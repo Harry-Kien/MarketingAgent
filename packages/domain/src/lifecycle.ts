@@ -1,4 +1,4 @@
-import { isAgentActor, type Actor } from "./actor.ts";
+import { isUserActor, type Actor } from "./actor.ts";
 import { InvalidTransitionError } from "./errors.ts";
 import type { Id } from "./ids.ts";
 
@@ -36,11 +36,28 @@ const REWORK_EDGES: ReadonlyArray<[LifecycleState, LifecycleState]> = [
   ["WAITING_APPROVAL", "IN_PROGRESS"],
 ];
 
+/**
+ * The pre-approval part of the main sequence: recovery from a side state
+ * (BLOCKED, FAILED_RETRYABLE) may only re-enter here, never at APPROVED or
+ * beyond. This is a named boundary rather than "all of MAIN_STATES" on
+ * purpose — nothing may gain approval or execution rights by passing
+ * through a side state. Going through BLOCKED must never be a shortcut
+ * around WAITING_APPROVAL (blueprint §11.4 invariant 2).
+ */
+const PRE_APPROVAL_STATES: ReadonlySet<LifecycleState> = new Set([
+  "DRAFT",
+  "RESEARCHING",
+  "PLANNED",
+  "IN_PROGRESS",
+  "INTERNAL_REVIEW",
+  "WAITING_APPROVAL",
+]);
+
 export function canTransition(from: LifecycleState, to: LifecycleState): boolean {
   if (from === to) return false;
   if (TERMINAL.has(from)) return false;
   if (to === "BLOCKED" || to === "CANCELLED" || to === "FAILED_RETRYABLE" || to === "FAILED_TERMINAL") return true;
-  if (from === "BLOCKED" || from === "FAILED_RETRYABLE") return MAIN_STATES.includes(to as MainState);
+  if (from === "BLOCKED" || from === "FAILED_RETRYABLE") return PRE_APPROVAL_STATES.has(to);
   if (REWORK_EDGES.some(([f, t]) => f === from && t === to)) return true;
   const i = MAIN_STATES.indexOf(from as MainState);
   const j = MAIN_STATES.indexOf(to as MainState);
@@ -82,8 +99,8 @@ export function applyTransition(input: TransitionInput): TransitionRecord {
     if (input.hasApprovalDecision !== true) {
       throw new InvalidTransitionError("APPROVED requires a recorded ApprovalDecision");
     }
-    if (isAgentActor(input.actor)) {
-      throw new InvalidTransitionError("An agent actor can never approve; only a user can");
+    if (!isUserActor(input.actor)) {
+      throw new InvalidTransitionError("Only a user actor can approve; agent and system actors cannot");
     }
   }
   return {

@@ -6,6 +6,7 @@ import {
   createInitialTransition,
   MAIN_STATES,
   SIDE_STATES,
+  type LifecycleState,
 } from "./lifecycle.ts";
 import { InvalidTransitionError } from "./errors.ts";
 import type { Actor } from "./actor.ts";
@@ -57,10 +58,10 @@ describe("canTransition — rejections", () => {
     expect(canTransition("EXECUTING", "FAILED_TERMINAL")).toBe(true);
   });
 
-  it("lets BLOCKED and FAILED_RETRYABLE resume into any main state, and into each other's side state", () => {
+  it("lets BLOCKED and FAILED_RETRYABLE resume only into the PRE-APPROVAL part of the main sequence, and into each other's side state", () => {
     expect(canTransition("BLOCKED", "IN_PROGRESS")).toBe(true);
     expect(canTransition("BLOCKED", "DRAFT")).toBe(true);
-    expect(canTransition("FAILED_RETRYABLE", "EXECUTING")).toBe(true);
+    expect(canTransition("FAILED_RETRYABLE", "WAITING_APPROVAL")).toBe(true);
     expect(canTransition("BLOCKED", "CANCELLED")).toBe(true);
   });
 
@@ -80,7 +81,117 @@ describe("canTransition — rejections", () => {
     expect(canTransition("IN_PROGRESS", "APPROVED")).toBe(false);
     expect(canTransition("SCHEDULED", "APPROVED")).toBe(false);
     expect(canTransition("INTERNAL_REVIEW", "APPROVED")).toBe(false);
+    // side states must never launder into APPROVED — going through BLOCKED
+    // or FAILED_RETRYABLE is not a shortcut around WAITING_APPROVAL.
+    expect(canTransition("BLOCKED", "APPROVED")).toBe(false);
+    expect(canTransition("FAILED_RETRYABLE", "APPROVED")).toBe(false);
     expect(canTransition("WAITING_APPROVAL", "APPROVED")).toBe(true);
+  });
+});
+
+describe("fix round 1 — HIGH 1: side states must not launder into approval/execution", () => {
+  it("BLOCKED and FAILED_RETRYABLE cannot reach APPROVED", () => {
+    expect(canTransition("BLOCKED", "APPROVED")).toBe(false);
+    expect(canTransition("FAILED_RETRYABLE", "APPROVED")).toBe(false);
+  });
+
+  it("applyTransition from BLOCKED to APPROVED throws, even with a decision and a user actor", () => {
+    expect(() =>
+      applyTransition({ ...base, from: "BLOCKED", to: "APPROVED", hasApprovalDecision: true }),
+    ).toThrow(InvalidTransitionError);
+  });
+
+  it("BLOCKED and FAILED_RETRYABLE cannot reach SCHEDULED, EXECUTING, MEASURING or COMPLETED", () => {
+    const postApproval: LifecycleState[] = ["SCHEDULED", "EXECUTING", "MEASURING", "COMPLETED"];
+    for (const to of postApproval) {
+      expect(canTransition("BLOCKED", to)).toBe(false);
+      expect(canTransition("FAILED_RETRYABLE", to)).toBe(false);
+    }
+  });
+
+  it("BLOCKED and FAILED_RETRYABLE CAN reach every pre-approval main state", () => {
+    const preApproval: LifecycleState[] = [
+      "DRAFT",
+      "RESEARCHING",
+      "PLANNED",
+      "IN_PROGRESS",
+      "INTERNAL_REVIEW",
+      "WAITING_APPROVAL",
+    ];
+    for (const to of preApproval) {
+      expect(canTransition("BLOCKED", to)).toBe(true);
+      expect(canTransition("FAILED_RETRYABLE", to)).toBe(true);
+    }
+  });
+});
+
+describe("fix round 1 — HIGH 2: only a real user actor may approve", () => {
+  it("a system actor is refused APPROVED with the same error type as an agent actor", () => {
+    expect(() =>
+      applyTransition({ ...base, actor: agent, from: "WAITING_APPROVAL", to: "APPROVED", hasApprovalDecision: true }),
+    ).toThrow(InvalidTransitionError);
+    expect(() =>
+      applyTransition({ ...base, actor: system, from: "WAITING_APPROVAL", to: "APPROVED", hasApprovalDecision: true }),
+    ).toThrow(InvalidTransitionError);
+  });
+
+  it("a user actor with a decision is still accepted from WAITING_APPROVAL", () => {
+    const record = applyTransition({ ...base, actor: user, from: "WAITING_APPROVAL", to: "APPROVED", hasApprovalDecision: true });
+    expect(record.to).toBe("APPROVED");
+  });
+});
+
+describe("fix round 1 — full 15x15 cross-product", () => {
+  // Independent re-derivation of the intended rule set (not a call-through to
+  // canTransition's own internals) so this is a real cross-check, not a
+  // tautology. Every (from, to) pair over all 15 states is compared.
+  const ALL_STATES: LifecycleState[] = [...MAIN_STATES, ...SIDE_STATES];
+  const TERMINAL_SET = new Set<LifecycleState>(["COMPLETED", "FAILED_TERMINAL", "CANCELLED"]);
+  const SIDE_TARGETS = new Set<LifecycleState>(["BLOCKED", "CANCELLED", "FAILED_RETRYABLE", "FAILED_TERMINAL"]);
+  const PRE_APPROVAL = new Set<LifecycleState>([
+    "DRAFT",
+    "RESEARCHING",
+    "PLANNED",
+    "IN_PROGRESS",
+    "INTERNAL_REVIEW",
+    "WAITING_APPROVAL",
+  ]);
+  const REWORK_PAIRS = new Set(["INTERNAL_REVIEW->IN_PROGRESS", "WAITING_APPROVAL->IN_PROGRESS"]);
+
+  function expectedCanTransition(from: LifecycleState, to: LifecycleState): boolean {
+    if (from === to) return false;
+    if (TERMINAL_SET.has(from)) return false;
+    if (SIDE_TARGETS.has(to)) return true;
+    if (from === "BLOCKED" || from === "FAILED_RETRYABLE") return PRE_APPROVAL.has(to);
+    if (REWORK_PAIRS.has(`${from}->${to}`)) return true;
+    const i = MAIN_STATES.indexOf(from as (typeof MAIN_STATES)[number]);
+    const j = MAIN_STATES.indexOf(to as (typeof MAIN_STATES)[number]);
+    return i >= 0 && j === i + 1;
+  }
+
+  it("matches the intended rule set for all 225 (from, to) pairs with zero mismatches", () => {
+    expect(ALL_STATES.length).toBe(15);
+    let allowedCount = 0;
+    let refusedCount = 0;
+    const mismatches: string[] = [];
+    for (const from of ALL_STATES) {
+      for (const to of ALL_STATES) {
+        const actual = canTransition(from, to);
+        const expected = expectedCanTransition(from, to);
+        if (actual !== expected) {
+          mismatches.push(`${from} -> ${to}: canTransition=${actual}, expected=${expected}`);
+        }
+        if (actual) allowedCount++;
+        else refusedCount++;
+      }
+    }
+    expect(mismatches).toEqual([]);
+    expect(allowedCount + refusedCount).toBe(225);
+    // Locked-in split so a future change to the rule set fails loudly here
+    // even if it happens to preserve zero mismatches against a since-edited
+    // expectedCanTransition. Values confirmed by this test run.
+    expect(allowedCount).toBe(70);
+    expect(refusedCount).toBe(155);
   });
 });
 
