@@ -21,7 +21,8 @@
     "lint:scope": "node scripts/check-forbidden-scope.mjs",
     "lint:secrets": "node scripts/scan-secrets.mjs",
     "lint:imports": "node scripts/check-imports.mjs",
-    "verify": "npm run lint:versions && npm run lint:scope && npm run lint:secrets && npm run lint:imports && npm run typecheck && npm run typecheck:web && npm run test"
+    "lint:migrations": "node scripts/check-migrations.mjs",
+    "verify": "npm run lint:versions && npm run lint:scope && npm run lint:secrets && npm run lint:imports && npm run lint:migrations && npm run typecheck && npm run typecheck:web && npm run test"
   },
   "devDependencies": {
     "@types/node": "26.1.1",
