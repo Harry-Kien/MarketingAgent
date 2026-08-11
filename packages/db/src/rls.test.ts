@@ -68,20 +68,63 @@ describe("row level security", () => {
     expect((r.rows[0] as { rolbypassrls: boolean }).rolbypassrls).toBe(false);
   });
 
-  // 0003_pgboss_schema_owner.sql grants smos_app CREATE ON DATABASE smos so
-  // pg-boss can bootstrap its own `pgboss` schema objects at boss.start().
-  // That is a real privilege widening (task-5c) and must not silently creep
-  // any further: it must not grant CREATE in `public` (where tenant tables
-  // live), must not make smos_app a superuser or BYPASSRLS-capable, and must
-  // not touch the append-only guard on audit_log. Pin all four here, next to
-  // the other role assertions, so any future drift fails a test instead of
-  // being discovered empirically again.
-  it("has CREATE on the database (for pg-boss's own schema bootstrap) but not on schema public", async () => {
+  // Final whole-branch review, FINDING 2 (MEDIUM). 0003_pgboss_schema_owner.sql
+  // originally granted smos_app CREATE ON DATABASE smos so pg-boss could
+  // bootstrap its own `pgboss` schema objects at boss.start(). That grant let
+  // smos_app create a real, un-migrated, RLS-less table ANYWHERE in the
+  // database at runtime -- the reviewer demonstrated this concretely with a
+  // `shadow.leaked_content` table readable across workspaces -- reducing
+  // ADR-007's three layers of defense to one for anything created that way.
+  //
+  // Investigated and closed (0020_pgboss_revoke_database_create.sql): the
+  // `pgboss` schema is pre-created and owned by smos_app before any
+  // application code ever runs (0002/0003), which already gives smos_app
+  // full, unconditional CREATE rights inside that one schema via ownership
+  // alone -- CREATE ON DATABASE was never needed for the tables/indexes/
+  // functions pg-boss's bootstrap actually creates. The one thing it WAS
+  // needed for was pg-boss's own `CREATE SCHEMA IF NOT EXISTS pgboss`
+  // clause, which packages/queue's createQueue (packages/queue/src/index.ts)
+  // now disables via the `createSchema: false` constructor option -- schema
+  // creation is the migrations' job here, not pg-boss's, so pg-boss never
+  // needs to attempt it at all. Verified against a live database: `create
+  // schema if not exists pgboss` as smos_app fails with "permission denied
+  // for database smos" even though the schema already exists and smos_app
+  // owns it -- PostgreSQL requires CREATE ON DATABASE for that statement
+  // regardless of pre-existence -- confirming this was the exact (and only)
+  // operation the grant was covering.
+  //
+  // smos_app now has CREATE on neither the database nor schema `public`.
+  // Pin both here, next to the other role assertions, so any future drift
+  // (a migration re-adding the grant, or packages/queue dropping
+  // createSchema: false) fails a test instead of being discovered
+  // empirically again.
+  it("has CREATE on neither the database nor schema public", async () => {
     const dbPriv = await db.execute(sql`select has_database_privilege('smos_app', 'smos', 'CREATE') as c`);
-    expect((dbPriv.rows[0] as { c: boolean }).c).toBe(true);
+    expect((dbPriv.rows[0] as { c: boolean }).c).toBe(false);
 
     const schemaPriv = await db.execute(sql`select has_schema_privilege('smos_app', 'public', 'CREATE') as c`);
     expect((schemaPriv.rows[0] as { c: boolean }).c).toBe(false);
+  });
+
+  it("still has CREATE inside pgboss via schema ownership alone, with no database-level grant", async () => {
+    const owner = await db.execute(
+      sql`select pg_get_userbyid(nspowner) as owner from pg_namespace where nspname = 'pgboss'`,
+    );
+    expect((owner.rows[0] as { owner: string }).owner).toBe("smos_app");
+
+    const schemaPriv = await db.execute(sql`select has_schema_privilege('smos_app', 'pgboss', 'CREATE') as c`);
+    expect((schemaPriv.rows[0] as { c: boolean }).c).toBe(true);
+
+    const client = await pool.connect();
+    try {
+      await client.query("set role smos_app");
+      await expect(client.query("create schema if not exists pgboss")).rejects.toThrow(
+        /permission denied/i,
+      );
+    } finally {
+      await client.query("reset role").catch(() => undefined);
+      client.release();
+    }
   });
 
   it("is still not superuser and still has no BYPASSRLS", async () => {

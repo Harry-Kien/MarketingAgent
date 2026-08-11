@@ -1,0 +1,61 @@
+-- Final whole-branch review, FINDING 2 (MEDIUM). `GRANT CREATE ON DATABASE
+-- smos TO smos_app` (0003_pgboss_schema_owner.sql) lets smos_app create real
+-- tables anywhere in the database at runtime -- not just inside `pgboss` --
+-- and any table so created has no RLS and appears in no migration, which
+-- reduces ADR-007's three layers of defense to one for anything created
+-- that way. The reviewer demonstrated this concretely with a
+-- `shadow.leaked_content` table, readable across workspaces, created purely
+-- with the privilege 0003 granted.
+--
+-- Investigated exactly as instructed: from a completely empty database
+-- (`docker compose down -v`, `up -d db`, `npm run db:migrate`), with this
+-- REVOKE applied and nothing else changed, `npx vitest run packages/queue
+-- apps/worker` failed -- pg-boss's bootstrap (`Contractor.create`, from
+-- `boss.start()`) hit "permission denied for database smos". Confirmed by
+-- hand, directly against a live database, as smos_app:
+--
+--   create schema if not exists pgboss;
+--   -- ERROR:  permission denied for database smos
+--
+-- even though `pgboss` already exists (created by 0002 as the `smos`
+-- superuser) and is already owned by smos_app (0003's `ALTER SCHEMA pgboss
+-- OWNER TO smos_app`). Schema ownership grants CREATE *inside* a schema
+-- unconditionally, but PostgreSQL still requires CREATE ON DATABASE to
+-- attempt `CREATE SCHEMA IF NOT EXISTS`, regardless of whether the schema
+-- turns out to already exist -- IF NOT EXISTS only suppresses the error on
+-- a name collision, it does not skip the privilege check to attempt the
+-- statement at all. pg-boss's `Contractor.create` bundles
+-- `CREATE SCHEMA IF NOT EXISTS pgboss` into the same single DDL statement
+-- as every table/index/function it creates (pg-boss/dist/plans.js `create()`
+-- + `createSchema()`), unconditionally, unless the `createSchema` PgBoss
+-- constructor option is explicitly set to `false`. That is the exact
+-- operation CREATE ON DATABASE was covering -- not the tables/indexes/
+-- functions pg-boss creates inside `pgboss` itself, which schema ownership
+-- alone already permits.
+--
+-- Fix, verified against a live, completely empty database exactly as
+-- above: packages/queue/src/index.ts's createQueue now passes
+-- `createSchema: false` to the PgBoss constructor, so pg-boss's bootstrap
+-- never attempts `CREATE SCHEMA IF NOT EXISTS` at all -- schema creation is
+-- the migrations' job (0002), not pg-boss's, and by the time boss.start()
+-- ever runs, `pgboss` is already there and already owned by smos_app. With
+-- that change in place, `npx vitest run packages/queue apps/worker` passes
+-- in full with this REVOKE applied, from a completely empty database:
+-- pg-boss bootstraps every table/index/function it needs inside `pgboss`
+-- purely via schema ownership, and packages/db/src/outbox*.test.ts's
+-- drain-path tests (smos_worker, which only ever inherits from smos_app and
+-- never had CREATE ON DATABASE of its own) are unaffected.
+--
+-- Blast radius after this migration: `has_database_privilege('smos_app',
+-- 'smos', 'CREATE')` is false (packages/db/src/rls.test.ts). smos_app can
+-- still create objects inside `pgboss`, via ownership, and nowhere else --
+-- it can no longer create a brand new schema, or a table directly in a
+-- schema it does not own, anywhere in the database. `public` was never
+-- reachable via this grant in the first place (0003's own header already
+-- established that); this migration closes the one schema-creation escape
+-- hatch CREATE ON DATABASE left open everywhere else -- the exact
+-- `shadow.leaked_content`-shaped attack the reviewer demonstrated.
+--
+-- Idempotent: REVOKE is unconditionally re-appliable; re-running this file
+-- has no additional effect.
+REVOKE CREATE ON DATABASE smos FROM smos_app;
