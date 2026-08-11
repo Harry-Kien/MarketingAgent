@@ -1,0 +1,25 @@
+{
+  "name": "solo-marketing-os",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "typecheck": "tsc --build --verbose",
+    "test": "vitest run",
+    "lint:versions": "node scripts/check-exact-versions.mjs",
+    "lint:scope": "node scripts/check-forbidden-scope.mjs",
+    "lint:secrets": "node scripts/scan-secrets.mjs",
+    "verify": "npm run lint:versions && npm run lint:scope && npm run lint:secrets && npm run typecheck && npm run test"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.1",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}
