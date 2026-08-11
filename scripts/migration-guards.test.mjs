@@ -137,3 +137,52 @@ describe("regression: string literal and comment interaction", () => {
     expect(findRlsViolations(sql)).toEqual([]);
   });
 });
+
+describe("regression: statement boundary detection", () => {
+  it("detects tables even when prior statement has unterminated string", () => {
+    const sql = `CREATE TABLE broken (id uuid PRIMARY KEY, workspace_id uuid NOT NULL, note text DEFAULT 'unterminated string starts here
+      CREATE TABLE clean_table (id uuid PRIMARY KEY, name text NOT NULL);`;
+    expect(findTenancyViolations(sql)).toContain("clean_table");
+  });
+
+  it("detects tables even when prior statement has unterminated paren", () => {
+    const sql = `CREATE TABLE broken (id uuid PRIMARY KEY, workspace_id uuid NOT NULL, note text, extra (
+      CREATE TABLE clean_table (id uuid PRIMARY KEY, name text NOT NULL);`;
+    expect(findTenancyViolations(sql)).toContain("clean_table");
+  });
+
+  it("detects RLS across files when ALTER in different statement", () => {
+    const sql = `CREATE TABLE campaign (id uuid PRIMARY KEY, workspace_id uuid NOT NULL);
+      CREATE TABLE other (id uuid PRIMARY KEY, workspace_id uuid NOT NULL);
+      ALTER TABLE campaign ENABLE ROW LEVEL SECURITY;`;
+    expect(findRlsViolations(sql)).toEqual(["other"]);
+  });
+
+  it("does not split on semicolon inside dollar-quoted function body", () => {
+    const sql = `CREATE OR REPLACE FUNCTION test() AS $$
+      BEGIN
+        EXECUTE 'SELECT 1; SELECT 2';
+      END;
+      $$ LANGUAGE plpgsql;
+      CREATE TABLE campaign (id uuid PRIMARY KEY, name text NOT NULL);`;
+    expect(findTenancyViolations(sql)).toEqual(["campaign"]);
+  });
+
+  it("does not split on semicolon inside DEFAULT string", () => {
+    const sql = `CREATE TABLE campaign (
+      id uuid PRIMARY KEY,
+      note text DEFAULT 'see https://example.com;docs',
+      name text NOT NULL
+    );`;
+    expect(findTenancyViolations(sql)).toEqual(["campaign"]);
+  });
+
+  it("does not split on semicolon inside CHECK constraint parens", () => {
+    const sql = `CREATE TABLE campaign (
+      id uuid PRIMARY KEY,
+      status text CHECK (status IN ('active'; 'deleted')),
+      name text NOT NULL
+    );`;
+    expect(findTenancyViolations(sql)).toEqual(["campaign"]);
+  });
+});
