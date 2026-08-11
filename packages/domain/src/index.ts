@@ -41,3 +41,8 @@ export {
   assertRenderable,
   decideApproval,
 } from "./approval.ts";
+export {
+  type Publication,
+  buildPublication,
+  hashPublicationContent,
+} from "./publication.ts";
