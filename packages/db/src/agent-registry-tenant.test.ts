@@ -232,3 +232,23 @@ describe("agent_version CHECK constraints", () => {
     ).rejects.toThrow(/violates|check constraint/i);
   });
 });
+
+// Fix round 1 on Task 10: coverage gap noted by review. agent_definition.role
+// is CHECK-constrained to the fifteen-value ALL_AGENT_ROLES union
+// (0012_agent_registry.sql) but nothing exercised it. This is separate from
+// the M1 activation gate (0013): that trigger stops an *activated*
+// agent_version pointing at the wrong role; this CHECK stops
+// agent_definition.role from ever being a string outside the fifteen roles
+// at all, activated or not.
+describe("agent_definition role CHECK", () => {
+  it("rejects an unknown role string", async () => {
+    const marker = `agent-registry-unknown-role ${Date.now()}-${Math.random()}`;
+    await expect(
+      withTenant(pool, A, (tx) =>
+        tx.query(
+          `insert into agent_definition (id, workspace_id, role, mission) values (gen_random_uuid(), $1, $2, $3)`,
+          [A, "not_a_real_role", marker],
+        )),
+    ).rejects.toThrow(/violates|check constraint/i);
+  });
+});
