@@ -136,3 +136,9 @@ temp/
 *.tmp
 *.pid
 *.seed
+
+# SDD scratch workspace (ledger, briefs, review packages)
+.superpowers/
+
+# Serena MCP server workspace
+.serena/
