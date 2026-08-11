@@ -68,6 +68,46 @@ describe("row level security", () => {
     expect((r.rows[0] as { rolbypassrls: boolean }).rolbypassrls).toBe(false);
   });
 
+  // 0003_pgboss_schema_owner.sql grants smos_app CREATE ON DATABASE smos so
+  // pg-boss can bootstrap its own `pgboss` schema objects at boss.start().
+  // That is a real privilege widening (task-5c) and must not silently creep
+  // any further: it must not grant CREATE in `public` (where tenant tables
+  // live), must not make smos_app a superuser or BYPASSRLS-capable, and must
+  // not touch the append-only guard on audit_log. Pin all four here, next to
+  // the other role assertions, so any future drift fails a test instead of
+  // being discovered empirically again.
+  it("has CREATE on the database (for pg-boss's own schema bootstrap) but not on schema public", async () => {
+    const dbPriv = await db.execute(sql`select has_database_privilege('smos_app', 'smos', 'CREATE') as c`);
+    expect((dbPriv.rows[0] as { c: boolean }).c).toBe(true);
+
+    const schemaPriv = await db.execute(sql`select has_schema_privilege('smos_app', 'public', 'CREATE') as c`);
+    expect((schemaPriv.rows[0] as { c: boolean }).c).toBe(false);
+  });
+
+  it("is still not superuser and still has no BYPASSRLS", async () => {
+    const r = await db.execute(
+      sql`select rolsuper, rolbypassrls from pg_roles where rolname = 'smos_app'`,
+    );
+    const row = r.rows[0] as { rolsuper: boolean; rolbypassrls: boolean };
+    expect(row.rolsuper).toBe(false);
+    expect(row.rolbypassrls).toBe(false);
+  });
+
+  it("still cannot UPDATE or DELETE audit_log", async () => {
+    const client = await pool.connect();
+    try {
+      await client.query("set role smos_app");
+      await client.query("select set_config('app.workspace_id', $1, false)", [A]);
+      await expect(client.query("update audit_log set event_type = 'tampered'")).rejects.toThrow(
+        /append-only|permission denied/i,
+      );
+      await expect(client.query("delete from audit_log")).rejects.toThrow(/append-only|permission denied/i);
+    } finally {
+      await client.query("reset role").catch(() => undefined);
+      client.release();
+    }
+  });
+
   it("cannot be defeated by an explicit where clause naming another workspace", async () => {
     const client = await pool.connect();
     try {

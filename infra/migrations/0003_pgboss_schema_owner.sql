@@ -1,0 +1,57 @@
+-- Follow-up to 0002 / task-5b's review-round-1 narrowing of pgboss grants.
+--
+-- Defect 1: `GRANT ... ON ALL TABLES IN SCHEMA pgboss` (0002) only affects
+-- tables that exist at the moment the GRANT statement runs. At migration
+-- time the `pgboss` schema was just created by that same file, so it was
+-- empty -- the two `ON ALL TABLES` / `ON ALL SEQUENCES` grants in 0002
+-- granted nothing at all. This only went unnoticed because the local
+-- database still had a `pgboss` schema left over from earlier runs, with
+-- tables that already existed when 0002's grants ran. On a database built
+-- from these migrations alone, pg-boss has nothing to SELECT/INSERT into
+-- because smos_app was never granted anything on the tables it goes on to
+-- create.
+--
+-- Defect 2: pg-boss creates and version-manages its own objects (tables,
+-- indexes, functions) the first time `boss.start()` runs -- see
+-- pg-boss/dist/contractor.js. The role smos_app connects as therefore needs
+-- to be able to create objects in `pgboss`, not just read/write rows in
+-- tables that already exist. 0002 deliberately withheld schema-level CREATE
+-- from smos_app, which is correct for `public` (ADR-007: smos_app must
+-- never be able to create tenant-schema objects) but wrong for `pgboss`,
+-- which is pg-boss's own infrastructure schema, not tenant data.
+--
+-- Fix, verified empirically against a live database:
+--   - `ALTER SCHEMA pgboss OWNER TO smos_app` alone is NOT sufficient --
+--     schema ownership does not by itself grant CREATE within the schema
+--     to a non-superuser role in the way pg-boss's bootstrap needs.
+--   - Additionally granting `CREATE ON DATABASE smos TO smos_app` is what
+--     actually unblocks pg-boss's schema bootstrap end to end (verified:
+--     packages/queue goes 4/4 green and pg-boss creates its 12 tables).
+--     This is the narrowest database-level privilege that allows it --
+--     CREATE ON DATABASE lets a role create new schemas/objects in schemas
+--     it owns; it is not the same as CREATE on any particular schema.
+--
+-- Blast radius, checked directly: `has_schema_privilege('smos_app',
+-- 'public', 'CREATE')` is still false after this migration. GRANT CREATE ON
+-- DATABASE does not grant CREATE in `public` (or any schema smos_app does
+-- not own) -- smos_app still cannot create anything in the schema holding
+-- tenant tables. Nothing in this file widens `public`.
+--
+-- Ownership, not ALTER DEFAULT PRIVILEGES: the only role that ever creates
+-- objects inside `pgboss` is smos_app itself, via `boss.start()` at
+-- runtime -- migrations only ever CREATE SCHEMA IF NOT EXISTS pgboss (0002)
+-- and never CREATE anything inside it. PostgreSQL always makes the
+-- creating role the owner of an object it creates, regardless of schema
+-- ownership or ALTER DEFAULT PRIVILEGES settings, so once smos_app owns
+-- the schema, every table/index/function pg-boss creates there is already
+-- owned by smos_app with full rights -- there is no second role ever
+-- creating pgboss objects for smos_app to need default privileges against.
+-- ALTER DEFAULT PRIVILEGES would only matter if some other role (e.g.
+-- `smos`, the migration role) created objects in `pgboss` for smos_app to
+-- consume later; that never happens, so it is deliberately omitted here.
+--
+-- Idempotent: GRANT and ALTER SCHEMA OWNER are both unconditionally
+-- re-appliable -- re-running this file has no additional effect. No
+-- credential appears in this file.
+GRANT CREATE ON DATABASE smos TO smos_app;
+ALTER SCHEMA pgboss OWNER TO smos_app;
