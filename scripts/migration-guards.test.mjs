@@ -526,6 +526,87 @@ describe("FINDING 3: a string literal containing the word workspace_id does not 
     const { tables } = collectFileFacts(sql);
     expect(tables).toEqual([{ name: "campaign", hasWorkspaceId: true }]);
   });
+
+  // Round 2 residual: stripStringLiteralContents only handled '...'.
+  // Dollar-quoted string literals (a normal, legal way to write a DEFAULT
+  // in PostgreSQL, not just a function-body construct) still let the bare
+  // word workspace_id inside one satisfy the check.
+  it("a plain dollar-quoted ($$...$$) DEFAULT literal naming workspace_id does not count", () => {
+    const sql = `CREATE TABLE campaign (
+      id uuid PRIMARY KEY,
+      cfg text DEFAULT $$workspace_id$$,
+      name text NOT NULL
+    );`;
+    const { tables } = collectFileFacts(sql);
+    expect(tables).toEqual([{ name: "campaign", hasWorkspaceId: false }]);
+  });
+
+  it("a tagged dollar-quoted ($x$...$x$) DEFAULT literal naming workspace_id does not count", () => {
+    const sql = `CREATE TABLE campaign (
+      id uuid PRIMARY KEY,
+      cfg text DEFAULT $x$workspace_id$x$,
+      name text NOT NULL
+    );`;
+    const { tables } = collectFileFacts(sql);
+    expect(tables).toEqual([{ name: "campaign", hasWorkspaceId: false }]);
+  });
+
+  it("still finds a real workspace_id column alongside a dollar-quoted decoy literal", () => {
+    const sql = `CREATE TABLE campaign (
+      id uuid PRIMARY KEY,
+      workspace_id uuid NOT NULL REFERENCES workspace(id),
+      cfg text DEFAULT $$workspace_id$$,
+      name text NOT NULL
+    );`;
+    const { tables } = collectFileFacts(sql);
+    expect(tables).toEqual([{ name: "campaign", hasWorkspaceId: true }]);
+  });
+});
+
+// Round 2 residual: SELECT ... INTO creates a brand new table (it is DDL,
+// equivalent to CREATE TABLE AS SELECT) but starts with SELECT, not CREATE,
+// so it never matched FILE_CREATE_TABLE, ANY_CREATE_TABLE, or anything
+// else -- the guard never saw it as a table declaration at all, which is
+// worse than the other unsupported shapes: those at least fail the file
+// closed, this one was silently invisible, contributing zero facts and zero
+// violations.
+describe("FINDING 3 (round 2): SELECT ... INTO fails closed instead of being invisible", () => {
+  it("a top-level SELECT ... INTO cannot be certified", () => {
+    const sql = `SELECT id, workspace_id INTO shadow_table FROM campaign;`;
+    const { tables, unterminated } = collectFileFacts(sql);
+    expect(tables).toEqual([]);
+    expect(unterminated).not.toBeNull();
+  });
+
+  it("SELECT ... INTO TEMP also cannot be certified", () => {
+    const sql = `SELECT * INTO TEMP shadow_table FROM campaign;`;
+    const { unterminated } = collectFileFacts(sql);
+    expect(unterminated).not.toBeNull();
+  });
+
+  it("a SELECT ... INTO in one file still fails the whole run closed via computeViolations", () => {
+    const fileA = `SELECT id, workspace_id INTO shadow_leak FROM campaign;`;
+    const { unparseableFiles } = computeViolations(factsFor({ "0099_select_into.sql": fileA }));
+    expect(unparseableFiles.map((f) => f.file)).toContain("0099_select_into.sql");
+  });
+
+  it("an ordinary SELECT with no INTO is not affected (it declares no table and is simply not a CREATE/ALTER statement)", () => {
+    const sql = `CREATE TABLE campaign (id uuid PRIMARY KEY, workspace_id uuid NOT NULL);
+      ALTER TABLE campaign ENABLE ROW LEVEL SECURITY;
+      SELECT count(*) FROM campaign;`;
+    const { tables, unterminated } = collectFileFacts(sql);
+    expect(unterminated).toBeNull();
+    expect(tables).toEqual([{ name: "campaign", hasWorkspaceId: true }]);
+  });
+
+  it("INSERT INTO is not confused with SELECT INTO", () => {
+    const sql = `CREATE TABLE campaign (id uuid PRIMARY KEY, workspace_id uuid NOT NULL);
+      ALTER TABLE campaign ENABLE ROW LEVEL SECURITY;
+      INSERT INTO campaign (id, workspace_id) VALUES (gen_random_uuid(), gen_random_uuid());`;
+    const { tables, unterminated } = collectFileFacts(sql);
+    expect(unterminated).toBeNull();
+    expect(tables).toEqual([{ name: "campaign", hasWorkspaceId: true }]);
+  });
 });
 
 // Final whole-branch review, FINDING 3 (second gap). This branch's stated

@@ -337,6 +337,33 @@ export function findRlsViolations(sql) {
  * guessed or recovered past that point — the caller must treat the whole
  * file as uncertifiable.
  */
+/**
+ * Given `text` and the index of a `$` that MIGHT open a dollar-quoted block
+ * (`$$...$$` or `$tag$...$tag$`), attempts to read the optional tag and
+ * confirm a second `$` follows. Returns `{ quote, contentStart }` (the
+ * exact delimiter and the index immediately after it) if `text` at `i`
+ * really is a dollar-quote opener, or `null` if it is not (e.g. a bare `$`
+ * used as a parameter placeholder like `$1`). The single source of truth
+ * for "what does a dollar-quote tag look like" -- `parseFile`,
+ * `findMatchingParen` and `stripStringLiteralContents` all call this
+ * instead of each re-implementing the same tag-matching loop (round 2 of
+ * the final whole-branch review: dollar-quoted string literals,
+ * `DEFAULT $$workspace_id$$`/`DEFAULT $x$workspace_id$x$`, were slipping
+ * past `stripStringLiteralContents`, which only handled `'...'`).
+ */
+function matchDollarQuoteOpener(text, i) {
+  let j = i + 1;
+  let tag = "";
+  while (j < text.length && /\w/.test(text[j])) {
+    tag += text[j];
+    j++;
+  }
+  if (text[j] === "$") {
+    return { quote: `$${tag}$`, contentStart: j + 1 };
+  }
+  return null;
+}
+
 export function parseFile(sql) {
   const statements = [];
   let current = "";
@@ -404,16 +431,11 @@ export function parseFile(sql) {
 
     // Dollar-quoted block: $$...$$ or $tag$...$tag$
     if (ch === "$") {
-      let j = i + 1;
-      let tag = "";
-      while (j < n && /\w/.test(sql[j])) {
-        tag += sql[j];
-        j++;
-      }
-      if (sql[j] === "$") {
-        const dollarQuote = `$${tag}$`;
+      const opener = matchDollarQuoteOpener(sql, i);
+      if (opener) {
+        const { quote: dollarQuote, contentStart } = opener;
         current += dollarQuote;
-        i = j + 1;
+        i = contentStart;
         let closed = false;
         while (i < n) {
           if (sql.startsWith(dollarQuote, i)) {
@@ -521,17 +543,29 @@ const FILE_ENABLE_RLS = /^\s*ALTER\s+TABLE\s+(?:"?\w+"?\.)?"?(\w+)"?\s+ENABLE\s+
 // if it declared no table at all.
 const ANY_CREATE_TABLE = /^\s*CREATE\s+(?:UNLOGGED\s+|(?:GLOBAL\s+|LOCAL\s+)?TEMP(?:ORARY)?\s+)?TABLE\b/i;
 
+// Final whole-branch review, FINDING 3 (round 2). `SELECT ... INTO target
+// FROM ...` is DDL -- equivalent to `CREATE TABLE target AS SELECT ...` --
+// but starts with the keyword SELECT, so it matched neither
+// FILE_CREATE_TABLE nor ANY_CREATE_TABLE and was invisible to this guard
+// rather than merely uncertifiable. Deliberately anchored on SELECT (not
+// just \bINTO\b anywhere) so `INSERT INTO ...` is never confused with it.
+const SELECT_INTO = /^\s*SELECT\b[\s\S]*?\bINTO\b/i;
+
 /**
- * Blank out the CONTENTS of every single-quoted string literal in `text`
- * (string/quote-aware: handles `''`-escaped quotes), leaving the
- * surrounding structure and length otherwise intact. Used only to keep a
- * string literal's contents from satisfying the `\bworkspace_id\b` column
- * check below -- the repo already writes `current_setting('app.workspace_id')`
- * 24 times, so a DEFAULT or CHECK holding that literal text must not read as
- * a real column declaration (final whole-branch review, FINDING 3). Double-
- * quoted identifiers are deliberately left untouched: a quoted identifier
- * names a real column (however unusually spelled), unlike a string literal's
- * content, which is data.
+ * Blank out the CONTENTS of every single-quoted string literal AND every
+ * dollar-quoted string literal (`$$...$$` / `$tag$...$tag$` -- a normal,
+ * legal way to write a string in PostgreSQL, not just a function-body
+ * construct) in `text`, leaving the surrounding structure and delimiters
+ * otherwise intact. Used only to keep a string literal's contents from
+ * satisfying the `\bworkspace_id\b` column check below -- the repo already
+ * writes `current_setting('app.workspace_id')` 24 times, so a DEFAULT or
+ * CHECK holding that literal text must not read as a real column
+ * declaration (final whole-branch review, FINDING 3; round 2 closed the
+ * dollar-quoted gap, reusing `matchDollarQuoteOpener` rather than
+ * re-implementing tag matching a third time). Double-quoted identifiers
+ * are deliberately left untouched: a quoted identifier names a real
+ * column (however unusually spelled), unlike a string literal's content,
+ * which is data.
  */
 function stripStringLiteralContents(text) {
   let result = "";
@@ -574,6 +608,28 @@ function stripStringLiteralContents(text) {
         }
         i++;
       }
+      continue;
+    }
+    if (ch === "$") {
+      const opener = matchDollarQuoteOpener(text, i);
+      if (opener) {
+        const closeIdx = text.indexOf(opener.quote, opener.contentStart);
+        if (closeIdx === -1) {
+          // Defensively swallow to end of text -- callers only ever pass
+          // text `parseFile` already vetted as balanced (an unterminated
+          // dollar-quote would already have failed the file closed
+          // earlier), so this path is not expected to run.
+          result += opener.quote;
+          i = n;
+          continue;
+        }
+        result += opener.quote; // opening delimiter
+        result += opener.quote; // closing delimiter -- content itself dropped
+        i = closeIdx + opener.quote.length;
+        continue;
+      }
+      result += ch;
+      i++;
       continue;
     }
     result += ch;
@@ -632,17 +688,11 @@ function findMatchingParen(text, openIndex) {
       continue;
     }
     if (ch === "$") {
-      let j = i + 1;
-      let tag = "";
-      while (j < n && /\w/.test(text[j])) {
-        tag += text[j];
-        j++;
-      }
-      if (text[j] === "$") {
-        const dollarQuote = `$${tag}$`;
-        const closeIdx = text.indexOf(dollarQuote, j + 1);
+      const opener = matchDollarQuoteOpener(text, i);
+      if (opener) {
+        const closeIdx = text.indexOf(opener.quote, opener.contentStart);
         if (closeIdx === -1) return -1;
-        i = closeIdx + dollarQuote.length;
+        i = closeIdx + opener.quote.length;
         continue;
       }
       i++;
@@ -728,6 +778,26 @@ export function collectFileFacts(sql) {
         rlsEnabled: [],
         unterminated: {
           construct: `CREATE TABLE statement does not match a certifiable shape (expected a plain or IF NOT EXISTS CREATE TABLE with a column-list body): "${stmt.trim().slice(0, 120)}"`,
+        },
+      };
+    }
+    // FINDING 3 (round 2): `SELECT ... INTO target FROM ...` is DDL -- it
+    // creates `target` as a brand new table, the same as `CREATE TABLE ...
+    // AS SELECT` -- but starts with SELECT, not CREATE, so it never
+    // matched FILE_CREATE_TABLE or ANY_CREATE_TABLE and was invisible to
+    // this guard entirely: not even reported as an uncertifiable shape,
+    // just silently contributing zero facts. `INSERT INTO` is unaffected
+    // (a different statement-starting keyword). A `SELECT ... INTO`
+    // written inside a PL/pgSQL function body (the variable-assignment
+    // form) can never reach this check: the whole dollar-quoted body is
+    // one opaque token to `parseFile` and is never split into top-level
+    // statements.
+    if (SELECT_INTO.test(stmt)) {
+      return {
+        tables: [],
+        rlsEnabled: [],
+        unterminated: {
+          construct: `SELECT ... INTO creates a table this guard cannot certify: "${stmt.trim().slice(0, 120)}"`,
         },
       };
     }
