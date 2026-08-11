@@ -4,7 +4,7 @@ import { createDb, createDbPool } from "./client.ts";
 import { withTenant } from "./tenant-scope.ts";
 
 const url =
-  process.env["DATABASE_URL"] ?? "postgres://smos:smos_local_dev@127.0.0.1:5433/smos";
+  process.env["DATABASE_URL"] ?? "postgres://smos_app:smos_app_local_dev@127.0.0.1:5433/smos";
 const pool = createDbPool(url);
 const db = createDb(pool);
 const A = "11111111-1111-7111-8111-111111111111";
@@ -52,23 +52,36 @@ describe("withTenant", () => {
     );
   });
 
-  // ADR-007 update (task-5b): DATABASE_URL now connects the pool AS
-  // smos_app directly (previously it connected as the `smos` superuser and
-  // `withTenant` only ever narrowed it). That makes "current_user is not
-  // smos_app" true of every connection this pool ever hands out, tested or
-  // not, so it stopped being a meaningful post-condition here -- it would
-  // pass even if `withTenant` did nothing at all. The property actually
-  // worth guarding is that nothing ever hands back a connection sitting on
-  // the superuser identity (`smos`), which is exactly what the pre-fix
-  // RESET ROLE escape reached (see the DEFEAT ATTEMPT tests below and
-  // task-5b-report.md).
-  it("resets the role even when the callback throws", async () => {
-    await withTenant(pool, A, async () => undefined).catch(() => undefined);
-    const client = await pool.connect();
-    const r = await client.query("select current_user as u");
-    client.release();
-    expect(r.rows[0].u).not.toBe("smos");
-  });
+  // DELETED (task-5b, fix round 1): "resets the role even when the callback
+  // throws". ADR-007 update made its `.not.toBe("smos_app")` assertion
+  // tautological (DATABASE_URL now connects the pool AS smos_app, so every
+  // connection reads that value regardless of what withTenant does), and
+  // `.not.toBe("smos")` doesn't fix it either: smos_app can never become
+  // smos at all (`permission denied to set role`, proved in
+  // task-5b-report.md), so that check is unconditionally true too.
+  //
+  // Tried a real discriminator before deleting, not just weakening the
+  // check: `current_setting('role', true)` reads the literal string "none"
+  // whenever no explicit role override is in effect, and only an *explicit*
+  // SET ROLE leaves it holding a role name instead -- even when that name
+  // equals the connection's own baseline role. Verified directly against
+  // PostgreSQL: `SET LOCAL ROLE smos_app` + COMMIT -> "none"; a plain
+  // (non-LOCAL) `SET ROLE smos_app` + COMMIT -> "smos_app". That would have
+  // been real coverage on the COMMIT path.
+  //
+  // But this test's whole reason to exist was the ROLLBACK path (its own
+  // name: "even when the callback throws"), and ROLLBACK erases that
+  // distinction too: verified directly that a plain `SET ROLE smos_app`
+  // followed by ROLLBACK also reads back as "none", identically to `SET
+  // LOCAL ROLE`. PostgreSQL only tells LOCAL and non-LOCAL apart at COMMIT
+  // time; a transaction that rolls back undoes either one the same way. So
+  // on the rollback path specifically, there is no observable left that
+  // distinguishes correct code from the exact regression this test was
+  // meant to catch -- deleting it is the honest outcome, not leaving a
+  // green assertion that would pass against broken code. The COMMIT-path
+  // equivalent below ("does not leave a stale workspace id on the
+  // connection after a successful call") still holds real, live coverage
+  // for the same class of bug and was left untouched per the review.
 
   // --- Leak scenarios beyond the brief -------------------------------------
 

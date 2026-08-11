@@ -33,15 +33,19 @@ GRANT INSERT ON workspace TO smos_app;
 -- just making smos_app able to do the job pg-boss needs, the same way the
 -- grants above do for the domain tables.
 --
--- On a database that has already run the queue, `pgboss` exists already,
--- owned by whichever role used to connect (smos); the explicit GRANTs below
--- hand smos_app the privileges on those existing objects. On a brand-new
--- database, `pgboss` does not exist yet; CREATE SCHEMA here (idempotent)
--- gives smos_app CREATE within a schema it already owns access to, so
--- pg-boss's own first-run bootstrap (executed as smos_app, since that is
--- the only role that will ever connect) can create its own tables without
--- needing database-wide CREATE.
+-- Schema creation stays with smos (this migration runs as smos): CREATE
+-- SCHEMA here is idempotent and, on a database that has already run the
+-- queue, is a no-op against the schema smos already owns. smos_app gets
+-- only USAGE on the schema -- not CREATE -- and only the DML its runtime
+-- operations (send/work/getQueues, all exercised by packages/queue's
+-- tests) actually issue: SELECT/INSERT/UPDATE/DELETE on tables,
+-- USAGE/SELECT/UPDATE on sequences. No TRUNCATE, REFERENCES, TRIGGER, or
+-- schema-level CREATE -- smos_app never issues any of those against this
+-- schema. (pg-boss's own bootstrap, which can CREATE TABLE when queue
+-- partitioning is enabled, is not exercised anywhere in this codebase --
+-- packages/queue never passes `partition: true` -- so it needs nothing
+-- more than this to do its actual job here.)
 CREATE SCHEMA IF NOT EXISTS pgboss;
-GRANT ALL ON SCHEMA pgboss TO smos_app;
-GRANT ALL ON ALL TABLES IN SCHEMA pgboss TO smos_app;
-GRANT ALL ON ALL SEQUENCES IN SCHEMA pgboss TO smos_app;
+GRANT USAGE ON SCHEMA pgboss TO smos_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA pgboss TO smos_app;
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA pgboss TO smos_app;

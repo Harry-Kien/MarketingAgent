@@ -3,7 +3,7 @@ import { sql } from "drizzle-orm";
 import { createDb, createDbPool } from "./client.ts";
 
 const url =
-  process.env["DATABASE_URL"] ?? "postgres://smos:smos_local_dev@127.0.0.1:5433/smos";
+  process.env["DATABASE_URL"] ?? "postgres://smos_app:smos_app_local_dev@127.0.0.1:5433/smos";
 const pool = createDbPool(url);
 const db = createDb(pool);
 const A = "11111111-1111-7111-8111-111111111111";
