@@ -11,6 +11,7 @@
     "noFallthroughCasesInSwitch": true,
     "verbatimModuleSyntax": true,
     "isolatedModules": true,
+    "types": ["node"],
     // Relative imports carry a .ts extension in source and are rewritten to .js
     // on emit. Writing .js in source (the older TypeScript convention) only
     // works for tsc and vitest: Turbopack and Node's type stripping both fail
