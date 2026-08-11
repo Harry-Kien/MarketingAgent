@@ -1,0 +1,22 @@
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    container_name: smos-db
+    environment:
+      POSTGRES_USER: smos
+      POSTGRES_PASSWORD: smos_local_dev
+      POSTGRES_DB: smos
+    # 5433 on the host so this never collides with an existing local
+    # PostgreSQL such as the one Odoo runs on 5432.
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smos -d smos"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pgdata:
