@@ -1,0 +1,46 @@
+-- Fix round 3 on Task 10. Rounds 1 (0013) and 2 (0014) closed every path
+-- that lets a NON-M1 role become activated. The reviewer confirmed both
+-- hold against every variant it could construct, then found a third door
+-- that does not touch which role is activated at all: nothing limited how
+-- many activated VERSIONS a single agent_definition may have. Inserting a
+-- second agent_version(activated=true) under an already-legitimately-
+-- activated `orchestrator` definition succeeded, pushing the activated row
+-- count to six. No new role runs, so the "which agents may run" control
+-- (0013, 0014) still holds. Two things still break: the "at most four
+-- activated rows" count invariant asserted by earlier fix rounds' own
+-- tests, and -- the one that costs money -- P2 dispatches by role with no
+-- dedup by definition, so two activated versions of the same role mean
+-- that role can be dispatched twice, calling a paid model provider twice
+-- for one logical run.
+--
+-- A partial unique index expresses "at most one activated version per
+-- definition" precisely and declaratively -- no trigger needed, unlike
+-- 0013/0014, because this rule is expressible entirely as uniqueness over
+-- rows already visible to the index (agent_definition_id where activated),
+-- with no cross-table lookup required:
+CREATE UNIQUE INDEX agent_version_one_activated_per_definition
+  ON agent_version (agent_definition_id)
+  WHERE activated;
+
+-- Activating a new version is a SWAP, not an addition -- the previous
+-- activated version of the same definition must be deactivated in the
+-- same transaction, before the new one is activated:
+--
+--   UPDATE agent_version SET activated = false WHERE id = <old version>;
+--   UPDATE agent_version SET activated = true  WHERE id = <new version>;
+--
+-- Order matters and is not optional. This index cannot be declared
+-- DEFERRABLE: PostgreSQL only allows DEFERRABLE on a constraint added via
+-- ALTER TABLE ... ADD CONSTRAINT, and a *partial* unique rule can only be
+-- expressed as a bare CREATE UNIQUE INDEX ... WHERE, which is checked
+-- immediately, per statement. Deactivating first means that by the time
+-- the second UPDATE activates the new version, the old version's index
+-- entry is already gone (both statements run in the same transaction, so
+-- the second sees the first's effect), and the uniqueness check passes.
+-- Activating the new version before deactivating the old one would have
+-- both rows active for the same agent_definition_id at once, however
+-- briefly, and is refused immediately by this index -- there is no
+-- ordering in which "activate first, deactivate second" succeeds, and
+-- that is intentional: it is not a real swap until the old version is
+-- actually off. Verified in
+-- packages/db/src/agent-version-single-activation.test.ts.
