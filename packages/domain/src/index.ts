@@ -46,3 +46,10 @@ export {
   buildPublication,
   hashPublicationContent,
 } from "./publication.ts";
+export {
+  type AgentRole,
+  type AgentRegistryEntry,
+  ALL_AGENT_ROLES,
+  M1_ACTIVATED_AGENTS,
+  assertActivated,
+} from "./agent-registry.ts";
