@@ -33,3 +33,11 @@ export {
   addVersion,
   canBeVerified,
 } from "./content.ts";
+export {
+  type PolicyFlag,
+  type ApprovalRequest,
+  type ApprovalDecisionKind,
+  type ApprovalDecision,
+  assertRenderable,
+  decideApproval,
+} from "./approval.ts";
