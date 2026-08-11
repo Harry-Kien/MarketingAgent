@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<title>V6 — Vietnamese font render verification</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=Be+Vietnam+Pro:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=block" rel="stylesheet">
+<style>
+  :root{
+    --paper:#FBFBFA; --surface:#FFFFFF; --ink:#16181C; --ink2:#4A505C;
+    --rule:#E3E5E9; --cham:#29406B; --tho:#A9701A; --moss:#2F6B4F; --brick:#9B3226;
+  }
+  body.dark{
+    --paper:#101216; --surface:#181B21; --ink:#F2F4F7; --ink2:#A6AEBC;
+    --rule:#262A32; --cham:#7C9BD1; --tho:#D9A047; --moss:#5FA37E; --brick:#D6705F;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:24px;background:var(--paper);color:var(--ink);
+       font-family:"Be Vietnam Pro",sans-serif;}
+  h1{font-family:"Archivo",sans-serif;font-size:22px;font-weight:700;margin:0 0 4px;
+     text-transform:uppercase;letter-spacing:.06em;font-stretch:87.5%;}
+  .sub{color:var(--ink2);font-size:12px;margin-bottom:20px}
+  section{background:var(--surface);border:1px solid var(--rule);padding:16px;margin-bottom:14px}
+  h2{font-family:"Archivo",sans-serif;font-size:11px;font-weight:600;text-transform:uppercase;
+     letter-spacing:.1em;color:var(--ink2);margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid var(--rule)}
+  .fA{font-family:"Archivo",sans-serif}
+  .fB{font-family:"Be Vietnam Pro",sans-serif}
+  .fM{font-family:"IBM Plex Mono",monospace}
+  .row{display:flex;gap:14px;align-items:baseline;margin-bottom:7px;flex-wrap:wrap}
+  .tag{font-family:"IBM Plex Mono",monospace;font-size:10px;color:var(--ink2);
+       min-width:104px;flex:none;text-transform:uppercase}
+  .s12{font-size:12px} .s14{font-size:14px} .s16{font-size:16px}
+  .s24{font-size:24px} .s32{font-size:32px}
+  .w400{font-weight:400} .w500{font-weight:500} .w600{font-weight:600} .w700{font-weight:700}
+  /* Deliberately tight leading to expose diacritic collision between stacked lines */
+  .tight{line-height:1.0;border-left:2px solid var(--tho);padding-left:10px;max-width:640px}
+  .tight div{font-size:15px}
+  table{border-collapse:collapse;width:100%;font-size:13px}
+  th{font-family:"Archivo",sans-serif;font-size:10px;font-weight:600;text-transform:uppercase;
+     letter-spacing:.08em;color:var(--ink2);text-align:left;padding:6px 8px;border-bottom:1px solid var(--rule)}
+  td{padding:6px 8px;border-bottom:1px solid var(--rule);vertical-align:middle}
+  td.num{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums;text-align:right}
+  /* State Ribbon: 11 stops, 3px tall, ~72px wide */
+  .ribbon{display:inline-flex;gap:2px;align-items:flex-end;height:7px}
+  .ribbon i{display:block;width:5px;height:3px;background:var(--rule)}
+  .ribbon i.done{background:var(--ink2)}
+  .ribbon i.now{height:5px;background:var(--tho)}
+  .rlabel{font-family:"Archivo",sans-serif;font-size:9px;font-weight:600;text-transform:uppercase;
+          letter-spacing:.09em;color:var(--tho);margin-left:8px;vertical-align:2px}
+  .glyphs{font-size:19px;line-height:1.75;word-spacing:3px}
+  .fallback{font-family:"NoSuchFontXYZ123",serif;font-size:15px;color:var(--brick)}
+  #probe{font-size:12px}
+  #probe td{padding:4px 8px}
+  .ok{color:var(--moss);font-weight:600}
+  .bad{color:var(--brick);font-weight:700}
+</style>
+</head>
+<body>
+
+<h1>V6 — Kiểm chứng render tiếng Việt</h1>
+<div class="sub fM" id="meta">Archivo · Be Vietnam Pro · IBM Plex Mono</div>
+
+<section>
+  <h2>1 — Câu kiểm tra bắt buộc, 5 cỡ chữ</h2>
+  <div class="row"><span class="tag">Archivo 32</span><span class="fA s32 w700">Sổ điều hành Marketing</span></div>
+  <div class="row"><span class="tag">BeVN 24</span><span class="fB s24 w600">Đang chờ bạn phê duyệt</span></div>
+  <div class="row"><span class="tag">BeVN 16</span><span class="fB s16 w400">Nghiên cứu thị trường và đối thủ</span></div>
+  <div class="row"><span class="tag">BeVN 14</span><span class="fB s14 w400">Tối ưu chuyển đổi, đo lường và tăng trưởng</span></div>
+  <div class="row"><span class="tag">BeVN 12</span><span class="fB s12 w400">Tối ưu chuyển đổi, đo lường và tăng trưởng</span></div>
+  <div class="row"><span class="tag">PlexMono 14</span><span class="fM s14 w400">Nghiên cứu thị trường và đối thủ</span></div>
+  <div class="row"><span class="tag">PlexMono 12</span><span class="fM s12 w400">Sổ điều hành — CMP-01H9 — 12,5%</span></div>
+</section>
+
+<section>
+  <h2>2 — Bốn font weight, cả ba họ chữ</h2>
+  <div class="row"><span class="tag">Archivo</span>
+    <span class="fA s16 w400">Đang chờ duyệt</span><span class="fA s16 w500">Đang chờ duyệt</span>
+    <span class="fA s16 w600">Đang chờ duyệt</span><span class="fA s16 w700">Đang chờ duyệt</span></div>
+  <div class="row"><span class="tag">Be Vietnam Pro</span>
+    <span class="fB s16 w400">Đang chờ duyệt</span><span class="fB s16 w500">Đang chờ duyệt</span>
+    <span class="fB s16 w600">Đang chờ duyệt</span><span class="fB s16 w700">Đang chờ duyệt</span></div>
+  <div class="row"><span class="tag">IBM Plex Mono</span>
+    <span class="fM s16 w400">Đang chờ duyệt</span><span class="fM s16 w500">Đang chờ duyệt</span>
+    <span class="fM s16 w600">Đang chờ duyệt</span><span class="fM s16 w700">Đang chờ duyệt</span></div>
+</section>
+
+<section>
+  <h2>3 — Chữ hoa, chữ thường, số, dấu ngoặc, phần trăm, tiền tệ</h2>
+  <div class="row"><span class="tag">Hoa BeVN</span><span class="fB s16 w600">SỔ ĐIỀU HÀNH · NGHIÊN CỨU THỊ TRƯỜNG · TỐI ƯU CHUYỂN ĐỔI</span></div>
+  <div class="row"><span class="tag">Hoa Archivo</span><span class="fA s16 w600">ĐANG CHỜ BẠN PHÊ DUYỆT · ĐÃ ĐĂNG · BỊ CHẶN</span></div>
+  <div class="row"><span class="tag">Thường</span><span class="fB s16 w400">sổ điều hành marketing · đang chờ bạn phê duyệt</span></div>
+  <div class="row"><span class="tag">Số + ký hiệu</span><span class="fM s16 w400">0123456789 (a) [b] {c} 12,5% 87.5% +24% −8%</span></div>
+  <div class="row"><span class="tag">Tiền VND</span><span class="fM s16 w500">1.250.000 ₫ · 12.500.000₫ · 990 000 VNĐ · 2,5 tr₫</span></div>
+  <div class="row"><span class="tag">Tiền BeVN</span><span class="fB s16 w500">1.250.000 ₫ · ngân sách 45.000.000 ₫ · CAC 320.000 ₫</span></div>
+</section>
+
+<section>
+  <h2>4 — Phủ toàn bộ dấu thanh tiếng Việt (Be Vietnam Pro)</h2>
+  <div class="fB glyphs">
+    a à á ả ã ạ ă ằ ắ ẳ ẵ ặ â ầ ấ ẩ ẫ ậ<br>
+    e è é ẻ ẽ ẹ ê ề ế ể ễ ệ · i ì í ỉ ĩ ị<br>
+    o ò ó ỏ õ ọ ô ồ ố ổ ỗ ộ ơ ờ ớ ở ỡ ợ<br>
+    u ù ú ủ ũ ụ ư ừ ứ ử ữ ự · y ỳ ý ỷ ỹ ỵ · đ<br>
+    A À Á Ả Ã Ạ Ă Ằ Ắ Ẳ Ẵ Ặ Â Ầ Ấ Ẩ Ẫ Ậ<br>
+    E È É Ẻ Ẽ Ẹ Ê Ề Ế Ể Ễ Ệ · I Ì Í Ỉ Ĩ Ị<br>
+    O Ò Ó Ỏ Õ Ọ Ô Ồ Ố Ổ Ỗ Ộ Ơ Ờ Ớ Ở Ỡ Ợ<br>
+    U Ù Ú Ủ Ũ Ụ Ư Ừ Ứ Ử Ữ Ự · Y Ỳ Ý Ỷ Ỹ Ỵ · Đ
+  </div>
+</section>
+
+<section>
+  <h2>5 — Phủ dấu thanh: Archivo (trên) và IBM Plex Mono (dưới)</h2>
+  <div class="fA glyphs">ẳ ẵ ặ ẫ ậ ỡ ợ ữ ự ỳ ỷ ỹ ỵ đ Ẳ Ẵ Ặ Ẫ Ậ Ỡ Ợ Ữ Ự Ỳ Ỷ Ỹ Ỵ Đ</div>
+  <div class="fM glyphs">ẳ ẵ ặ ẫ ậ ỡ ợ ữ ự ỳ ỷ ỹ ỵ đ Ẳ Ẵ Ặ Ẫ Ậ Ỡ Ợ Ữ Ự Ỳ Ỷ Ỹ Ỵ Đ</div>
+</section>
+
+<section>
+  <h2>6 — Va chạm dấu ở line-height 1.0 (điều kiện khắc nghiệt)</h2>
+  <div class="tight fB">
+    <div>ĐẦY ĐỦ DẤU THANH Ở DÒNG TRÊN: ẲẴẶỠỢỮỰ</div>
+    <div>Dòng dưới có dấu móc: ựữứừụ ợỡởớờ ỵỹỷỳ</div>
+    <div>ĐƯỜNG DẪN CHUYỂN ĐỔI VÀ TĂNG TRƯỞNG QUÝ</div>
+  </div>
+</section>
+
+<section>
+  <h2>7 — Bảng dữ liệu + State Ribbon label</h2>
+  <table>
+    <thead><tr>
+      <th style="width:34%">Chiến dịch</th><th style="width:22%">Trạng thái</th>
+      <th style="width:22%">Vòng đời</th><th class="num" style="width:11%">Ngân sách</th>
+      <th class="num" style="width:11%">Chuyển đổi</th>
+    </tr></thead>
+    <tbody>
+      <tr><td>Ra mắt gói tư vấn quý IV</td><td>Đang chờ bạn phê duyệt</td>
+        <td><span class="ribbon"><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i><i class="now"></i><i></i><i></i><i></i><i></i><i></i></span><span class="rlabel">Chờ duyệt</span></td>
+        <td class="num">45.000.000 ₫</td><td class="num">12,5%</td></tr>
+      <tr><td>Nghiên cứu thị trường đối thủ</td><td>Đã hoàn thành</td>
+        <td><span class="ribbon"><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i></span></td>
+        <td class="num">8.750.000 ₫</td><td class="num">4,8%</td></tr>
+      <tr><td>Tối ưu chuyển đổi trang đích</td><td>Đang thực thi</td>
+        <td><span class="ribbon"><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i><i class="now"></i><i></i><i></i></span></td>
+        <td class="num">1.250.000 ₫</td><td class="num">31,2%</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>8 — Fallback behavior (font không tồn tại → serif hệ thống)</h2>
+  <div class="fallback">Sổ điều hành Marketing — đây là hình dạng KHI FONT KHÔNG TẢI ĐƯỢC. Nếu mục 1–7 trông giống dòng này, font đã không được áp dụng.</div>
+</section>
+
+<section>
+  <h2>9 — Kiểm tra tự động: glyph coverage qua document.fonts.check()</h2>
+  <table id="probe"><thead><tr><th>Font</th><th>Weight</th><th>Đã tải</th><th>Phủ dấu thanh</th><th>Phủ ₫ / ký hiệu</th></tr></thead><tbody></tbody></table>
+</section>
+
+<script>
+const VN = "àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬÈÉẺẼẸÊỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢÙÚỦŨỤƯỪỨỬỮỰỲÝỶỸỴĐ";
+const SYM = "₫%()[]{}0123456789.,+−·";
+const fonts = ["Archivo","Be Vietnam Pro","IBM Plex Mono"];
+const weights = [400,500,600,700];
+document.fonts.ready.then(()=>{
+  const tb = document.querySelector("#probe tbody");
+  let allOk = true;
+  for(const f of fonts){
+    for(const w of weights){
+      const spec = w+" 16px '"+f+"'";
+      const loaded = document.fonts.check(spec);
+      const vn = document.fonts.check(spec, VN);
+      const sym = document.fonts.check(spec, SYM);
+      if(!loaded||!vn||!sym) allOk=false;
+      const tr=document.createElement("tr");
+      tr.innerHTML = "<td>"+f+"</td><td>"+w+"</td>"
+        + "<td class='"+(loaded?"ok":"bad")+"'>"+(loaded?"CÓ":"KHÔNG")+"</td>"
+        + "<td class='"+(vn?"ok":"bad")+"'>"+(vn?"ĐỦ":"THIẾU")+"</td>"
+        + "<td class='"+(sym?"ok":"bad")+"'>"+(sym?"ĐỦ":"THIẾU")+"</td>";
+      tb.appendChild(tr);
+    }
+  }
+  document.getElementById("meta").textContent =
+    "Kết quả tự động: " + (allOk ? "TẤT CẢ ĐẠT" : "CÓ MỤC KHÔNG ĐẠT")
+    + " · UA=" + navigator.userAgent.replace(/^Mozilla\/5\.0 /,"");
+  window.__V6 = {allOk:allOk};
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,138 @@
+# ─────────────────────────────────────────────────────────────
+# Solo Marketing OS — .gitignore
+#
+# Nguyên tắc: KHÔNG ignore tài liệu thiết kế và research evidence.
+# docs/ phải kiểm toán được, gồm cả ảnh bằng chứng trong
+# docs/research/assets/. Xem Definition of Done mục 11.
+# ─────────────────────────────────────────────────────────────
+
+# ── Secret và environment ───────────────────────────────────
+# Bất biến: secret không bao giờ vào repo (T4).
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+credentials.json
+service-account*.json
+client_secret*.json
+secrets/
+.secrets/
+*.secret
+*.credentials
+
+# ── Node / package manager ──────────────────────────────────
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/*
+!.yarn/patches
+!.yarn/releases
+!.yarn/plugins
+!.yarn/versions
+.pnp.*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ── Build output ────────────────────────────────────────────
+.next/
+out/
+build/
+dist/
+.turbo/
+.vercel/
+*.tsbuildinfo
+next-env.d.ts
+
+# ── Test và coverage output ─────────────────────────────────
+coverage/
+.nyc_output/
+test-results/
+junit.xml
+*.lcov
+
+# ── Playwright ──────────────────────────────────────────────
+playwright-report/
+blob-report/
+.playwright/
+.playwright-mcp/
+playwright/.cache/
+playwright/.auth/
+**/__screenshots__/
+**/*-snapshots/
+trace.zip
+*.webm
+
+# ── Database local ──────────────────────────────────────────
+*.sqlite
+*.sqlite3
+*.db
+pgdata/
+postgres-data/
+.pgdata/
+docker-volumes/
+dump.sql
+*.dump
+*.bak
+
+# ── Telemetry / log runtime ─────────────────────────────────
+logs/
+*.log
+.otel/
+
+# ── Cache công cụ ───────────────────────────────────────────
+.cache/
+.eslintcache
+.stylelintcache
+.parcel-cache/
+.swc/
+.rollup.cache/
+tsconfig.tsbuildinfo
+
+# ── Hệ điều hành ────────────────────────────────────────────
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+# Linux
+*~
+.directory
+.fuse_hidden*
+.nfs*
+
+# ── IDE — chỉ ignore phần cá nhân, giữ phần chia sẻ ─────────
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.shared.json
+.idea/
+*.iml
+*.ipr
+*.iws
+.fleet/
+*.sublime-workspace
+*.sublime-project
+
+# ── Tạm ─────────────────────────────────────────────────────
+tmp/
+temp/
+.tmp/
+*.tmp
+*.pid
+*.seed
