@@ -7,6 +7,16 @@ const serverEnvSchema = z.object({
     .refine((v) => v.startsWith("postgres://") || v.startsWith("postgresql://"), {
       message: "DATABASE_URL must be a postgres:// connection string",
     }),
+  // Optional: only apps/worker's outbox-draining path ever needs this (the
+  // smos_worker credential, 0017_outbox_claim_token.sql) -- apps/web has no
+  // reason to hold it. When present, it is validated the same way
+  // DATABASE_URL is.
+  DATABASE_WORKER_URL: z
+    .string()
+    .refine((v) => v.startsWith("postgres://") || v.startsWith("postgresql://"), {
+      message: "DATABASE_WORKER_URL must be a postgres:// connection string",
+    })
+    .optional(),
   OTEL_SERVICE_NAME: z.string().min(1),
   OTEL_EXPORTER_OTLP_ENDPOINT: z.string().url().optional(),
 });

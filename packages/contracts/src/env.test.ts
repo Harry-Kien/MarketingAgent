@@ -32,4 +32,26 @@ describe("parseServerEnv", () => {
       expect(String(error)).not.toContain("SUPERSECRET");
     }
   });
+
+  // Final whole-branch review, FINDING 7. DATABASE_WORKER_URL is optional
+  // here (apps/web has no reason to ever hold it -- only apps/worker's own
+  // draining path does), but when present it must be validated the same
+  // way DATABASE_URL is: a real postgres connection string, not silently
+  // accepted as anything.
+  it("accepts an environment with no DATABASE_WORKER_URL at all (optional)", () => {
+    const env = parseServerEnv(valid);
+    expect(env.DATABASE_WORKER_URL).toBeUndefined();
+  });
+
+  it("accepts a valid DATABASE_WORKER_URL", () => {
+    const withWorkerUrl = { ...valid, DATABASE_WORKER_URL: "postgres://smos_worker:pw@127.0.0.1:5433/smos" };
+    const env = parseServerEnv(withWorkerUrl);
+    expect(env.DATABASE_WORKER_URL).toBe(withWorkerUrl.DATABASE_WORKER_URL);
+  });
+
+  it("rejects a non-postgres DATABASE_WORKER_URL", () => {
+    expect(() => parseServerEnv({ ...valid, DATABASE_WORKER_URL: "mysql://x" })).toThrow(
+      /DATABASE_WORKER_URL/,
+    );
+  });
 });
