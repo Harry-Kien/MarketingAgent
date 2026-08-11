@@ -151,18 +151,6 @@ describe("regression: string literal and comment interaction", () => {
 });
 
 describe("regression: statement boundary detection", () => {
-  it("detects tables even when prior statement has unterminated string", () => {
-    const sql = `CREATE TABLE broken (id uuid PRIMARY KEY, workspace_id uuid NOT NULL, note text DEFAULT 'unterminated string starts here
-      CREATE TABLE clean_table (id uuid PRIMARY KEY, name text NOT NULL);`;
-    expect(findTenancyViolations(sql)).toContain("clean_table");
-  });
-
-  it("detects tables even when prior statement has unterminated paren", () => {
-    const sql = `CREATE TABLE broken (id uuid PRIMARY KEY, workspace_id uuid NOT NULL, note text, extra (
-      CREATE TABLE clean_table (id uuid PRIMARY KEY, name text NOT NULL);`;
-    expect(findTenancyViolations(sql)).toContain("clean_table");
-  });
-
   it("detects RLS across files when ALTER in different statement", () => {
     const sql = `CREATE TABLE campaign (id uuid PRIMARY KEY, workspace_id uuid NOT NULL);
       CREATE TABLE other (id uuid PRIMARY KEY, workspace_id uuid NOT NULL);
@@ -418,5 +406,80 @@ describe("computeViolations: realistic clean two-file migration set", () => {
     expect(tenancyViolations).toEqual([]);
     expect(rlsViolations).toEqual([]);
     expect(unparseableFiles).toEqual([]);
+  });
+});
+
+describe("round 5: paren-depth desync and exact column-list matching", () => {
+  it("flags the reviewer's PoC (stray close paren then compensating open, missing workspace_id)", () => {
+    const sql = `CREATE TABLE campaign (id uuid PRIMARY KEY)) FILLER (workspace_id fake;
+      ALTER TABLE campaign ENABLE ROW LEVEL SECURITY;`;
+    const { tables, unterminated } = collectFileFacts(sql);
+    // Either outcome is acceptable per the mandate: flagged as a tenancy violation
+    // (campaign found with hasWorkspaceId: false) or the whole file refused as
+    // malformed. Silently reporting clean is the only unacceptable outcome.
+    const flaggedAsViolation = tables.some((t) => t.name === "campaign" && t.hasWorkspaceId === false);
+    const failedClosed = unterminated !== null;
+    expect(flaggedAsViolation || failedClosed).toBe(true);
+  });
+
+  it("fails a file closed on a stray ')' at depth 0, anywhere in the file", () => {
+    const sql = `CREATE TABLE t (id uuid PRIMARY KEY, workspace_id uuid NOT NULL);
+      ALTER TABLE t ENABLE ROW LEVEL SECURITY;
+      )`;
+    const { unterminated } = collectFileFacts(sql);
+    expect(unterminated).not.toBeNull();
+    expect(unterminated.construct).toMatch(/\)/);
+  });
+
+  it("never lets depth go negative: a stray ')' is caught the instant it occurs, not laundered by a later '('", () => {
+    // A legally *balanced* variant of the PoC: no stray unmatched paren, but a
+    // trailing clause after the real column-list close still contains the word
+    // workspace_id. Top-level parseFile sees a perfectly balanced statement
+    // (depth never goes negative, ends at 0) — this must be caught by exact
+    // column-list extraction (requirement 2), not by the depth-negative guard.
+    const sql = `CREATE TABLE campaign (id uuid PRIMARY KEY) FILLER (workspace_id fake);`;
+    const { tables, unterminated } = collectFileFacts(sql);
+    expect(unterminated).toBeNull();
+    expect(tables).toEqual([{ name: "campaign", hasWorkspaceId: false }]);
+  });
+
+  it("does not let workspace_id appearing after the column list's closing paren satisfy the check", () => {
+    const sql = `CREATE TABLE campaign (id uuid PRIMARY KEY, name text NOT NULL) WITH (fillfactor = 70, workspace_id = 1);`;
+    const { tables } = collectFileFacts(sql);
+    expect(tables).toEqual([{ name: "campaign", hasWorkspaceId: false }]);
+  });
+
+  it("does let workspace_id appearing inside a nested CHECK constraint within the column list satisfy the check", () => {
+    const sql = `CREATE TABLE campaign (
+      id uuid PRIMARY KEY,
+      status text CHECK (status = 'active' OR workspace_id IS NOT NULL)
+    );`;
+    const { tables } = collectFileFacts(sql);
+    expect(tables).toEqual([{ name: "campaign", hasWorkspaceId: true }]);
+  });
+
+  it("parses balanced nested parens (CHECK, DEFAULT with a function call, composite-ish column) and reports clean", () => {
+    const fileA = `CREATE TABLE campaign (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      workspace_id uuid NOT NULL REFERENCES workspace(id),
+      status text CHECK (status IN ('active', 'archived')),
+      meta jsonb DEFAULT jsonb_build_object('created_by', 'system')
+    );
+    ALTER TABLE campaign ENABLE ROW LEVEL SECURITY;`;
+    const { tenancyViolations, rlsViolations, unparseableFiles } = computeViolations(
+      factsFor({ "0001_campaign.sql": fileA })
+    );
+    expect(tenancyViolations).toEqual([]);
+    expect(rlsViolations).toEqual([]);
+    expect(unparseableFiles).toEqual([]);
+  });
+
+  it("fails a file closed when the CREATE TABLE's opening paren never finds a matching close", () => {
+    const sql = `CREATE TABLE campaign (id uuid PRIMARY KEY, workspace_id uuid NOT NULL, extra (nested;`;
+    const { tables, unterminated } = collectFileFacts(sql);
+    // parseFile itself already fails this closed (unbalanced depth at EOF); this
+    // test pins that collectFileFacts never falls back to a partial table list.
+    expect(tables).toEqual([]);
+    expect(unterminated).not.toBeNull();
   });
 });

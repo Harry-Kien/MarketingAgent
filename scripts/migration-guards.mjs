@@ -109,9 +109,16 @@ export function stripComments(sql) {
 }
 
 /**
- * Split SQL text on semicolons at nesting depth 0, handling unclosed constructs.
- * Resets depth when encountering new CREATE/ALTER statements at depth > 0
- * to recover from malformed statements and prevent cascading failures.
+ * Split SQL text on semicolons at nesting depth 0. String-, quoted-identifier-,
+ * and dollar-quote-aware, so a `;` inside any of those never splits a
+ * statement. Does NOT attempt to recover from unclosed constructs — round 3's
+ * newline+keyword lookahead heuristic that tried to guess a statement
+ * boundary inside an unterminated string/paren was removed in round 5 (it is
+ * the anti-pattern the fail-closed `parseFile`/`collectFileFacts` pipeline
+ * exists to replace; see the module header comment). On malformed input this
+ * simply yields whatever partial text accumulated as a final degenerate
+ * "statement" — callers that need fail-closed guarantees must use
+ * `parseFile`/`collectFileFacts`, not this function.
  */
 export function splitStatements(sql) {
   const statements = [];
@@ -119,43 +126,11 @@ export function splitStatements(sql) {
   let i = 0;
   let depth = 0;
   let inString = false;
-  let stringChar = null;
 
   while (i < sql.length) {
-    // Check for statement keywords at line boundaries - force split if we're in an unclosed construct
-    if (sql[i] === '\n') {
-      // Look ahead to see if the next non-whitespace content is a statement keyword
-      let j = i + 1;
-      while (j < sql.length && /[ \t]/.test(sql[j])) {
-        j++;
-      }
-      const nextChars = sql.substring(j, Math.min(j + 50, sql.length));
-      if (/^(CREATE|ALTER|INSERT|UPDATE|DELETE|DROP|WITH)\s+/i.test(nextChars)) {
-        // If we're in an unclosed construct, treat this as a statement boundary
-        if (depth > 0 || inString) {
-          current += '\n';
-          if (current.trim()) {
-            statements.push(current);
-          }
-          current = '';
-          depth = 0;
-          inString = false;
-          stringChar = null;
-          i++;
-          continue;
-        }
-      }
-    }
-
-    // Check if we're at the start of a new statement keyword while depth > 0 and not in string
-    if (depth > 0 && !inString && /^\s*(CREATE|ALTER|INSERT|UPDATE|DELETE|DROP|WITH)\s+/i.test(sql.substring(i))) {
-      depth = 0;
-    }
-
     // Single-quoted string
     if (!inString && sql[i] === "'") {
       inString = true;
-      stringChar = "'";
       current += sql[i];
       i++;
       while (i < sql.length) {
@@ -165,33 +140,8 @@ export function splitStatements(sql) {
         } else if (sql[i] === "'") {
           current += sql[i];
           inString = false;
-          stringChar = null;
           i++;
           break;
-        } else if (sql[i] === '\n') {
-          // Check if next line starts with CREATE/ALTER - if so, this unterminated string
-          // marks the end of the current statement
-          current += sql[i];
-          let j = i + 1;
-          while (j < sql.length && /[ \t]/.test(sql[j])) {
-            j++;
-          }
-          const nextChars = sql.substring(j, Math.min(j + 50, sql.length));
-          if (/^(CREATE|ALTER|INSERT|UPDATE|DELETE|DROP|WITH)\s+/i.test(nextChars)) {
-            // Unterminated string before new statement - force split
-            if (current.trim()) {
-              statements.push(current);
-            }
-            current = '';
-            depth = 0;
-            inString = false;
-            stringChar = null;
-            i++;
-            break;  // Exit string parsing, continue main loop
-          } else {
-            current += sql[i];
-            i++;
-          }
         } else {
           current += sql[i];
           i++;
@@ -201,7 +151,6 @@ export function splitStatements(sql) {
     // Double-quoted identifier
     else if (!inString && sql[i] === '"') {
       inString = true;
-      stringChar = '"';
       current += sql[i];
       i++;
       while (i < sql.length) {
@@ -211,7 +160,6 @@ export function splitStatements(sql) {
         } else if (sql[i] === '"') {
           current += sql[i];
           inString = false;
-          stringChar = null;
           i++;
           break;
         } else {
@@ -231,14 +179,12 @@ export function splitStatements(sql) {
       if (j < sql.length && sql[j] === '$') {
         const dollarQuote = '$' + tag + '$';
         inString = true;
-        stringChar = dollarQuote;
         current += dollarQuote;
         i = j + 1;
         while (i < sql.length) {
           if (sql.substr(i, dollarQuote.length) === dollarQuote) {
             current += dollarQuote;
             inString = false;
-            stringChar = null;
             i += dollarQuote.length;
             break;
           } else {
@@ -263,15 +209,13 @@ export function splitStatements(sql) {
       current += sql[i];
       i++;
     }
-    // Semicolon at depth 0 (statement boundary, always splits even if inString)
+    // Semicolon at depth 0 (statement boundary)
     else if (sql[i] === ';' && depth === 0) {
       current += sql[i];
       if (current.trim()) {
         statements.push(current);
       }
       current = '';
-      inString = false;  // Reset in case of unclosed string
-      stringChar = null;
       i++;
     }
     else {
@@ -333,15 +277,20 @@ export function findRlsViolations(sql) {
 }
 
 /* =============================================================================
- * Per-file, fail-closed parsing (round 4).
+ * Per-file, fail-closed parsing (rounds 4-5).
  *
- * Everything above this line (`stripComments`, `splitStatements`,
- * `findTenancyViolations`, `findRlsViolations`) is UNCHANGED from round 3 and
- * is kept only so the original 24-test suite keeps passing byte-for-byte —
- * see the round-4 report section for why. `check-migrations.mjs` (the actual
- * CI gate) no longer calls any of it.
+ * `stripComments`, `findTenancyViolations`, `findRlsViolations` above are
+ * UNCHANGED from round 3 and kept only so the original 24-test suite (minus
+ * the two tests retired in round 5 that pinned the removed heuristic — see
+ * the round-5 report section) keeps passing. `check-migrations.mjs` (the
+ * actual CI gate) does not call any of them. `splitStatements` above HAS
+ * changed in round 5: the newline+keyword lookahead recovery heuristic was
+ * deleted (it was never load-bearing for the gate, only for the two retired
+ * tests) — it now just splits correctly on well-formed input and degrades
+ * to a single trailing partial statement on malformed input, with no
+ * guessing.
  *
- * The functions below are the real guard. Three rules make it structurally
+ * The functions below are the real guard. Rules that make it structurally
  * different from everything above:
  *
  *   1. `parseFile` is called once per migration file. It is never given text
@@ -350,11 +299,19 @@ export function findRlsViolations(sql) {
  *      in.
  *   2. `parseFile` never guesses. If it reaches end-of-input still inside a
  *      string, a dollar-quoted block, a block comment, or with unbalanced
- *      parentheses, it stops and reports exactly what was left open. It does
- *      not look ahead for "CREATE"/"ALTER" to recover a boundary the way
- *      round 3's `splitStatements` does — that lookahead is precisely the
- *      class of heuristic this rewrite removes.
- *   3. Cross-file aggregation (`computeViolations`) operates on plain data —
+ *      parentheses, it stops and reports exactly what was left open. It also
+ *      never lets its paren-depth counter go negative: a stray ')' with no
+ *      matching '(' fails the file the instant it is seen, rather than
+ *      letting a later unrelated '(' net the count back to zero and launder
+ *      the structural error (round 5, CRITICAL).
+ *   3. `collectFileFacts` extracts a CREATE TABLE's column body as the EXACT
+ *      span between its opening '(' and the matching ')' (`findMatchingParen`,
+ *      string/dollar-quote aware), never "everything from the opening paren
+ *      to the end of the statement." Text after the real close cannot
+ *      satisfy the `workspace_id` check just by containing that word
+ *      (round 5, CRITICAL). If the matching ')' cannot be found, the file
+ *      fails closed.
+ *   4. Cross-file aggregation (`computeViolations`) operates on plain data —
  *      arrays of {name, hasWorkspaceId} and lists of RLS-enabled table names
  *      — never on concatenated SQL text.
  * ============================================================================= */
@@ -501,6 +458,16 @@ export function parseFile(sql) {
       continue;
     }
     if (ch === ")") {
+      // A close paren with no open to match is malformed input the instant it
+      // happens — depth must never go negative. Netting back to zero via a
+      // later, unrelated '(' would launder a structural error and desync
+      // every statement/body boundary computed after this point (round 5,
+      // CRITICAL: reviewer-constructed PoC). Fail this file closed here,
+      // rather than only detecting an imbalance at EOF.
+      if (depth === 0) {
+        unterminated = { construct: "unbalanced parentheses (unexpected ')' with no matching '(')" };
+        break outer;
+      }
       depth--;
       current += ch;
       i++;
@@ -534,12 +501,104 @@ const FILE_CREATE_TABLE = /^\s*CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+(?:"?\w
 const FILE_ENABLE_RLS = /^\s*ALTER\s+TABLE\s+(?:"?\w+"?\.)?"?(\w+)"?\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY/i;
 
 /**
+ * Given `text` (an already-vetted, single top-level statement — parseFile
+ * guarantees it is balanced and contains no unterminated string, quoted
+ * identifier, or dollar-quoted block) and the index of an opening '(' within
+ * it, scan forward to the index of its EXACT matching ')'. Parens inside
+ * string literals, quoted identifiers, or dollar-quoted blocks are skipped so
+ * they cannot desync the count; nested parens (CHECK, DEFAULT with a function
+ * call, composite types) are balanced correctly. Returns -1 if no matching
+ * close is found before the end of `text` — the caller must treat that as a
+ * parse failure, never as "the column list is empty".
+ */
+function findMatchingParen(text, openIndex) {
+  let depth = 0;
+  let i = openIndex;
+  const n = text.length;
+
+  while (i < n) {
+    const ch = text[i];
+
+    if (ch === "'") {
+      i++;
+      while (i < n) {
+        if (text[i] === "'" && text[i + 1] === "'") {
+          i += 2;
+          continue;
+        }
+        if (text[i] === "'") {
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      i++;
+      while (i < n) {
+        if (text[i] === '"' && text[i + 1] === '"') {
+          i += 2;
+          continue;
+        }
+        if (text[i] === '"') {
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (ch === "$") {
+      let j = i + 1;
+      let tag = "";
+      while (j < n && /\w/.test(text[j])) {
+        tag += text[j];
+        j++;
+      }
+      if (text[j] === "$") {
+        const dollarQuote = `$${tag}$`;
+        const closeIdx = text.indexOf(dollarQuote, j + 1);
+        if (closeIdx === -1) return -1;
+        i = closeIdx + dollarQuote.length;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (ch === "(") {
+      depth++;
+      i++;
+      continue;
+    }
+    if (ch === ")") {
+      depth--;
+      if (depth === 0) return i;
+      if (depth < 0) return -1;
+      i++;
+      continue;
+    }
+    i++;
+  }
+  return -1;
+}
+
+/**
  * Collect facts from a single migration file: which tables it declares
  * (bare name, plus whether the column body mentions `workspace_id`), and
  * which tables it enables row level security on. Returns
  * `{ tables: [], rlsEnabled: [], unterminated }` with empty arrays when the
  * file could not be parsed to completion — an unterminated file yields no
  * facts at all, it is never partially trusted.
+ *
+ * The column body used for the `workspace_id` check is the EXACT span
+ * between a CREATE TABLE's opening '(' and its matching ')' (via
+ * `findMatchingParen`), never "everything from the opening paren to the end
+ * of the statement." Anything after the real close — a trailing WITH (...)
+ * clause, storage parameters, whatever — cannot satisfy the check just by
+ * containing the word `workspace_id` (round 5, CRITICAL). If the matching
+ * ')' cannot be found, the whole file fails closed rather than being
+ * treated as a table with no columns.
  */
 export function collectFileFacts(sql) {
   const { statements, unterminated } = parseFile(sql);
@@ -553,8 +612,18 @@ export function collectFileFacts(sql) {
   for (const stmt of statements) {
     const createMatch = stmt.match(FILE_CREATE_TABLE);
     if (createMatch) {
-      const parenStart = stmt.indexOf("(");
-      const body = parenStart === -1 ? "" : stmt.slice(parenStart + 1);
+      // The regex is anchored at ^ and ends in a literal '(', so its last
+      // matched character is that opening paren's exact index in `stmt`.
+      const parenStart = createMatch[0].length - 1;
+      const parenEnd = findMatchingParen(stmt, parenStart);
+      if (parenEnd === -1) {
+        return {
+          tables: [],
+          rlsEnabled: [],
+          unterminated: { construct: `unmatched '(' in CREATE TABLE ${createMatch[1]}` },
+        };
+      }
+      const body = stmt.slice(parenStart + 1, parenEnd);
       foundTables.push({ name: createMatch[1], hasWorkspaceId: /\bworkspace_id\b/.test(body) });
       continue;
     }
