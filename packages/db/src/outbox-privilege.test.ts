@@ -246,4 +246,63 @@ describe("outbox privileged path", () => {
       tx.query("select published_at from outbox where correlation_id = $1", [correlationId]));
     expect(after.rows[0].published_at).not.toBeNull();
   });
+
+  // Final whole-branch review round 2, RESIDUAL HIGH (same class as the
+  // agent_version_m1_activation_gate finding). `SET search_path = public`
+  // alone does not stop a session from shadowing an unqualified relation
+  // reference with its own `pg_temp` table, which is implicitly searched
+  // before any configured search_path. Proves outbox_claim_batch /
+  // outbox_mark_published (0022_function_table_qualification.sql) resist
+  // exactly that: a smos_worker session creates its own `pg_temp.outbox`
+  // decoy, shaped so a naive unqualified query would read/write it instead
+  // of the real table, and the claim still operates on the real,
+  // public.outbox row.
+  it("a session-local pg_temp.outbox decoy cannot redirect outbox_claim_batch / outbox_mark_published", async () => {
+    const correlationId = trackId(newId());
+    await withTenant(pool, A, (tx) =>
+      enqueueInTransaction(tx, {
+        workspaceId: A,
+        eventType: `test.privilege.pg-temp-shadow.${suffix}`,
+        payload: {},
+        correlationId,
+      }));
+
+    const client = await workerPool.connect();
+    try {
+      // Same columns as the real table's row shape, so a query that
+      // accidentally hit this one wouldn't even fail loudly -- it would
+      // just silently claim/mark the decoy instead of the real row.
+      await client.query(
+        `create temp table outbox (
+           id uuid primary key, workspace_id uuid, event_type text,
+           payload jsonb, correlation_id uuid, published_at timestamptz,
+           created_at timestamptz default now(), claimed_by uuid, claimed_at timestamptz
+         )`,
+      );
+
+      await client.query("begin");
+      const claimed = await client.query("select * from outbox_claim_batch($1)", [50]);
+      const mine = claimed.rows.find((r: { correlation_id: string }) => r.correlation_id === correlationId);
+      expect(mine, "the real row was claimed, not silently skipped in favour of the empty decoy").toBeDefined();
+
+      const marked = await client.query("select outbox_mark_published($1, $2) as marked", [
+        mine.id,
+        mine.claimed_by,
+      ]);
+      expect(marked.rows[0].marked).toBe(true);
+      await client.query("commit");
+
+      // The decoy temp table must still be empty -- nothing was ever
+      // routed into it.
+      const decoyCount = await client.query("select count(*)::int as n from pg_temp.outbox");
+      expect(decoyCount.rows[0].n).toBe(0);
+    } finally {
+      await client.query("drop table if exists pg_temp.outbox").catch(() => undefined);
+      client.release();
+    }
+
+    const after = await withTenant(pool, A, (tx) =>
+      tx.query("select published_at from outbox where correlation_id = $1", [correlationId]));
+    expect(after.rows[0].published_at).not.toBeNull();
+  });
 });

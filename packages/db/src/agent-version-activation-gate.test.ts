@@ -234,4 +234,53 @@ describe("agent_version M1 activation gate", () => {
     // infrastructure and must never carry test debris.
     await adminPool.query(`drop table if exists pgboss.agent_definition`).catch(() => undefined);
   });
+
+  // Final review round 2, RESIDUAL HIGH. `SET search_path = public` alone
+  // does not close this: PostgreSQL implicitly searches `pg_temp` (the
+  // calling session's own temporary schema) BEFORE anything in the
+  // configured search_path, for every unqualified relation reference,
+  // regardless of what search_path is set to. A session-local `CREATE TEMP
+  // TABLE agent_definition` therefore shadows the real table for the gate's
+  // unqualified `FROM agent_definition` exactly as a named decoy schema
+  // did -- no CREATE ON DATABASE, no schema ownership, and no `SET
+  // search_path` call by the attacker are needed at all. Reproduced live
+  // against a freshly migrated database as plain smos_app before this
+  // fix. Closed by schema-qualifying the reference inside the function body
+  // itself (`public.agent_definition`), which pg_temp's implicit
+  // precedence cannot override -- `SET search_path = public` stays too, as
+  // belt and braces against the named-schema variant proven above.
+  it("a CREATE TEMP TABLE agent_definition shadow cannot forge the gate's role lookup either", async () => {
+    const definitionId = definitionIdByRole.get("integration_reliability")!;
+
+    const client = await pool.connect();
+    try {
+      await client.query("begin");
+      await client.query("set local role smos_app");
+      await client.query("select set_config('app.workspace_id', $1, true)", [W]);
+
+      // No search_path manipulation at all -- pg_temp's implicit priority
+      // over any configured search_path is the entire attack.
+      await client.query(`create temp table agent_definition (id uuid, workspace_id uuid, role text)`);
+      await client.query(
+        `insert into agent_definition (id, workspace_id, role) values ($1, $2, 'content')`,
+        [definitionId, W],
+      );
+
+      await expect(
+        client.query(
+          `insert into agent_version (id, workspace_id, agent_definition_id, version_number, activated, prompt_version, model_version, budget_usd)
+           values (gen_random_uuid(), $1, $2, 5, true, 'p1', 'm1', 1.0)`,
+          [W, definitionId],
+        ),
+      ).rejects.toThrow(/M1|activated/i);
+    } finally {
+      // TEMP tables are session-scoped, not merely transaction-scoped, so a
+      // rollback alone would not drop it -- the connection is about to be
+      // released back to the pool for reuse by another test, so drop it
+      // explicitly rather than relying on the session ending.
+      await client.query("drop table if exists agent_definition").catch(() => undefined);
+      await client.query("rollback").catch(() => undefined);
+      client.release();
+    }
+  });
 });
