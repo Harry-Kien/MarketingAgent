@@ -13,11 +13,24 @@ const url =
 const pool = createDbPool(url);
 const db = createDb(pool);
 
+// Fix round 1 on Task 11: smos_app has no EXECUTE on outbox_claim_batch /
+// outbox_mark_published at all any more -- only the drain worker's own
+// role does (0017_outbox_claim_token.sql). enqueueInTransaction and every
+// tenant-scoped assertion below still go through the smos_app pool above,
+// exactly as the application would; only drainOutbox itself needs the
+// worker pool, matching how apps/worker is meant to be configured
+// (DATABASE_WORKER_URL, not DATABASE_URL).
+const workerUrl =
+  process.env["DATABASE_WORKER_URL"] ??
+  "postgres://smos_worker:smos_worker_local_dev@127.0.0.1:5433/smos";
+const workerPool = createDbPool(workerUrl);
+
 // Admin connection: only used to seed/clean up outside any single
 // workspace's RLS view (workspace rows themselves, and end-of-suite
 // cleanup of outbox rows this file created). Never used to exercise the
-// behavior under test -- every assertion about tenant scoping or draining
-// goes through the smos_app pool above, exactly as the application would.
+// behavior under test -- every assertion about tenant scoping goes through
+// the smos_app pool, and every drain goes through the worker pool, exactly
+// as the application would.
 const adminUrl =
   process.env["DATABASE_MIGRATION_URL"] ?? "postgres://smos:smos_local_dev@127.0.0.1:5433/smos";
 const adminPool = createDbPool(adminUrl);
@@ -59,6 +72,7 @@ afterAll(async () => {
     ]);
   }
   await pool.end();
+  await workerPool.end();
   await adminPool.end();
 });
 
@@ -107,8 +121,8 @@ describe("transactional outbox", () => {
       }));
 
     const q = fakeQueue();
-    const first = await drainOutbox(pool, q as never);
-    const second = await drainOutbox(pool, q as never);
+    const first = await drainOutbox(workerPool, q as never);
+    const second = await drainOutbox(workerPool, q as never);
     expect(first).toBeGreaterThan(0);
     expect(second).toBe(0);
 
@@ -136,14 +150,14 @@ describe("transactional outbox", () => {
 
     const q1 = fakeQueue();
     const q2 = fakeQueue();
-    // A second, independent pool: two truly separate connections draining
-    // at the same time is what actually exercises SKIP LOCKED, rather than
-    // two sequential calls against one pool that never overlap.
-    const pool2 = createDbPool(url);
+    // A second, independent worker pool: two truly separate connections
+    // draining at the same time is what actually exercises SKIP LOCKED,
+    // rather than two sequential calls against one pool that never overlap.
+    const workerPool2 = createDbPool(workerUrl);
     try {
       const [n1, n2] = await Promise.all([
-        drainOutbox(pool, q1 as never, rowCount),
-        drainOutbox(pool2, q2 as never, rowCount),
+        drainOutbox(workerPool, q1 as never, rowCount),
+        drainOutbox(workerPool2, q2 as never, rowCount),
       ]);
 
       const allSent = [...q1.sent, ...q2.sent].filter((s) => s.name === `test.concurrent.${suffix}`);
@@ -159,7 +173,7 @@ describe("transactional outbox", () => {
         ));
       expect(published.rows[0].n).toBe(rowCount);
     } finally {
-      await pool2.end();
+      await workerPool2.end();
     }
   });
 
@@ -199,7 +213,7 @@ describe("transactional outbox", () => {
       },
     };
 
-    await expect(drainOutbox(pool, flakyQueue as never, 3)).rejects.toThrow("queue unavailable");
+    await expect(drainOutbox(workerPool, flakyQueue as never, 3)).rejects.toThrow("queue unavailable");
     expect(calls).toBeGreaterThan(0);
 
     const rows = await withTenant(pool, A, (tx) =>
@@ -219,7 +233,7 @@ describe("transactional outbox", () => {
     // drained by a later, unrelated test run against this same database.
     // Mark it done via a clean drain so it does not linger.
     const cleanupQueue = fakeQueue();
-    await drainOutbox(pool, cleanupQueue as never, 10);
+    await drainOutbox(workerPool, cleanupQueue as never, 10);
   });
 
   // --- Beyond the brief: tenant isolation on the outbox table itself ------

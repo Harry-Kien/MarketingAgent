@@ -97,6 +97,25 @@ async function main() {
     // still never interpolated unescaped.
     await client.query(`ALTER ROLE smos_app PASSWORD ${client.escapeLiteral(smosAppPassword)}`);
     console.log("smos_app password set from SMOS_APP_PASSWORD");
+
+    // Same pattern, for the worker's own login role (0017_outbox_claim_token.sql):
+    // smos_worker is a separate credential from smos_app so the worker process
+    // (the only thing with EXECUTE on outbox_claim_batch / outbox_mark_published)
+    // is not reachable using the web app's own DATABASE_URL.
+    const smosWorkerPassword = process.env["SMOS_WORKER_PASSWORD"];
+    if (!smosWorkerPassword) {
+      console.error(
+        "SMOS_WORKER_PASSWORD is not set. Refusing to leave smos_worker without a " +
+          "password: set SMOS_WORKER_PASSWORD (see .env.example) and re-run " +
+          "npm run db:migrate.",
+      );
+      process.exitCode = 1;
+      return;
+    }
+    await client.query(
+      `ALTER ROLE smos_worker PASSWORD ${client.escapeLiteral(smosWorkerPassword)}`,
+    );
+    console.log("smos_worker password set from SMOS_WORKER_PASSWORD");
   } finally {
     client.release();
     await pool.end();

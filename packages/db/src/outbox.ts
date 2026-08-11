@@ -40,6 +40,7 @@ interface OutboxRow {
   event_type: string;
   payload: Record<string, unknown>;
   correlation_id: string;
+  claimed_by: string;
 }
 
 /**
@@ -51,21 +52,33 @@ interface OutboxRow {
  * This does NOT run with an application role that has BYPASSRLS: that would
  * hand every other code path on this connection the same bypass, which is
  * exactly the class of incident ADR-007's database layer exists to make
- * impossible even when application code is wrong. Instead, `pool` connects
- * as smos_app exactly as everywhere else, and the two privileged steps --
- * claiming a batch across workspaces, and marking a row published -- go
- * through `outbox_claim_batch` / `outbox_mark_published`, two narrow SQL
- * functions owned by a separate, NOLOGIN, BYPASSRLS-only role
- * (`smos_outbox_drainer`, see 0016_outbox.sql). smos_app is only ever
- * granted EXECUTE on those two functions, never BYPASSRLS itself and never
- * direct cross-workspace SELECT/UPDATE on `outbox`. The privilege escalation
- * is explicit, narrow and auditable in the migration, not incidental here.
+ * impossible even when application code is wrong. `pool` here is expected to
+ * connect as `smos_worker` (DATABASE_WORKER_URL) -- a separate login from
+ * `smos_app` (DATABASE_URL) -- and the two privileged steps -- claiming a
+ * batch across workspaces, and marking a row published -- go through
+ * `outbox_claim_batch` / `outbox_mark_published`, two narrow SQL functions
+ * owned by a separate, NOLOGIN, BYPASSRLS-only role (`smos_outbox_drainer`,
+ * see 0016_outbox.sql / 0017_outbox_claim_token.sql). `smos_app` has no
+ * EXECUTE on either function at all (fix round 1 -- it originally did, which
+ * let any application code path read every tenant's pending payload via
+ * `outbox_claim_batch`). The privilege escalation is explicit, narrow and
+ * auditable in the migration, not incidental here.
  *
  * `outbox_claim_batch` uses `FOR UPDATE SKIP LOCKED`, which is what lets two
  * concurrent drains split a batch without either blocking on, or
  * double-publishing, the other's rows: the lock a claiming transaction
  * takes is held until that transaction commits or rolls back, and a second
- * drain's claim simply skips whatever the first has already locked.
+ * drain's claim simply skips whatever the first has already locked. It also
+ * stamps every row it claims with a single random `claimed_by` token for
+ * that call. `outbox_mark_published` requires that exact token: a caller
+ * that never claimed the row (fix round 1's other finding -- it originally
+ * took no proof of claiming at all, so any `smos_app` session could mark
+ * any row, including another tenant's, published without ever sending it)
+ * updates nothing and gets `false` back, not an exception -- see
+ * 0017_outbox_claim_token.sql for why that was the chosen behavior on
+ * mismatch. Marking a row this same transaction just claimed must always
+ * succeed; a `false` there can only mean something is badly wrong, so it is
+ * raised as a hard error rather than silently ignored.
  *
  * A row is marked published only immediately after its event is actually
  * handed to `queue.send`, one row at a time, inside the same transaction
@@ -76,6 +89,13 @@ interface OutboxRow {
  * longer locked once this transaction ends -- and the original error is
  * re-thrown to the caller after that commit. A row's published_at can only
  * ever be non-null because it was truly sent.
+ *
+ * Crash recovery: if this process dies before the transaction commits,
+ * PostgreSQL rolls the whole transaction back on connection loss, which
+ * undoes the claim stamp along with everything else and releases the row's
+ * lock -- a later drain's claim does not exclude previously-claimed rows,
+ * so the row is picked up again automatically. Nothing is ever permanently
+ * stranded and there is no separate release step.
  */
 export async function drainOutbox(
   pool: pg.Pool,
@@ -102,7 +122,19 @@ export async function drainOutbox(
         failure = error;
         break;
       }
-      await client.query("select outbox_mark_published($1)", [row.id]);
+      const marked = await client.query(
+        "select outbox_mark_published($1, $2) as marked",
+        [row.id, row.claimed_by],
+      );
+      if (marked.rows[0]?.marked !== true) {
+        // This row was claimed by this same still-open transaction moments
+        // ago; a mismatch here means the claim token contract itself is
+        // broken, not a benign race -- fail loudly rather than silently
+        // under-counting.
+        throw new Error(
+          `outbox: claim token mismatch marking row ${row.id} published -- this should be unreachable`,
+        );
+      }
       published++;
     }
     await client.query("commit");
