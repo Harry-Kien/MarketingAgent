@@ -1,8 +1,20 @@
 /**
  * Tables that legitimately have no workspace_id. Adding to this list is a
  * reviewed decision (ADR-007), never a convenience.
+ *
+ * `schema_migration` is created procedurally by scripts/apply-migrations.mjs
+ * (CREATE TABLE IF NOT EXISTS, run outside any tracked migration file) to
+ * record which migrations have been applied. It holds no tenant data and is
+ * legitimately global, but never appears in a migration file, so
+ * check-migrations.mjs never sees it to classify it either way -- it is
+ * listed here purely so this allowlist tells the truth about what tables
+ * actually exist (see packages/db/src/cross-tenant.test.ts's GLOBAL_TABLES
+ * cross-check, task-12-report.md).
  */
-export const GLOBAL_TABLES = ["workspace", "user_account", "session", "account", "verification", "__drizzle_migrations"];
+export const GLOBAL_TABLES = [
+  "workspace", "user_account", "session", "account", "verification",
+  "__drizzle_migrations", "schema_migration",
+];
 
 /**
  * Strip SQL comments (line and block) while respecting string literals and

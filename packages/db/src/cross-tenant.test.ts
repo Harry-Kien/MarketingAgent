@@ -141,6 +141,40 @@ const RLS_ROWS = await discoverRlsRows();
 const POLICIES = await discoverPolicies();
 const FK_PAIRS = await discoverTenantToTenantFks(TENANT_TABLES);
 
+// Committed, not derived. Catalog discovery is exhaustive by construction
+// for a table/FK that's ADDED (it's simply found), but the opposite failure
+// mode -- a migration that silently DROPS a workspace_id column or a
+// composite tenant-to-tenant FK -- is invisible to discovery: the removed
+// item just stops appearing, `it.each` emits one fewer case, and the run
+// reports fewer tests with zero failures. Pinning the exact expected result
+// here turns that into a loud failure that names what disappeared (a
+// toEqual diff), instead of a quiet shrink nobody notices.
+//
+// Changing either list below is a DELIBERATE act and must happen in the
+// SAME commit as the schema change that adds or removes a workspace-owned
+// table or a composite tenant-to-tenant foreign key -- never as a side
+// effect of something else, and never "just to make the suite pass" without
+// first confirming the underlying schema change is intentional.
+const EXPECTED_TENANT_TABLES = [
+  "agent_definition", "agent_version", "approval_decision", "approval_request",
+  "audit_log", "campaign", "content_item", "content_version", "goal",
+  "outbox", "publication", "source_citation",
+].toSorted();
+
+const EXPECTED_FK_PAIRS = [
+  "agent_version->agent_definition",
+  "approval_decision->approval_request",
+  "approval_request->campaign",
+  "approval_request->content_version",
+  "campaign->goal",
+  "content_item->campaign",
+  "content_version->content_item",
+  "publication->approval_decision",
+  "publication->campaign",
+  "publication->content_version",
+  "source_citation->content_version",
+].toSorted();
+
 let a: TenantFixture;
 let b: TenantFixture;
 
@@ -325,11 +359,12 @@ function fixtureIdForColumn(ws: TenantFixture, column: string): string {
 }
 
 describe("E8/E14: every discovered workspace-owned table is isolated", () => {
-  it(`discovered ${TENANT_TABLES.length} workspace-owned table(s) from information_schema.columns`, () => {
-    // Sanity floor, not a hard-coded ceiling: catches "discovery query broke
-    // and returned nothing" without pinning the exact count, which would
-    // recreate the hand-maintained-list problem this file exists to avoid.
-    expect(TENANT_TABLES.length).toBeGreaterThan(0);
+  it(`discovered exactly the committed set of ${EXPECTED_TENANT_TABLES.length} workspace-owned table(s)`, () => {
+    // This is the ADD side of the exhaustiveness claim (a new workspace_id
+    // column is picked up automatically) crossed with the REMOVE side (a
+    // dropped one is caught immediately, by name, via the toEqual diff)
+    // rather than just shrinking `it.each`'s case count silently.
+    expect(TENANT_TABLES.toSorted()).toEqual(EXPECTED_TENANT_TABLES);
   });
 
   it.each(TENANT_TABLES)("%s: RLS is both enabled and forced", (table) => {
@@ -391,8 +426,15 @@ describe("E8/E14: every discovered workspace-owned table is isolated", () => {
 });
 
 describe("E14: cross-table composite foreign keys refuse a cross-workspace parent", () => {
-  it(`discovered ${FK_PAIRS.length} foreign key(s) between two workspace-owned tables`, () => {
-    expect(FK_PAIRS.length).toBeGreaterThan(0);
+  it(`discovered exactly the committed set of ${EXPECTED_FK_PAIRS.length} composite tenant-to-tenant foreign key(s)`, () => {
+    // Same shape as the tenant-table pin above: a dropped composite FK
+    // (e.g. reverting to a plain single-column REFERENCES, or dropping the
+    // constraint outright) makes discovery return one fewer pair, which
+    // `it.each` would otherwise turn into "one fewer test, zero failures."
+    // This assertion is what makes that loud instead, and names the exact
+    // pair that vanished via the toEqual diff.
+    const discovered = FK_PAIRS.map((p) => `${p.childTable}->${p.parentTable}`).toSorted();
+    expect(discovered).toEqual(EXPECTED_FK_PAIRS);
   });
 
   it.each(FK_PAIRS)("$childTable -> $parentTable is composite (includes workspace_id)", ({ childCols }) => {
@@ -456,17 +498,14 @@ describe("E8/E14: proven once, not per table", () => {
 
   it("GLOBAL_TABLES cross-check: every base table is either workspace-owned or an explicitly reviewed global table", () => {
     const unaccounted = ALL_TABLES.filter((t) => !TENANT_TABLES.includes(t) && !GLOBAL_TABLES.includes(t));
-    // FINDING (task-12-report.md): `schema_migration` is created procedurally
-    // by scripts/apply-migrations.mjs (CREATE TABLE IF NOT EXISTS, run
-    // outside any tracked migration file) to record which migrations have
-    // been applied. It holds no tenant data and is legitimately global, but
-    // it is missing from GLOBAL_TABLES in scripts/migration-guards.mjs, so
-    // neither check-migrations.mjs nor (until now) any test actually
-    // classifies it. Asserting the exact expected gap here -- rather than
-    // asserting `unaccounted` is empty -- means today's known gap does not
-    // block this suite, but any NEW ungoverned table added by a future
-    // migration fails this assertion immediately and must be triaged as
-    // either workspace-owned or deliberately added to GLOBAL_TABLES.
-    expect(unaccounted).toEqual(["schema_migration"]);
+    // Fix round 1 (task-12-report.md): `schema_migration` -- created
+    // procedurally by scripts/apply-migrations.mjs, never via a tracked
+    // migration file -- is now listed in GLOBAL_TABLES
+    // (scripts/migration-guards.mjs), so the allowlist tells the truth
+    // about every table that actually exists and this backstop expects a
+    // clean, empty gap. Any NEW ungoverned table added by a future
+    // migration still fails this assertion immediately and must be triaged
+    // as either workspace-owned or deliberately added to GLOBAL_TABLES.
+    expect(unaccounted).toEqual([]);
   });
 });

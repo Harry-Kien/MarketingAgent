@@ -2,10 +2,12 @@
 // once each. Forward-only: there is no down-migration concept here.
 //
 // Tracking is done in a `schema_migration` table that this script creates
-// itself (never via a file under infra/migrations/), so it is infrastructure
-// the migration guard never has to know about — it is not declared by any
-// migration file, so scripts/check-migrations.mjs never sees a CREATE TABLE
-// for it and there is nothing to add to GLOBAL_TABLES.
+// itself (never via a file under infra/migrations/), so check-migrations.mjs
+// never sees a CREATE TABLE for it -- it is not declared by any migration
+// file, so the guard has no text to scan in the first place. It is still
+// listed in GLOBAL_TABLES (scripts/migration-guards.mjs) so that allowlist
+// tells the truth about every table that actually exists; task 12's
+// cross-tenant.test.ts is what actually cross-checks it (task-12-report.md).
 //
 // Each migration file is applied inside its own transaction: either every
 // statement in the file commits, or none of them do. A failure stops the run
