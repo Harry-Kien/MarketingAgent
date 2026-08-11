@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseServerEnv } from "./env.js";
+import { parseServerEnv } from "./env.ts";
 
 const valid = {
   NODE_ENV: "test",

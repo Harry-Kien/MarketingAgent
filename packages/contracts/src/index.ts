@@ -1,1 +1,1 @@
-export { parseServerEnv, type ServerEnv } from "./env.js";
+export { parseServerEnv, type ServerEnv } from "./env.ts";

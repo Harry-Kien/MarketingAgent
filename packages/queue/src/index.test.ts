@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { createQueue, type Queue } from "./index.js";
+import { createQueue, type Queue } from "./index.ts";
 
 const url =
   process.env["DATABASE_URL"] ?? "postgres://smos:smos_local_dev@127.0.0.1:5433/smos";

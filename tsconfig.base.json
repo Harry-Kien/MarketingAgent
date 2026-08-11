@@ -11,6 +11,12 @@
     "noFallthroughCasesInSwitch": true,
     "verbatimModuleSyntax": true,
     "isolatedModules": true,
+    // Relative imports carry a .ts extension in source and are rewritten to .js
+    // on emit. Writing .js in source (the older TypeScript convention) only
+    // works for tsc and vitest: Turbopack and Node's type stripping both fail
+    // to remap it, which broke `next dev` and direct `node src/main.ts`.
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
     "skipLibCheck": true,
     "declaration": true,
     "composite": true,

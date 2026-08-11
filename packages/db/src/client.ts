@@ -1,6 +1,6 @@
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import pg from "pg";
-import * as schema from "./schema/index.js";
+import * as schema from "./schema/index.ts";
 
 /**
  * @types/pg must stay pinned to the exact version drizzle-orm depends on

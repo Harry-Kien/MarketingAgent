@@ -10,12 +10,18 @@
     "packages/*"
   ],
   "scripts": {
+    "db:up": "docker compose up -d db",
+    "db:down": "docker compose down",
+    "db:migrate": "node scripts/apply-migrations.mjs",
+    "dev:web": "npm run dev --workspace @smos/web",
     "typecheck": "tsc --build --verbose",
+    "typecheck:web": "tsc --project apps/web/tsconfig.json --noEmit",
     "test": "vitest run",
     "lint:versions": "node scripts/check-exact-versions.mjs",
     "lint:scope": "node scripts/check-forbidden-scope.mjs",
     "lint:secrets": "node scripts/scan-secrets.mjs",
-    "verify": "npm run lint:versions && npm run lint:scope && npm run lint:secrets && npm run typecheck && npm run test"
+    "lint:imports": "node scripts/check-imports.mjs",
+    "verify": "npm run lint:versions && npm run lint:scope && npm run lint:secrets && npm run lint:imports && npm run typecheck && npm run typecheck:web && npm run test"
   },
   "devDependencies": {
     "@types/node": "26.1.1",

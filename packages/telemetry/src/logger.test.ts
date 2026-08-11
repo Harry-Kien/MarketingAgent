@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createLogger } from "./logger.js";
+import { createLogger } from "./logger.ts";
 
 describe("createLogger", () => {
   it("emits one JSON line per call", () => {

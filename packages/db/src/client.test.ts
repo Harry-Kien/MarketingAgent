@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
-import { createDb, createDbPool } from "./client.js";
+import { createDb, createDbPool } from "./client.ts";
 
 const url =
   process.env["DATABASE_URL"] ?? "postgres://smos:smos_local_dev@127.0.0.1:5433/smos";

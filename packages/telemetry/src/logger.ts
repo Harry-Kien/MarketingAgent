@@ -1,4 +1,4 @@
-import { redact } from "./redact.js";
+import { redact } from "./redact.ts";
 
 export type LogLevel = "info" | "warn" | "error";
 export type LogSink = (line: string) => void;

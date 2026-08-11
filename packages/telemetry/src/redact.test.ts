@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { redact } from "./redact.js";
+import { redact } from "./redact.ts";
 
 describe("redact", () => {
   it("masks sensitive keys at any depth", () => {
