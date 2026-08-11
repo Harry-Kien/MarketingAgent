@@ -34,6 +34,8 @@ async function seedUser(label: string): Promise<string> {
 }
 
 let requestId: string;
+let campaignId: string;
+let versionId: string;
 
 beforeAll(async () => {
   await db.execute(
@@ -43,7 +45,7 @@ beforeAll(async () => {
   // Seed a full chain: goal -> campaign -> content_item -> content_version
   // -> approval_request, all scoped to WS via withTenant so RLS applies the
   // same way it would for the application.
-  requestId = await withTenant(pool, WS, async (tx) => {
+  ({ requestId, campaignId, versionId } = await withTenant(pool, WS, async (tx) => {
     const goal = await tx.query(
       `insert into goal (id, workspace_id, statement) values (gen_random_uuid(), $1, 'approval invariants probe') returning id`,
       [WS],
@@ -66,9 +68,27 @@ beforeAll(async () => {
        values (gen_random_uuid(), $1, $2, $3, 'meta_page') returning id`,
       [WS, campaign.rows[0].id, version.rows[0].id],
     );
-    return request.rows[0].id as string;
-  });
+    return {
+      requestId: request.rows[0].id as string,
+      campaignId: campaign.rows[0].id as string,
+      versionId: version.rows[0].id as string,
+    };
+  }));
 });
+
+/**
+ * approval_request_id is UNIQUE on approval_decision, so any test that
+ * inserts a decision beyond the first against `requestId` needs a fresh
+ * request of its own.
+ */
+async function freshRequestId(): Promise<string> {
+  return withTenant(pool, WS, (tx) =>
+    tx.query(
+      `insert into approval_request (id, workspace_id, campaign_id, content_version_id, target_channel)
+       values (gen_random_uuid(), $1, $2, $3, 'meta_page') returning id`,
+      [WS, campaignId, versionId],
+    ).then((r) => r.rows[0].id as string));
+}
 
 afterAll(async () => {
   await pool.end();
@@ -137,5 +157,41 @@ describe("approval invariants enforced by the database (E4)", () => {
       .rejects.toThrow(/immutable|permission denied/i);
     await expect(withTenant(pool, WS, (tx) => tx.query(`delete from approval_decision where workspace_id = $1`, [WS])))
       .rejects.toThrow(/immutable|permission denied/i);
+  });
+
+  // Fix round 1: btrim(reason) with no second argument strips only ASCII
+  // spaces (U+0020), not tabs or newlines, so a reason made entirely of
+  // E'\t\n' passed the old CHECK while decideApproval's `.trim()` in
+  // packages/domain/src/approval.ts would reject the identical string.
+  // The database must refuse exactly what the domain refuses.
+  it("refuses a reason made only of tabs and newlines, not just plain spaces", async () => {
+    const userId = await seedUser("whitespace-reason-probe");
+    const reqId = await freshRequestId();
+    await expect(withTenant(pool, WS, (tx) => tx.query(
+      `insert into approval_decision (id,workspace_id,approval_request_id,actor_user_id,decision,reason)
+       values (gen_random_uuid(),$1,$2,$3,'approve',$4)`, [WS, reqId, userId, "\t\n"],
+    ))).rejects.toThrow(/check|violates/i);
+  });
+});
+
+// Fix round 1, LOW: pins the permission state that is the other half of
+// E4's first lock. The foreign key to user_account only stops an agent
+// because an agent cannot make itself a user_account row; that in turn
+// depends entirely on smos_app never having been granted INSERT there. If
+// a future migration granted it, an agent could manufacture its own "user"
+// row and satisfy the foreign key. This test fails loudly the moment that
+// happens, rather than letting the regression go unnoticed.
+describe("E4 lock 1's other half: smos_app cannot provision its own user_account row", () => {
+  it("smos_app has no INSERT privilege on user_account", async () => {
+    const r = await adminPool.query(
+      `select privilege_type from information_schema.role_table_grants
+       where table_name = 'user_account' and grantee = 'smos_app'`,
+    );
+    const privileges = r.rows.map((row: { privilege_type: string }) => row.privilege_type);
+    expect(privileges).not.toContain("INSERT");
+    // SELECT is the only grant 0001_core_tenancy.sql gives smos_app on this
+    // table; asserting the full set (not just the absence of INSERT) means
+    // a future UPDATE/DELETE grant would also fail this test.
+    expect(privileges).toEqual(["SELECT"]);
   });
 });
