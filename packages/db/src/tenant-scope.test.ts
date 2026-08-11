@@ -52,17 +52,27 @@ describe("withTenant", () => {
     );
   });
 
+  // ADR-007 update (task-5b): DATABASE_URL now connects the pool AS
+  // smos_app directly (previously it connected as the `smos` superuser and
+  // `withTenant` only ever narrowed it). That makes "current_user is not
+  // smos_app" true of every connection this pool ever hands out, tested or
+  // not, so it stopped being a meaningful post-condition here -- it would
+  // pass even if `withTenant` did nothing at all. The property actually
+  // worth guarding is that nothing ever hands back a connection sitting on
+  // the superuser identity (`smos`), which is exactly what the pre-fix
+  // RESET ROLE escape reached (see the DEFEAT ATTEMPT tests below and
+  // task-5b-report.md).
   it("resets the role even when the callback throws", async () => {
     await withTenant(pool, A, async () => undefined).catch(() => undefined);
     const client = await pool.connect();
     const r = await client.query("select current_user as u");
     client.release();
-    expect(r.rows[0].u).not.toBe("smos_app");
+    expect(r.rows[0].u).not.toBe("smos");
   });
 
   // --- Leak scenarios beyond the brief -------------------------------------
 
-  it("does not leave smos_app or a stale workspace id on the connection after a successful call", async () => {
+  it("does not leave a stale workspace id on the connection after a successful call, and never the superuser", async () => {
     await withTenant(pool, A, async (tx) => {
       await tx.query("select 1");
     });
@@ -70,7 +80,7 @@ describe("withTenant", () => {
     try {
       const user = await client.query("select current_user as u");
       const ws = await client.query("select current_setting('app.workspace_id', true) as ws");
-      expect(user.rows[0].u).not.toBe("smos_app");
+      expect(user.rows[0].u).not.toBe("smos");
       expect(ws.rows[0].ws).not.toBe(A);
       // A fresh/returned connection must read as unset, not merely "different".
       expect(ws.rows[0].ws === "" || ws.rows[0].ws === null).toBe(true);
@@ -79,7 +89,7 @@ describe("withTenant", () => {
     }
   });
 
-  it("does not leave smos_app or a stale workspace id on the connection after a throwing call", async () => {
+  it("does not leave a stale workspace id on the connection after a throwing call, and never the superuser", async () => {
     await withTenant(pool, A, async () => {
       throw new Error("leak probe");
     }).catch(() => undefined);
@@ -87,7 +97,7 @@ describe("withTenant", () => {
     try {
       const user = await client.query("select current_user as u");
       const ws = await client.query("select current_setting('app.workspace_id', true) as ws");
-      expect(user.rows[0].u).not.toBe("smos_app");
+      expect(user.rows[0].u).not.toBe("smos");
       expect(ws.rows[0].ws).not.toBe(A);
       expect(ws.rows[0].ws === "" || ws.rows[0].ws === null).toBe(true);
     } finally {
@@ -147,8 +157,19 @@ describe("withTenant", () => {
   // using raw SQL passed through tx.query (which is a thin wrapper over the
   // underlying pg client and does not inspect statement text). They exist to
   // honestly document what is, and is not, actually enforced.
+  //
+  // ADR-007 update (task-5b): both of these used to succeed, because the
+  // pool connected as the `smos` superuser and `SET LOCAL ROLE smos_app`
+  // was the only thing narrowing it -- RESET ROLE / SET ROLE smos undid
+  // that and reached full superuser access, which FORCE ROW LEVEL SECURITY
+  // does not constrain (see the git history of this file, and
+  // task-5-report.md, for the version that demonstrated the escape). Now
+  // DATABASE_URL connects the pool AS smos_app directly, so there is no
+  // more-privileged identity behind it to fall back to -- these two are
+  // kept, inverted, as regression tests for that fix, alongside the new,
+  // more focused coverage in tenant-role.test.ts.
 
-  it("DEFEAT ATTEMPT: RESET ROLE inside the callback reaches superuser and bypasses RLS", async () => {
+  it("DEFEAT ATTEMPT (closed): RESET ROLE inside the callback no longer reaches a role that bypasses RLS", async () => {
     const marker = `defeat.reset-role.${Date.now()}`;
     await withTenant(pool, A, (tx) =>
       tx.query(
@@ -173,20 +194,18 @@ describe("withTenant", () => {
       );
       sawOtherWorkspaceRow = seen.rows[0].n > 0;
     } finally {
-      // Clean up defensively: RESET ROLE already returns us to the session
-      // user (the pool's normal baseline), so no extra poisoning to undo.
       await client.query("rollback").catch(() => undefined);
       client.release();
     }
 
-    // Documented outcome (see report): RESET ROLE succeeds and, because the
-    // session user is a superuser, RLS is bypassed entirely for the rest of
-    // the transaction.
-    expect(escapedUser).toBe("smos");
-    expect(sawOtherWorkspaceRow).toBe(true);
+    // RESET ROLE now returns to smos_app itself (the connection's own
+    // login role) -- there is no superuser identity behind it any more, so
+    // RLS keeps applying and workspace A's marker row stays invisible.
+    expect(escapedUser).toBe("smos_app");
+    expect(sawOtherWorkspaceRow).toBe(false);
   });
 
-  it("DEFEAT ATTEMPT: SET ROLE back to the owner inside the callback also bypasses RLS", async () => {
+  it("DEFEAT ATTEMPT (closed): SET ROLE smos inside the callback is refused outright", async () => {
     const marker = `defeat.set-role-owner.${Date.now()}`;
     await withTenant(pool, A, (tx) =>
       tx.query(
@@ -195,27 +214,19 @@ describe("withTenant", () => {
         [A, marker],
       ));
 
-    let escapedUser: string | undefined;
-    let sawOtherWorkspaceRow: boolean | undefined;
     const client = await pool.connect();
     try {
       await client.query("begin");
       await client.query("set local role smos_app");
       await client.query("select set_config('app.workspace_id', $1, true)", [B]);
-      await client.query("set role smos"); // explicit, not RESET
-      escapedUser = (await client.query("select current_user as u")).rows[0].u;
-      const seen = await client.query(
-        "select count(*)::int as n from audit_log where event_type = $1",
-        [marker],
-      );
-      sawOtherWorkspaceRow = seen.rows[0].n > 0;
+      // smos_app is not, and must never become, a member of smos: this is
+      // no longer "SET ROLE succeeds, then RLS is bypassed" -- SET ROLE
+      // itself now fails.
+      await expect(client.query("set role smos")).rejects.toThrow(/permission denied/i);
     } finally {
       await client.query("rollback").catch(() => undefined);
       client.release();
     }
-
-    expect(escapedUser).toBe("smos");
-    expect(sawOtherWorkspaceRow).toBe(true);
   });
 
   it("DEFEAT ATTEMPT: set_config to another workspace id (still as smos_app) reads that workspace's rows", async () => {

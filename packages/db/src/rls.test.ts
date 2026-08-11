@@ -71,16 +71,20 @@ describe("row level security", () => {
   it("cannot be defeated by an explicit where clause naming another workspace", async () => {
     const client = await pool.connect();
     try {
-      // Seed a row for workspace B as the table owner (RLS is FORCEd so this
-      // is the only way to guarantee a B row exists regardless of app-role
-      // session state left over from other tests).
+      await client.query("set role smos_app");
+      // Seed a row for workspace B. ADR-007 (task-5b): the pool's
+      // connecting role no longer bypasses RLS -- it used to be the `smos`
+      // superuser here, for which FORCE ROW LEVEL SECURITY does not apply,
+      // so this insert could run before any scope was set. smos_app has no
+      // such bypass, so the row has to be inserted while actually scoped to
+      // B, or RLS's WITH CHECK rejects it outright.
+      await client.query("select set_config('app.workspace_id', $1, false)", [B]);
       await client.query(
         `insert into audit_log (id, workspace_id, event_type, actor_kind, payload)
          values (gen_random_uuid(), $1, 'test.b-explicit', 'system', '{}'::jsonb)`,
         [B],
       );
 
-      await client.query("set role smos_app");
       await client.query("select set_config('app.workspace_id', $1, false)", [A]);
       // Even though the app role explicitly asks for workspace_id = B, RLS
       // must still filter it out because the session is scoped to A.

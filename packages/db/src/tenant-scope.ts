@@ -16,6 +16,17 @@ export interface TenantTx {
  * PostgreSQL unwinds them automatically on COMMIT or ROLLBACK, so a
  * connection handed back to the pool never carries `smos_app` or a stale
  * `app.workspace_id` into the next unrelated request.
+ *
+ * `set local role smos_app` here is now defensive, not load-bearing: the
+ * pool itself connects AS smos_app (DATABASE_URL, ADR-007), which has no
+ * BYPASSRLS and is not a superuser, so RLS applies to every connection this
+ * function ever gets from `pool.connect()` whether or not this line runs.
+ * Previously the pool connected as the `smos` superuser and this line was
+ * the only thing narrowing it -- callback code issuing `RESET ROLE` could
+ * undo that and reach full superuser access (see task-5-report.md /
+ * task-5b-report.md). It stays as a second, redundant layer: cheap
+ * insurance if a future connection string is ever misconfigured back to a
+ * privileged role.
  */
 export async function withTenant<T>(
   pool: pg.Pool,

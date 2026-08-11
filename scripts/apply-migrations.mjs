@@ -11,14 +11,26 @@
 // statement in the file commits, or none of them do. A failure stops the run
 // immediately (no later files are attempted) and exits non-zero, naming the
 // file that failed.
-import { readFileSync, readdirSync } from "node:fs";
+//
+// ADR-007: this script is the ONLY thing that connects with
+// DATABASE_MIGRATION_URL (the `smos` superuser, needed to run DDL and to
+// ALTER the smos_app role itself). Everything else -- the app, the worker,
+// every test -- connects with DATABASE_URL (`smos_app`, no BYPASSRLS).
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import pg from "pg";
+
+// Same loading convention as vitest.setup.ts: local runs pick up .env
+// automatically, CI sets the variables directly and has no .env file.
+if (existsSync(".env")) {
+  process.loadEnvFile(".env");
+}
 
 const MIGRATIONS_DIR = "infra/migrations";
 
 const url =
-  process.env["DATABASE_URL"] ?? "postgres://smos:smos_local_dev@127.0.0.1:5433/smos";
+  process.env["DATABASE_MIGRATION_URL"] ??
+  "postgres://smos:smos_local_dev@127.0.0.1:5433/smos";
 
 async function main() {
   const pool = new pg.Pool({ connectionString: url });
@@ -61,6 +73,30 @@ async function main() {
         return;
       }
     }
+
+    // Migrations give smos_app LOGIN (0002) but never its password -- that
+    // would put a credential in a file npm run lint:secrets scans, and
+    // infra/migrations/ is forward-only, checked-in, and reviewable, which
+    // is exactly the wrong place for one. Set it here instead, from an
+    // environment variable that must be provided explicitly: no hardcoded
+    // fallback, ever.
+    const smosAppPassword = process.env["SMOS_APP_PASSWORD"];
+    if (!smosAppPassword) {
+      console.error(
+        "SMOS_APP_PASSWORD is not set. Refusing to leave smos_app without a " +
+          "password: set SMOS_APP_PASSWORD (see .env.example) and re-run " +
+          "npm run db:migrate.",
+      );
+      process.exitCode = 1;
+      return;
+    }
+    // PostgreSQL's ALTER ROLE ... PASSWORD clause takes a string literal in
+    // its grammar, not a general expression, so a $1 bind parameter is not
+    // accepted there. client.escapeLiteral produces a safely quoted literal
+    // (doubles embedded quotes, escapes backslashes) so the password is
+    // still never interpolated unescaped.
+    await client.query(`ALTER ROLE smos_app PASSWORD ${client.escapeLiteral(smosAppPassword)}`);
+    console.log("smos_app password set from SMOS_APP_PASSWORD");
   } finally {
     client.release();
     await pool.end();
