@@ -32,3 +32,44 @@ describe("findRlsViolations", () => {
     expect(findRlsViolations(sql)).toEqual([]);
   });
 });
+
+describe("regression: comment stripping and schema qualification", () => {
+  it("flags a table with commented-out workspace_id as tenancy violation", () => {
+    const sql = `CREATE TABLE campaign (
+      id uuid PRIMARY KEY,
+      -- workspace_id uuid NOT NULL REFERENCES workspace(id),
+      name text NOT NULL
+    );`;
+    expect(findTenancyViolations(sql)).toEqual(["campaign"]);
+  });
+
+  it("flags a table with commented-out ENABLE ROW LEVEL SECURITY as RLS violation", () => {
+    const sql = `CREATE TABLE campaign (id uuid PRIMARY KEY, workspace_id uuid NOT NULL);
+      -- ALTER TABLE campaign ENABLE ROW LEVEL SECURITY;`;
+    expect(findRlsViolations(sql)).toEqual(["campaign"]);
+  });
+
+  it("flags schema-qualified table without workspace_id as tenancy violation", () => {
+    const sql = `CREATE TABLE public.campaign (id uuid PRIMARY KEY, name text NOT NULL);`;
+    expect(findTenancyViolations(sql)).toEqual(["campaign"]);
+  });
+
+  it("flags schema-qualified table without RLS as RLS violation", () => {
+    const sql = `CREATE TABLE public.campaign (id uuid PRIMARY KEY, workspace_id uuid NOT NULL);`;
+    expect(findRlsViolations(sql)).toEqual(["campaign"]);
+  });
+
+  it("exempts schema-qualified global tables from tenancy check", () => {
+    const sql = `CREATE TABLE public.workspace (id uuid PRIMARY KEY, name text NOT NULL);`;
+    expect(findTenancyViolations(sql)).toEqual([]);
+  });
+
+  it("flags table with block-comment-hidden workspace_id as tenancy violation", () => {
+    const sql = `CREATE TABLE campaign (
+      id uuid PRIMARY KEY,
+      /* workspace_id uuid NOT NULL REFERENCES workspace(id), */
+      name text NOT NULL
+    );`;
+    expect(findTenancyViolations(sql)).toEqual(["campaign"]);
+  });
+});
