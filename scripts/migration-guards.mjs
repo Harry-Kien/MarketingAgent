@@ -512,6 +512,76 @@ export function parseFile(sql) {
 const FILE_CREATE_TABLE = /^\s*CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+(?:"?\w+"?\.)?"?(\w+)"?\s*\(/i;
 const FILE_ENABLE_RLS = /^\s*ALTER\s+TABLE\s+(?:"?\w+"?\.)?"?(\w+)"?\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY/i;
 
+// Final whole-branch review, FINDING 3 (first gap). Any statement that
+// starts with CREATE (optionally UNLOGGED/TEMP/TEMPORARY) TABLE but is NOT
+// the one certifiable shape FILE_CREATE_TABLE matches -- AS SELECT,
+// PARTITION OF, UNLOGGED, TEMP/TEMPORARY, a quoted identifier FILE_CREATE_
+// TABLE's simple `\w+` capture cannot represent (e.g. one containing a
+// space) -- must fail the file closed rather than be silently skipped as
+// if it declared no table at all.
+const ANY_CREATE_TABLE = /^\s*CREATE\s+(?:UNLOGGED\s+|(?:GLOBAL\s+|LOCAL\s+)?TEMP(?:ORARY)?\s+)?TABLE\b/i;
+
+/**
+ * Blank out the CONTENTS of every single-quoted string literal in `text`
+ * (string/quote-aware: handles `''`-escaped quotes), leaving the
+ * surrounding structure and length otherwise intact. Used only to keep a
+ * string literal's contents from satisfying the `\bworkspace_id\b` column
+ * check below -- the repo already writes `current_setting('app.workspace_id')`
+ * 24 times, so a DEFAULT or CHECK holding that literal text must not read as
+ * a real column declaration (final whole-branch review, FINDING 3). Double-
+ * quoted identifiers are deliberately left untouched: a quoted identifier
+ * names a real column (however unusually spelled), unlike a string literal's
+ * content, which is data.
+ */
+function stripStringLiteralContents(text) {
+  let result = "";
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const ch = text[i];
+    if (ch === "'") {
+      result += ch;
+      i++;
+      while (i < n) {
+        if (text[i] === "'" && text[i + 1] === "'") {
+          i += 2;
+          continue;
+        }
+        if (text[i] === "'") {
+          result += ch;
+          i++;
+          break;
+        }
+        i++; // swallow the literal's content -- never copied to `result`
+      }
+      continue;
+    }
+    if (ch === '"') {
+      // Quoted identifier: copy through unchanged (it names a real object,
+      // not string data).
+      result += ch;
+      i++;
+      while (i < n) {
+        if (text[i] === '"' && text[i + 1] === '"') {
+          result += '""';
+          i += 2;
+          continue;
+        }
+        result += text[i];
+        if (text[i] === '"') {
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    result += ch;
+    i++;
+  }
+  return result;
+}
+
 /**
  * Given `text` (an already-vetted, single top-level statement — parseFile
  * guarantees it is balanced and contains no unterminated string, quoted
@@ -636,8 +706,30 @@ export function collectFileFacts(sql) {
         };
       }
       const body = stmt.slice(parenStart + 1, parenEnd);
-      foundTables.push({ name: createMatch[1], hasWorkspaceId: /\bworkspace_id\b/.test(body) });
+      // FINDING 3: strip string-literal CONTENTS before testing for the
+      // word `workspace_id` -- a DEFAULT or CHECK holding that literal text
+      // (`current_setting('app.workspace_id')` appears 24 times in this
+      // repo) must not read as a real column declaration.
+      const hasWorkspaceId = /\bworkspace_id\b/.test(stripStringLiteralContents(body));
+      foundTables.push({ name: createMatch[1], hasWorkspaceId });
       continue;
+    }
+    // FINDING 3 (fail-closed branch): a statement that starts CREATE
+    // [UNLOGGED|TEMP|TEMPORARY] TABLE but does not match the one
+    // certifiable shape above (AS SELECT, PARTITION OF, UNLOGGED, TEMP,
+    // an identifier FILE_CREATE_TABLE's simple `\w+` capture cannot
+    // represent) must not be silently skipped as if it declared no table --
+    // this guard has no idea whether such a table needs workspace_id or
+    // RLS, so it fails the whole file closed rather than certifying it by
+    // omission.
+    if (ANY_CREATE_TABLE.test(stmt)) {
+      return {
+        tables: [],
+        rlsEnabled: [],
+        unterminated: {
+          construct: `CREATE TABLE statement does not match a certifiable shape (expected a plain or IF NOT EXISTS CREATE TABLE with a column-list body): "${stmt.trim().slice(0, 120)}"`,
+        },
+      };
     }
     const alterMatch = stmt.match(FILE_ENABLE_RLS);
     if (alterMatch) {
@@ -665,8 +757,7 @@ export function collectFileFacts(sql) {
 export function computeViolations(fileFacts) {
   const unparseableFiles = [];
   const rlsEnabledTables = new Set();
-  const seenTables = new Set();
-  const tablesToCheck = [];
+  const tableMap = new Map();
 
   for (const { name, facts } of fileFacts) {
     if (facts.unterminated) {
@@ -678,15 +769,25 @@ export function computeViolations(fileFacts) {
     for (const rlsName of facts.rlsEnabled) rlsEnabledTables.add(rlsName);
   }
 
+  // FINDING 3 (second gap): this branch's migration style is forward-only
+  // DROP + CREATE of the same table name across files (files are processed
+  // here in the caller's filename-sorted order, i.e. migration order). A
+  // later file's CREATE TABLE for a name already seen must OVERWRITE the
+  // earlier file's facts, not be skipped -- otherwise a later redefinition
+  // that drops workspace_id is invisible: the guard would still be judging
+  // the table by whatever the FIRST file said, which may no longer be true
+  // of the table that actually exists once every migration has run. Using a
+  // Map (keyed by table name, always re-set on every occurrence) makes the
+  // LAST file to declare a given table win, matching the actual final state
+  // of the schema.
   for (const { facts } of fileFacts) {
     if (facts.unterminated) continue;
     for (const t of facts.tables) {
       if (GLOBAL_TABLES.includes(t.name)) continue;
-      if (seenTables.has(t.name)) continue;
-      seenTables.add(t.name);
-      tablesToCheck.push(t);
+      tableMap.set(t.name, t);
     }
   }
+  const tablesToCheck = [...tableMap.values()];
 
   const tenancyViolations = tablesToCheck.filter((t) => !t.hasWorkspaceId).map((t) => t.name);
   const rlsViolations = tablesToCheck.filter((t) => !rlsEnabledTables.has(t.name)).map((t) => t.name);

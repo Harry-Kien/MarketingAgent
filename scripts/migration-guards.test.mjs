@@ -483,3 +483,140 @@ describe("round 5: paren-depth desync and exact column-list matching", () => {
     expect(unterminated).not.toBeNull();
   });
 });
+
+// Final whole-branch review, FINDING 3 (first gap). The repo already writes
+// `current_setting('app.workspace_id')` 24 times; a string literal
+// containing the bare word `workspace_id` -- e.g. a DEFAULT, a CHECK
+// comparing against a config-key string, a comment-like literal -- must not
+// satisfy `\bworkspace_id\b` the way a real column declaration does.
+describe("FINDING 3: a string literal containing the word workspace_id does not satisfy the tenancy check", () => {
+  it("a DEFAULT string literal naming workspace_id does not count as a real column", () => {
+    const sql = `CREATE TABLE campaign (
+      id uuid PRIMARY KEY,
+      cfg text DEFAULT 'app.workspace_id',
+      name text NOT NULL
+    );`;
+    const { tables } = collectFileFacts(sql);
+    expect(tables).toEqual([{ name: "campaign", hasWorkspaceId: false }]);
+  });
+
+  it("a CHECK constraint comparing a column against the literal string 'workspace_id' does not count", () => {
+    const sql = `CREATE TABLE campaign (
+      id uuid PRIMARY KEY,
+      setting_key text CHECK (setting_key = 'workspace_id'),
+      name text NOT NULL
+    );`;
+    const { tables } = collectFileFacts(sql);
+    expect(tables).toEqual([{ name: "campaign", hasWorkspaceId: false }]);
+  });
+
+  it("still finds a real workspace_id column even when a decoy string literal is also present", () => {
+    const sql = `CREATE TABLE campaign (
+      id uuid PRIMARY KEY,
+      workspace_id uuid NOT NULL REFERENCES workspace(id),
+      cfg text DEFAULT 'app.workspace_id',
+      name text NOT NULL
+    );`;
+    const { tables } = collectFileFacts(sql);
+    expect(tables).toEqual([{ name: "campaign", hasWorkspaceId: true }]);
+  });
+
+  it("a quoted identifier literally named \"workspace_id\" still counts (it is a real, if unusually spelled, column)", () => {
+    const sql = `CREATE TABLE campaign (id uuid PRIMARY KEY, "workspace_id" uuid NOT NULL);`;
+    const { tables } = collectFileFacts(sql);
+    expect(tables).toEqual([{ name: "campaign", hasWorkspaceId: true }]);
+  });
+});
+
+// Final whole-branch review, FINDING 3 (second gap). This branch's stated
+// migration style is forward-only DROP + CREATE of the same table name
+// across files. Cross-file aggregation must reflect the FINAL definition
+// (the last file to redefine the table), not the first file's facts --
+// otherwise a later migration that drops workspace_id (or drops RLS
+// enablement) on redefinition is invisible to the guard.
+describe("FINDING 3: cross-file DROP + CREATE redefinition is not invisible", () => {
+  it("a later file's CREATE (without workspace_id) overrides an earlier file's compliant definition", () => {
+    const fileA = `CREATE TABLE campaign (id uuid PRIMARY KEY, workspace_id uuid NOT NULL);
+      ALTER TABLE campaign ENABLE ROW LEVEL SECURITY;`;
+    const fileB = `DROP TABLE campaign;
+      CREATE TABLE campaign (id uuid PRIMARY KEY, name text NOT NULL);`;
+    const { tenancyViolations } = computeViolations(
+      factsFor({ "0001_campaign.sql": fileA, "0002_campaign_redefine.sql": fileB }),
+    );
+    expect(tenancyViolations).toEqual(["campaign"]);
+  });
+
+  it("a later file's CREATE (with workspace_id) overrides an earlier file's non-compliant definition", () => {
+    const fileA = `CREATE TABLE campaign (id uuid PRIMARY KEY, name text NOT NULL);`;
+    const fileB = `DROP TABLE campaign;
+      CREATE TABLE campaign (id uuid PRIMARY KEY, workspace_id uuid NOT NULL);
+      ALTER TABLE campaign ENABLE ROW LEVEL SECURITY;`;
+    const { tenancyViolations } = computeViolations(
+      factsFor({ "0001_campaign.sql": fileA, "0002_campaign_redefine.sql": fileB }),
+    );
+    expect(tenancyViolations).toEqual([]);
+  });
+
+  it("three files redefining the same table: the last one strictly wins, not the first or a merge", () => {
+    const fileA = `CREATE TABLE campaign (id uuid PRIMARY KEY, workspace_id uuid NOT NULL);`;
+    const fileB = `DROP TABLE campaign; CREATE TABLE campaign (id uuid PRIMARY KEY, name text NOT NULL);`;
+    const fileC = `DROP TABLE campaign; CREATE TABLE campaign (id uuid PRIMARY KEY, workspace_id uuid NOT NULL);
+      ALTER TABLE campaign ENABLE ROW LEVEL SECURITY;`;
+    const { tenancyViolations, rlsViolations } = computeViolations(
+      factsFor({ "0001.sql": fileA, "0002.sql": fileB, "0003.sql": fileC }),
+    );
+    expect(tenancyViolations).toEqual([]);
+    expect(rlsViolations).toEqual([]);
+  });
+});
+
+// Final whole-branch review, FINDING 3 (fail-closed branch). Any statement
+// beginning CREATE ... TABLE that does not match the one certifiable shape
+// this guard actually parses (a plain/IF-NOT-EXISTS CREATE TABLE with a
+// column-list body) must raise "cannot be certified" rather than be
+// silently skipped as if it declared no table at all.
+describe("FINDING 3: unsupported CREATE TABLE shapes fail closed instead of being silently ignored", () => {
+  it.each([
+    ["CREATE TABLE foo AS SELECT * FROM bar;", "AS SELECT"],
+    ["CREATE TABLE foo PARTITION OF bar FOR VALUES IN ('x');", "PARTITION OF"],
+    ["CREATE UNLOGGED TABLE foo (id uuid PRIMARY KEY, workspace_id uuid NOT NULL);", "UNLOGGED"],
+    ["CREATE TEMP TABLE foo (id uuid PRIMARY KEY, workspace_id uuid NOT NULL);", "TEMP"],
+    ["CREATE TEMPORARY TABLE foo (id uuid PRIMARY KEY, workspace_id uuid NOT NULL);", "TEMPORARY"],
+    ['CREATE TABLE "Weird Name" (id uuid PRIMARY KEY, workspace_id uuid NOT NULL);', "quoted identifier with a space"],
+  ])("%s (%s) cannot be certified, not silently ignored", (sql) => {
+    const { tables, unterminated } = collectFileFacts(sql);
+    expect(tables).toEqual([]);
+    expect(unterminated).not.toBeNull();
+  });
+
+  it("a normal CREATE TABLE (the one certifiable shape) is unaffected", () => {
+    const sql = `CREATE TABLE campaign (id uuid PRIMARY KEY, workspace_id uuid NOT NULL);
+      ALTER TABLE campaign ENABLE ROW LEVEL SECURITY;`;
+    const { tables, unterminated } = collectFileFacts(sql);
+    expect(unterminated).toBeNull();
+    expect(tables).toEqual([{ name: "campaign", hasWorkspaceId: true }]);
+  });
+
+  it("an unsupported shape in one file still fails the whole run closed via computeViolations", () => {
+    const fileA = `CREATE UNLOGGED TABLE shadow_leak (id uuid PRIMARY KEY, workspace_id uuid NOT NULL);`;
+    const { unparseableFiles } = computeViolations(factsFor({ "0099_sneaky.sql": fileA }));
+    expect(unparseableFiles.map((f) => f.file)).toContain("0099_sneaky.sql");
+  });
+});
+
+// Final whole-branch review, FINDING 4. GLOBAL_TABLES was a bare array with
+// only `toContain` assertions anywhere in the suite -- appending
+// "campaign" to it would silently disable both the tenancy and RLS checks
+// for that table and break no test. Pinned here with an exhaustive toEqual
+// against a committed list, the same discipline Task 12 applied to
+// EXPECTED_TENANT_TABLES (packages/db/src/cross-tenant.test.ts) -- any
+// future addition or removal must be a deliberate, reviewed edit to this
+// test in the same commit, not a silent side effect.
+describe("FINDING 4: GLOBAL_TABLES is pinned to an exhaustive, committed list", () => {
+  it("is exactly the committed set of global tables", () => {
+    expect(GLOBAL_TABLES).toEqual([
+      "workspace", "user_account", "session", "account", "verification",
+      "__drizzle_migrations", "schema_migration",
+    ]);
+  });
+});
