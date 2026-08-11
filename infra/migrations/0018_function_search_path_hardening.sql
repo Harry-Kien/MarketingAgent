@@ -1,0 +1,63 @@
+-- Final whole-branch review, FINDING 1 (HIGH), reproduced live:
+-- agent_version_m1_activation_gate() (0013_agent_version_activation_gate.sql)
+-- is SECURITY INVOKER with no pinned search_path, and its `SELECT role FROM
+-- agent_definition` is unqualified. 0003_pgboss_schema_owner.sql separately
+-- grants smos_app CREATE ON DATABASE so pg-boss can bootstrap `pgboss` --
+-- correct and necessary on its own. Together: any smos_app session, inside
+-- an otherwise properly RLS-scoped transaction, can do
+--
+--   CREATE SCHEMA evil;
+--   CREATE TABLE evil.agent_definition(id uuid, workspace_id uuid, role text);
+--   INSERT INTO evil.agent_definition VALUES (<real def id>, <ws>, 'content');
+--   SET search_path = evil, public;
+--   INSERT INTO public.agent_version(..., activated) VALUES (..., true);
+--
+-- and the gate's unqualified `agent_definition` resolves to the attacker's
+-- decoy row first, reporting whatever role they want -- forging activation
+-- for any of the fifteen roles regardless of the real agent_definition's
+-- actual role. Reproduced and verified against a live database: the same
+-- attack also works via the `pgboss` schema smos_app already owns, so
+-- revoking CREATE ON DATABASE alone (see 0019, which investigates whether
+-- that grant is even still needed) does not close this -- the fix has to be
+-- in the function itself.
+--
+-- `ALTER FUNCTION ... SET search_path = public` pins name resolution inside
+-- the function body to the `public` schema only, regardless of whatever
+-- search_path the calling session has set -- the same fix already applied
+-- (from the start) to outbox_claim_batch/outbox_mark_published in
+-- 0016_outbox.sql / 0017_outbox_claim_token.sql. Verified empirically: the
+-- exact decoy-schema attack above fails after this migration (see
+-- packages/db/src/agent-version-activation-gate.test.ts).
+--
+-- Auditing every function this branch has created so far
+-- (`SELECT proname, prosecdef, proconfig FROM pg_proc WHERE pronamespace =
+-- 'public'::regnamespace`) turned up four more with the same gap. None of
+-- the other four currently reads a table unqualified the way the gate
+-- did -- they only RAISE EXCEPTION or read TG_OP/TG_ARGV -- so none of them
+-- reproduces today's decoy-schema attack. They are pinned anyway, on the
+-- instruction that every function gets a pinned search_path regardless of
+-- whether it is SECURITY DEFINER or INVOKER, and regardless of whether a
+-- concrete exploit is known today: an unqualified reference added to any of
+-- these function bodies in a future migration would otherwise silently
+-- reopen the same class of hole, and there is no cost to pinning a function
+-- that does not need it.
+--
+--   audit_log_is_append_only          (0001_core_tenancy.sql)
+--   approval_decision_is_immutable    (0007_approval.sql)
+--   publication_core_fields_immutable (0011_publication_immutability.sql)
+--   agent_definition_role_immutable   (0014_agent_definition_role_immutable.sql)
+--
+-- outbox_claim_batch(integer) and outbox_mark_published(uuid, uuid) were
+-- already pinned (`SET search_path = public` in their own CREATE FUNCTION,
+-- 0016/0017) and need no change here. CHECK constraints and RLS policies
+-- are OID-bound to the exact table they were defined against and cannot be
+-- redirected by search_path the way an unqualified name inside a function
+-- body can, so this migration touches only functions.
+--
+-- Idempotent: ALTER FUNCTION ... SET search_path unconditionally
+-- (re)applies the same setting on every run.
+ALTER FUNCTION agent_version_m1_activation_gate() SET search_path = public;
+ALTER FUNCTION audit_log_is_append_only() SET search_path = public;
+ALTER FUNCTION approval_decision_is_immutable() SET search_path = public;
+ALTER FUNCTION publication_core_fields_immutable() SET search_path = public;
+ALTER FUNCTION agent_definition_role_immutable() SET search_path = public;
