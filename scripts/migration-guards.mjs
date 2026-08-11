@@ -5,14 +5,106 @@
 export const GLOBAL_TABLES = ["workspace", "user_account", "session", "account", "verification", "__drizzle_migrations"];
 
 /**
- * Strip SQL comments (line comments and block comments) to prevent
- * commented-out security requirements from bypassing guards.
+ * Strip SQL comments (line and block) while respecting string literals and
+ * dollar-quoted blocks. State machine walks character-by-character to properly
+ * handle: single quotes with '' escaping, double-quoted identifiers, dollar-quoted
+ * strings ($tag$...$tag$), and only strips comments outside all of these contexts.
  */
-function stripComments(sql) {
-  // Remove block comments /* ... */
-  let result = sql.replace(/\/\*[\s\S]*?\*\//g, "");
-  // Remove line comments --
-  result = result.replace(/--[^\n]*$/gm, "");
+export function stripComments(sql) {
+  let result = '';
+  let i = 0;
+  while (i < sql.length) {
+    // Single-quoted string: 'string with ''escaped'' quotes'
+    if (sql[i] === "'") {
+      result += sql[i];
+      i++;
+      while (i < sql.length) {
+        if (sql[i] === "'" && sql[i + 1] === "'") {
+          result += "''";
+          i += 2;
+        } else if (sql[i] === "'") {
+          result += sql[i];
+          i++;
+          break;
+        } else {
+          result += sql[i];
+          i++;
+        }
+      }
+    }
+    // Double-quoted identifier: "column_name"
+    else if (sql[i] === '"') {
+      result += sql[i];
+      i++;
+      while (i < sql.length) {
+        if (sql[i] === '"' && sql[i + 1] === '"') {
+          result += '""';
+          i += 2;
+        } else if (sql[i] === '"') {
+          result += sql[i];
+          i++;
+          break;
+        } else {
+          result += sql[i];
+          i++;
+        }
+      }
+    }
+    // Dollar-quoted string: $$...$$  or  $tag$...$tag$
+    else if (sql[i] === '$') {
+      let j = i + 1;
+      let tag = '';
+      while (j < sql.length && (sql[j] === '_' || /\w/.test(sql[j]))) {
+        tag += sql[j];
+        j++;
+      }
+      if (j < sql.length && sql[j] === '$') {
+        const dollarQuote = '$' + tag + '$';
+        result += dollarQuote;
+        i = j + 1;
+        while (i < sql.length) {
+          if (sql.substr(i, dollarQuote.length) === dollarQuote) {
+            result += dollarQuote;
+            i += dollarQuote.length;
+            break;
+          } else {
+            result += sql[i];
+            i++;
+          }
+        }
+      } else {
+        result += sql[i];
+        i++;
+      }
+    }
+    // Block comment: /* ... */
+    else if (sql[i] === '/' && sql[i + 1] === '*') {
+      i += 2;
+      while (i < sql.length) {
+        if (sql[i] === '*' && sql[i + 1] === '/') {
+          i += 2;
+          break;
+        }
+        i++;
+      }
+    }
+    // Line comment: -- to end of line
+    else if (sql[i] === '-' && sql[i + 1] === '-') {
+      i += 2;
+      while (i < sql.length && sql[i] !== '\n') {
+        i++;
+      }
+      if (i < sql.length && sql[i] === '\n') {
+        result += '\n';
+        i++;
+      }
+    }
+    // Normal character
+    else {
+      result += sql[i];
+      i++;
+    }
+  }
   return result;
 }
 
