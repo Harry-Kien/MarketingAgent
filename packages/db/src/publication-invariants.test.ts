@@ -3,10 +3,15 @@
 // publication exist without one, without real (non-blank) publication_content,
 // and without a unique idempotency_key -- even when called directly by
 // smos_app, bypassing buildPublication entirely.
+import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import { createDb, createDbPool } from "./client.ts";
 import { withTenant } from "./tenant-scope.ts";
+
+function sha256Hex(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
 
 const url =
   process.env["DATABASE_URL"] ?? "postgres://smos_app:smos_app_local_dev@127.0.0.1:5433/smos";
@@ -85,6 +90,12 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  // publication rows are cleaned up (unlike the rest of the seeded chain,
+  // which follows this repo's existing convention of leaving fixture rows
+  // in the persistent dev database) because a later migration adds a CHECK
+  // tying content_hash to publication_content; leftover rows with
+  // placeholder hashes would fail that CHECK's validation on ALTER TABLE.
+  await adminPool.query(`delete from publication where workspace_id in ($1,$2)`, [A, B]);
   await pool.end();
   await adminPool.end();
 });
@@ -110,8 +121,8 @@ function insertPublication(
       `insert into publication
          (id, workspace_id, campaign_id, content_version_id, approval_decision_id,
           publication_content, content_hash, idempotency_key, target_channel, state)
-       values (gen_random_uuid(), $1, $2, $3, $4, $5, 'deadbeef', $6, 'meta_page', 'prepared')`,
-      [ws, campaignId, versionId, decisionId, content, idempotencyKey],
+       values (gen_random_uuid(), $1, $2, $3, $4, $5, $7, $6, 'meta_page', 'prepared')`,
+      [ws, campaignId, versionId, decisionId, content, idempotencyKey, sha256Hex(content)],
     ));
 }
 
