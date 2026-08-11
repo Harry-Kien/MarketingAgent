@@ -20,3 +20,4 @@ export {
   applyTransition,
   createInitialTransition,
 } from "./lifecycle.ts";
+export { type Campaign, createCampaign, transitionCampaign } from "./campaign.ts";
