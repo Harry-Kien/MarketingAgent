@@ -112,10 +112,46 @@ describe("campaign.state — transition-validating trigger (Invariant D)", () =>
     await expect(updateState(campaignId, "MEASURING")).rejects.toThrow(/transition|not allowed/i);
   });
 
-  it("setting state to its own current value is refused (from === to)", async () => {
+  // Final whole-branch review round 2. Originally this trigger raised on
+  // NEW.state = OLD.state, mirroring canTransition's own from === to
+  // rule -- but canTransition judges a REQUESTED transition, while this
+  // trigger fires on any UPDATE that merely NAMES the state column,
+  // including one where nothing about state was actually requested to
+  // change (an ORM's full-row UPDATE that lists every column, most of them
+  // unchanged, is the standard shape once real persistence code exists).
+  // Rejecting that would make the very first full-row UPDATE -- changing
+  // only `name`, say, while state is carried along unchanged in the same
+  // SET clause -- fail outright with no real transition ever attempted.
+  // The trigger now treats an unchanged value as a no-op (allowed), while
+  // a genuinely requested but illegal transition is still refused.
+  it("setting state to its own current value is a no-op and is allowed", async () => {
     const goalId = await insertGoal();
     const campaignId = await insertCampaignAt("PLANNED", goalId);
-    await expect(updateState(campaignId, "PLANNED")).rejects.toThrow(/transition|not allowed/i);
+    await updateState(campaignId, "PLANNED");
+    const after = await withTenant(pool, WS, (tx) =>
+      tx.query(`select state from campaign where id = $1`, [campaignId]));
+    expect(after.rows[0].state).toBe("PLANNED");
+  });
+
+  it("a full-row-shaped UPDATE that changes name but carries state unchanged in the same SET clause succeeds", async () => {
+    const goalId = await insertGoal();
+    const campaignId = await insertCampaignAt("PLANNED", goalId);
+    const newName = `renamed-${Date.now()}-${Math.random()}`;
+    await withTenant(pool, WS, (tx) =>
+      tx.query(`update campaign set name = $1, state = state where id = $2`, [newName, campaignId]));
+    const after = await withTenant(pool, WS, (tx) =>
+      tx.query(`select name, state from campaign where id = $1`, [campaignId]));
+    expect(after.rows[0].name).toBe(newName);
+    expect(after.rows[0].state).toBe("PLANNED");
+  });
+
+  it("a real illegal transition inside the same kind of full-row UPDATE is still refused", async () => {
+    const goalId = await insertGoal();
+    const campaignId = await insertCampaignAt("DRAFT", goalId);
+    await expect(
+      withTenant(pool, WS, (tx) =>
+        tx.query(`update campaign set name = name, state = $1 where id = $2`, ["APPROVED", campaignId])),
+    ).rejects.toThrow(/transition|not allowed/i);
   });
 
   // Exhaustive cross-check: every (from, to) pair the domain's canTransition
