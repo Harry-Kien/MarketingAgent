@@ -36,6 +36,12 @@ export interface TenantFixture {
   // exhaustive probe can hijack it across workspaces the same way it does
   // every other composite tenant-to-tenant FK.
   integrationId: Id;
+  // Auth schema (0029_auth_schema.sql): the membership row binding userId to
+  // this workspace -- workspace_member is workspace-owned (unlike
+  // user_account/session/account/verification, which are global), so
+  // cross-tenant.test.ts's exhaustive, catalog-driven suite needs one real
+  // row per workspace here too.
+  workspaceMemberId: Id;
 }
 
 async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixture> {
@@ -57,6 +63,7 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
   const toolCallId = newId();
   const runCheckpointId = newId();
   const integrationId = newId();
+  const workspaceMemberId = newId();
 
   // Seeded directly as the connecting (superuser) role, which always bypasses
   // RLS -- these rows exist to be *subjects* of the isolation proof, not to
@@ -185,6 +192,13 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
      values (gen_random_uuid(), $1, $2, 'e12_seed_metric', 1, now(), 'last_touch', '7d', 'low')`,
     [workspaceId, campaignId],
   );
+  // 0029_auth_schema.sql: binds the fixture's own user_account row to this
+  // workspace, the same "first membership wins" shape resolve_user_workspace
+  // expects.
+  await client.query(
+    `insert into workspace_member (id, workspace_id, user_id, role) values ($1, $2, $3, 'owner')`,
+    [workspaceMemberId, workspaceId, userId],
+  );
 
   return {
     workspaceId,
@@ -205,6 +219,7 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
     toolCallId,
     runCheckpointId,
     integrationId,
+    workspaceMemberId,
   };
 }
 

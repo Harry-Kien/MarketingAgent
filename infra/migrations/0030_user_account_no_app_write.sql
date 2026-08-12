@@ -1,0 +1,28 @@
+-- Fix round 1: 0029_auth_schema.sql granted smos_app INSERT and UPDATE on
+-- user_account so better-auth could provision/update users through the
+-- application's own database connection. That directly reopened E4's first
+-- lock (packages/db/src/approval-invariants.test.ts, describe block "E4
+-- lock 1's other half: smos_app cannot provision its own user_account
+-- row"): approval_decision.actor_user_id's foreign key to user_account only
+-- proves a recorded approval's actor is a real human because smos_app --
+-- the exact role every agent (and every compromised agent) also runs as --
+-- can never manufacture its own user_account row. Running `npm run verify`
+-- against 0029 failed exactly that test
+-- ("expected [ 'INSERT', 'SELECT', 'UPDATE' ] to not include 'INSERT'"),
+-- which is what caught this before merge, not a later audit.
+--
+-- Per the task brief's own instruction: "If better-auth's own schema
+-- requirements conflict with this project's tenancy invariants, the
+-- invariants win." User provisioning stays an administrative act, done
+-- through DATABASE_MIGRATION_URL (smos), never through the application's
+-- pool -- exactly like scripts/apply-migrations.mjs and every existing test
+-- fixture (packages/testing/src/tenant-fixtures.ts's seedOne(),
+-- approval-invariants.test.ts's own seedUser()) already do it. better-auth's
+-- *sign-up* endpoint is therefore configured unreachable through the
+-- running app (`emailAndPassword.disableSignUp: true`,
+-- apps/web/src/server/auth.ts) -- consistent with D1.b, "no public signup."
+--
+-- Sign-in, get-session and sign-out need only SELECT on user_account (0001,
+-- unchanged) plus full CRUD on session/account/verification (0029,
+-- unchanged) -- none of that depended on the grant being revoked here.
+REVOKE INSERT, UPDATE ON user_account FROM smos_app;

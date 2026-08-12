@@ -162,11 +162,16 @@ const FK_PAIRS = await discoverTenantToTenantFks(TENANT_TABLES);
 // credential_reference, webhook_delivery, event, metric -- all five
 // workspace-owned, per this list's own rule, updated in the same commit as
 // the migration that adds them.
+// Auth schema (infra/migrations/0029_auth_schema.sql) adds workspace_member
+// -- workspace-owned (unlike user_account/session/account/verification,
+// which stay global, see that migration's own header) -- updated here in
+// the same commit per this list's own rule above.
 const EXPECTED_TENANT_TABLES = [
   "agent_definition", "agent_run", "agent_version", "approval_decision", "approval_request",
   "audit_log", "campaign", "content_item", "content_version", "credential_reference",
   "event", "goal", "integration", "metric", "outbox",
   "publication", "run_checkpoint", "source_citation", "tool_call", "webhook_delivery",
+  "workspace_member",
 ].toSorted();
 
 const EXPECTED_FK_PAIRS = [
@@ -233,6 +238,9 @@ afterAll(async () => {
     await adminPool.query("delete from metric where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
     await adminPool.query("delete from webhook_delivery where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
     await adminPool.query("delete from integration where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
+    // Auth schema (0029_auth_schema.sql): workspace_member has no children,
+    // so it is always safely deletable here, unlike the plain-FK chain above.
+    await adminPool.query("delete from workspace_member where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
   }
   await pool.end();
   await adminPool.end();
@@ -407,6 +415,12 @@ function buildProbeRow(table: string, ws: TenantFixture, id: string): { columns:
           { value: id }, { value: ws.workspaceId }, { value: ws.campaignId }, { value: "e12_probe_metric" }, { value: 1 },
           { value: new Date() }, { value: "last_touch" }, { value: "7d" }, { value: "low" },
         ],
+      };
+    // Auth schema (infra/migrations/0029_auth_schema.sql):
+    case "workspace_member":
+      return {
+        columns: ["id", "workspace_id", "user_id", "role"],
+        cells: [{ value: id }, { value: ws.workspaceId }, { value: ws.userId }, { value: "owner" }],
       };
     default:
       // Fails loudly rather than silently skipping: a table discovered from
