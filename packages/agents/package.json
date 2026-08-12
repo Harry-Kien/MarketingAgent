@@ -6,5 +6,10 @@
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@smos/db": "*",
+    "@smos/domain": "*",
+    "@smos/telemetry": "*"
   }
 }
