@@ -1,5 +1,9 @@
 export const messages = {
   nav: { today: "Sổ điều hành", campaigns: "Chiến dịch", content: "Nội dung", approvals: "Phê duyệt", analytics: "Kết quả" },
+  shell: {
+    commandBarOpen: "Mở thanh lệnh (⌘K)",
+    landmark: "Điều hướng chính",
+  },
   home: { title: "Sổ điều hành", briefTitle: "Tóm tắt hôm nay", needsYou: "Cần bạn xử lý", atRisk: "Chiến dịch có rủi ro" },
   approval: {
     pendingTitle: "Đang chờ bạn phê duyệt",
