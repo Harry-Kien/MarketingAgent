@@ -16,7 +16,9 @@
     "instrumentation.ts",
     "next.config.ts",
     "next-env.d.ts",
-    ".next/types/**/*.ts"
+    ".next/types/**/*.ts",
+    "e2e/fixtures/**/*.ts",
+    "e2e/golden-sequence.test.ts"
   ],
   "exclude": ["node_modules", ".next"]
 }
