@@ -27,6 +27,21 @@ import type { Id } from "@smos/domain";
 import { logger } from "@smos/telemetry";
 import { withTenantTools, type ToolTx } from "@smos/db";
 
+// The refused name is attacker-influenced (it is exactly what the model
+// asked for), so logging it verbatim is an unbounded log-volume vector -- a
+// multi-megabyte tool name would be written to the log in full. Capped well
+// below anything a real tool name needs, and marked so a reader
+// investigating an incident (Task 11's whole point) knows the value was cut
+// rather than genuinely this short. The full name is never assembled into
+// the logged fields at all -- not truncated for display and left elsewhere
+// in the same log line -- so it cannot leak out through a sibling field.
+const MAX_LOGGED_TOOL_NAME_LENGTH = 200;
+
+function truncateForLog(value: string, max = MAX_LOGGED_TOOL_NAME_LENGTH): string {
+  if (value.length <= max) return value;
+  return `${value.slice(0, max)}...[truncated, ${value.length} chars total]`;
+}
+
 export interface ToolContext {
   workspaceId: Id;
   agentRunId: Id;
@@ -78,7 +93,7 @@ export function createToolRegistry(tools: ToolDef[]): ToolRegistry {
         // corpus and the audit trail both depend on that.
         logger.warn("policy.violation", {
           kind: "tool_not_allowed",
-          tool: name,
+          tool: truncateForLog(name),
           workspaceId: ctx.workspaceId,
           agentRunId: ctx.agentRunId,
         });

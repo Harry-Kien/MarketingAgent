@@ -15,17 +15,70 @@ const url = process.env["DATABASE_URL"] ?? "postgres://smos_app:smos_app_local_d
 const pool = createDbPool(url);
 const db = createDb(pool);
 
-const A = "77777777-7777-7777-8777-777777777777";
-const B = "88888888-8888-7888-8888-888888888888";
+// smos_app is NOBYPASSRLS (STANDING-CONTEXT.md), so cleanup -- which must
+// run regardless of which workspace's session variable happened to be set
+// last -- goes through the migration role instead, the same way
+// packages/db/src/agent-registry-tenant.test.ts's adminPool does.
+const adminUrl =
+  process.env["DATABASE_MIGRATION_URL"] ?? "postgres://smos:smos_local_dev@127.0.0.1:5433/smos";
+const adminPool = createDbPool(adminUrl);
+
+// Generated fresh per test run rather than a fixed literal: a hand-picked
+// constant risks exactly what happened here during review -- it collided
+// with the same literal already used by packages/db/src/campaign-state-check.test.ts
+// and publication-immutability.test.ts, inflating this file's row counts
+// with rows the collision, not this suite, was responsible for. A random id
+// makes that collision structurally impossible and gives every run a
+// workspace with a guaranteed-empty baseline.
+const A = newId();
+const B = newId();
+
+// This runs against the real, persistent, shared PostgreSQL instance
+// (STANDING-CONTEXT.md: tests share one database, clean up rows you
+// create). Every goal/campaign row this file inserts is tracked here and
+// deleted in afterAll -- campaign before goal, since campaign.goal_id
+// REFERENCES goal(id) with no ON DELETE CASCADE (0004_campaign.sql). The
+// suite writes nothing to audit_log (append-only, so nothing here could be
+// deleted even if it did), and to no table other than goal and campaign.
+const createdGoalIds: string[] = [];
+const createdCampaignIds: string[] = [];
+
+let baselineGoalCount = -1;
+let baselineCampaignCount = -1;
+
+async function countRows(table: "goal" | "campaign", workspaceId: string): Promise<number> {
+  const r = await adminPool.query(`select count(*)::int as n from ${table} where workspace_id = $1`, [
+    workspaceId,
+  ]);
+  return (r.rows[0] as { n: number }).n;
+}
 
 beforeAll(async () => {
   await db.execute(
     sql`insert into workspace (id, name) values (${A}::uuid, 'tools-tenant-A'), (${B}::uuid, 'tools-tenant-B') on conflict do nothing`,
   );
+  // Baseline captured fresh at the start of this run, through the
+  // RLS-bypassing admin role so it reflects every row truly present for
+  // workspace A regardless of session state -- afterAll proves the suite
+  // returns this exact count, not merely that its own tracked ids are gone.
+  baselineGoalCount = await countRows("goal", A);
+  baselineCampaignCount = await countRows("campaign", A);
 });
 
 afterAll(async () => {
-  await pool.end();
+  try {
+    if (createdCampaignIds.length > 0) {
+      await adminPool.query(`delete from campaign where id = ANY($1::uuid[])`, [createdCampaignIds]);
+    }
+    if (createdGoalIds.length > 0) {
+      await adminPool.query(`delete from goal where id = ANY($1::uuid[])`, [createdGoalIds]);
+    }
+    expect(await countRows("goal", A)).toBe(baselineGoalCount);
+    expect(await countRows("campaign", A)).toBe(baselineCampaignCount);
+  } finally {
+    await pool.end();
+    await adminPool.end();
+  }
 });
 
 const ctx = (workspaceId: string) => ({ workspaceId, agentRunId: newId(), allowlist: ["read.campaign"] });
@@ -41,15 +94,19 @@ async function seedCampaign(workspaceId: string): Promise<string> {
   try {
     await client.query("select set_config('app.workspace_id', $1, false)", [workspaceId]);
     const goal = await client.query(
-      `insert into goal (id, workspace_id, statement) values (gen_random_uuid(), $1, 'tools-tenant probe') returning id`,
-      [workspaceId],
+      `insert into goal (id, workspace_id, statement) values (gen_random_uuid(), $1, $2) returning id`,
+      [workspaceId, `tools-tenant probe ${newId()}`],
     );
+    const goalId = (goal.rows[0] as { id: string }).id;
+    createdGoalIds.push(goalId);
     const campaign = await client.query(
       `insert into campaign (id, workspace_id, goal_id, name, state)
        values (gen_random_uuid(), $1, $2, $3, 'DRAFT') returning id`,
-      [workspaceId, (goal.rows[0] as { id: string }).id, `tools-tenant campaign ${newId()}`],
+      [workspaceId, goalId, `tools-tenant campaign ${newId()}`],
     );
-    return (campaign.rows[0] as { id: string }).id;
+    const campaignId = (campaign.rows[0] as { id: string }).id;
+    createdCampaignIds.push(campaignId);
+    return campaignId;
   } finally {
     client.release();
   }

@@ -284,6 +284,39 @@ describe("allowlist: a handler cannot escape its own allowlist via the registry"
   });
 });
 
+describe("allowlist: an unbounded attacker-supplied name cannot blow up the log", () => {
+  it("caps a very long tool name in the policy.violation log, marks it truncated, and never writes the full name anywhere in that log line", async () => {
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    try {
+      const longName = "publish.meta." + "x".repeat(5000);
+      const reg = createToolRegistry([]);
+      await expect(reg.invoke(longName, {}, ctx(["read.brand"]))).rejects.toThrow();
+
+      expect(warn).toHaveBeenCalledOnce();
+      const call = warn.mock.calls[0] as [string, Record<string, unknown>];
+      const fields = call[1];
+      const loggedTool = fields["tool"];
+
+      expect(typeof loggedTool).toBe("string");
+      // Capped well below the attacker's 5000+ char input.
+      expect((loggedTool as string).length).toBeLessThan(300);
+      // Marked so a reader investigating an incident knows it was cut, not
+      // that the tool name genuinely was this short.
+      expect(loggedTool).toMatch(/truncated/i);
+
+      // The full name must not appear ANYWHERE in the logged call -- not in
+      // a sibling field, not smuggled in under a different key. Serialising
+      // the whole call and searching it catches that, not just checking the
+      // "tool" field in isolation.
+      const serialisedCall = JSON.stringify(call);
+      expect(serialisedCall).not.toContain(longName);
+      expect(serialisedCall.length).toBeLessThan(longName.length);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
 describe("allowlist: prototype-chain names cannot fall through to something inherited", () => {
   for (const trap of ["__proto__", "constructor", "toString", "hasOwnProperty", "valueOf"]) {
     it(`treats "${trap}" as an ordinary unregistered tool name, not a live prototype member`, async () => {
