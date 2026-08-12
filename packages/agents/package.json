@@ -8,12 +8,10 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@smos/contracts": "*",
     "@smos/db": "*",
     "@smos/domain": "*",
     "@smos/model-gateway": "*",
     "@smos/telemetry": "*"
-  },
-  "devDependencies": {
-    "@smos/contracts": "*"
   }
 }
