@@ -14,15 +14,18 @@
     "@smos/domain": "*",
     "@smos/telemetry": "*",
     "@smos/worker": "*",
+    "better-auth": "1.6.26",
     "next": "16.3.0",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },
   "devDependencies": {
+    "@playwright/test": "1.62.1",
     "@smos/agents": "*",
     "@smos/integrations": "*",
     "@smos/model-gateway": "*",
     "@smos/policy": "*",
+    "@smos/testing": "*",
     "@types/react": "19.2.7",
     "@types/react-dom": "19.2.4"
   }
