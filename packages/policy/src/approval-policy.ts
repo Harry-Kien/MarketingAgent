@@ -5,8 +5,40 @@
 // whether the gate exists, never who may open it).
 import { classifyRisk, type RiskLevel } from "./risk.ts";
 
+// Fix round 1, IMPORTANT: the wiring risk flagged in the original report,
+// made impossible instead of merely documented. `GateInput.actionKind` used
+// to be a plain `string`, so nothing distinguished "derived from the
+// construction-time tool allowlist" from "arbitrary model-parsed text" --
+// a future caller could pipe `interpretToolCall(raw)`'s pre-allowlist-check
+// name (packages/agents/src/runtime.ts) straight into `actionKind` with no
+// type error at all. `TrustedActionKind` can only be produced by
+// `trustActionKind`, which checks the value against the caller's actual
+// allowlist, so `evaluateGate({ actionKind: someModelText, ... })` now
+// fails to compile unless `someModelText` already went through that check.
+// A brand is erasable with `as`, so `trustActionKind` also re-validates at
+// runtime: the brand stops the accident, the runtime check stops the
+// deliberate bypass.
+declare const trustedActionKindBrand: unique symbol;
+export type TrustedActionKind = string & { readonly [trustedActionKindBrand]: true };
+
+/**
+ * The only way to produce a `TrustedActionKind`. `name` must be literally
+ * present in `allowlist` -- pass the invoking agent's real
+ * `entry.toolAllowlist` (T4's construction-time snapshot), never a list
+ * built from the same untrusted source as `name` itself.
+ */
+export function trustActionKind(name: string, allowlist: readonly string[]): TrustedActionKind {
+  if (typeof name !== "string") {
+    throw new TypeError(`trustActionKind requires a string name; got ${typeof name}.`);
+  }
+  if (!allowlist.includes(name)) {
+    throw new Error(`"${name}" is not on the tool allowlist; refusing to trust it as an action kind`);
+  }
+  return name as TrustedActionKind;
+}
+
 export interface GateInput {
-  actionKind: string;
+  actionKind: TrustedActionKind;
   text: string;
   qaVerdict: "pass" | "block";
 }
