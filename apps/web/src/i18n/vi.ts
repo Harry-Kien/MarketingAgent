@@ -13,8 +13,14 @@ export const messages = {
     missingEvidence: "Thiếu bằng chứng nên chưa thể phê duyệt",
     disconnected: "Kênh đích đang ngắt kết nối nên chưa thể phê duyệt",
   },
-  campaign: { title: "Chiến dịch", lifecycle: "Vòng đời", budget: "Ngân sách", conversion: "Chuyển đổi" },
-  content: { title: "Nội dung", version: "Phiên bản", publicationContent: "Nội dung sẽ đăng", citations: "Nguồn trích dẫn" },
+  campaign: {
+    title: "Chiến dịch", lifecycle: "Vòng đời", budget: "Ngân sách", conversion: "Chuyển đổi",
+    name: "Tên chiến dịch", updatedAt: "Cập nhật lúc", notFound: "Không tìm thấy chiến dịch này",
+  },
+  content: {
+    title: "Nội dung", version: "Phiên bản", publicationContent: "Nội dung sẽ đăng", citations: "Nguồn trích dẫn",
+    notFound: "Không tìm thấy nội dung này", body: "Nội dung", diffBefore: "Trước", diffAfter: "Sau",
+  },
   analytics: { title: "Kết quả", freshness: "Cập nhật lúc", attributionModel: "Mô hình quy thuộc", confidence: "Độ tin cậy", missingData: "Thiếu dữ liệu" },
   state: {
     loading: "Đang tải", empty: "Chưa có dữ liệu", error: "Không tải được dữ liệu",
