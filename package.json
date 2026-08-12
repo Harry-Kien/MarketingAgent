@@ -23,9 +23,10 @@
     "lint:imports": "node scripts/check-imports.mjs",
     "lint:migrations": "node scripts/check-migrations.mjs",
     "lint:purity": "node scripts/check-domain-purity.mjs",
+    "lint:authz": "node scripts/check-authz-purity.mjs",
     "lint:design": "node scripts/check-design-constraints.mjs",
     "lint:i18n": "node scripts/check-i18n.mjs",
-    "verify": "npm run lint:versions && npm run lint:scope && npm run lint:secrets && npm run lint:imports && npm run lint:migrations && npm run lint:purity && npm run lint:design && npm run lint:i18n && npm run typecheck && npm run typecheck:web && npm run test"
+    "verify": "npm run lint:versions && npm run lint:scope && npm run lint:secrets && npm run lint:imports && npm run lint:migrations && npm run lint:purity && npm run lint:authz && npm run lint:design && npm run lint:i18n && npm run typecheck && npm run typecheck:web && npm run test"
   },
   "devDependencies": {
     "@types/node": "26.1.1",
