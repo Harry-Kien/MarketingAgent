@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { findLineHeightViolations, findArchivoMiddot, findBannedVisuals } from "./design-constraints.mjs";
+import { FALSE_POSITIVE_FIXTURE } from "./false-positive-fixture.mjs";
 
 // Built via fromCharCode rather than typed as a literal escape sequence in
 // this file, because a literal `·` typed here would itself be resolved
@@ -145,5 +146,98 @@ describe("anti AI-look -- still fires on a real violation and still passes clean
   });
   it("passes a clean block", () => {
     expect(findBannedVisuals(`background: var(--color-surface); border-radius: 6px;`)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix round 2: round 1 traded false negatives for false positives. This
+// section covers the reviewer's two confirmed false positives (a JSX/JS
+// comment read as literal text; the single-line vertical-centering idiom),
+// the remaining C1 evasions (leading-dot decimals, quoted style values),
+// and exact boundary behaviour.
+// ---------------------------------------------------------------------------
+
+describe("C2 middot -- comments document the rule, they are not the violation (fix round 2)", () => {
+  it("does not flag a middot inside a JSX comment", () => {
+    expect(findArchivoMiddot(`<span className="font-display">{/* separator uses · like this */}</span>`)).toEqual([]);
+  });
+  it("does not flag a middot inside a // line comment sitting inside a JSX expression", () => {
+    const src = "<span className=\"font-display\">{value // uses · here\n}</span>";
+    expect(findArchivoMiddot(src)).toEqual([]);
+  });
+  it("still flags a middot in real rendered text next to a comment about it", () => {
+    const src = `<span className="font-display">{/* note: uses · like this */}Đã đăng · Bị chặn</span>`;
+    expect(findArchivoMiddot(src)).toHaveLength(1);
+  });
+});
+
+describe("C1 -- single-line vertical-centering idiom is not a false positive (fix round 2)", () => {
+  it("does not flag line-height equal to an explicit height in the same CSS rule", () => {
+    expect(findLineHeightViolations(`.badge { height: 32px; line-height: 32px; }`)).toEqual([]);
+  });
+  it("does not flag line-height equal to an explicit height in an inline style object (unitless height implies px)", () => {
+    expect(findLineHeightViolations(`style={{ height: 32, lineHeight: "32px" }}`)).toEqual([]);
+  });
+  it("still flags an absolute line-height with no height at all in the block", () => {
+    expect(findLineHeightViolations(`.badge { width: 32px; line-height: 20px; }`).length).toBeGreaterThan(0);
+  });
+  it("still flags an absolute line-height whose value does not match the height", () => {
+    expect(findLineHeightViolations(`.badge { height: 40px; line-height: 20px; }`).length).toBeGreaterThan(0);
+  });
+  it("a documented suppression comment with a reason suppresses one occurrence", () => {
+    expect(findLineHeightViolations(`.x { line-height: 20px; /* c1-ok: single-line icon button, verified no second line ever renders */ }`)).toEqual([]);
+  });
+  it("an empty suppression comment does NOT suppress", () => {
+    expect(findLineHeightViolations(`.x { line-height: 20px; /* c1-ok: */ }`).length).toBeGreaterThan(0);
+  });
+  it("no suppression comment at all still refuses the absolute unit", () => {
+    expect(findLineHeightViolations(`.x { line-height: 20px; }`).length).toBeGreaterThan(0);
+  });
+  it("the refusal message states both legitimate paths forward", () => {
+    const [msg] = findLineHeightViolations(`.x { line-height: 20px; }`);
+    expect(msg).toMatch(/height/i);
+    expect(msg).toMatch(/c1-ok/i);
+  });
+});
+
+describe("C1 -- remaining evasions from round 1 (fix round 2)", () => {
+  it("flags a leading-dot decimal with no leading zero", () => {
+    expect(findLineHeightViolations(`.x { line-height: .9; }`).length).toBeGreaterThan(0);
+  });
+  it("flags a quoted ratio string in an inline style", () => {
+    expect(findLineHeightViolations(`style={{ lineHeight: "1.1" }}`).length).toBeGreaterThan(0);
+  });
+  it("flags a quoted absolute-unit string in an inline style", () => {
+    expect(findLineHeightViolations(`style={{ lineHeight: "14px" }}`).length).toBeGreaterThan(0);
+  });
+});
+
+describe("C1 -- boundary behaviour", () => {
+  it("exactly 1.3 passes", () => {
+    expect(findLineHeightViolations(`.x { line-height: 1.3; }`)).toEqual([]);
+  });
+  it("1.29 fails", () => {
+    expect(findLineHeightViolations(`.x { line-height: 1.29; }`).length).toBeGreaterThan(0);
+  });
+  it("1.30 (trailing zero) passes", () => {
+    expect(findLineHeightViolations(`.x { line-height: 1.30; }`)).toEqual([]);
+  });
+  it("1.3000 passes", () => {
+    expect(findLineHeightViolations(`.x { line-height: 1.3000; }`)).toEqual([]);
+  });
+  it("+1.3 (explicit leading plus) passes", () => {
+    expect(findLineHeightViolations(`.x { line-height: +1.3; }`)).toEqual([]);
+  });
+});
+
+describe("permanent false-positive regression suite (fix round 2)", () => {
+  it("findLineHeightViolations reports zero findings against ordinary component code", () => {
+    expect(findLineHeightViolations(FALSE_POSITIVE_FIXTURE)).toEqual([]);
+  });
+  it("findArchivoMiddot reports zero findings against ordinary component code", () => {
+    expect(findArchivoMiddot(FALSE_POSITIVE_FIXTURE)).toEqual([]);
+  });
+  it("findBannedVisuals reports zero findings against ordinary component code", () => {
+    expect(findBannedVisuals(FALSE_POSITIVE_FIXTURE)).toEqual([]);
   });
 });
