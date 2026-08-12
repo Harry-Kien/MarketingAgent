@@ -154,6 +154,43 @@ describe("runAgent bookkeeping", () => {
     // twice, not merely "the ledger only counted it once".
     expect(providerCalls).toBe(1);
   });
+
+  // Fix round 3, IMPORTANT: the round-2 cold-start gate (removed in
+  // gateway.ts, see task-7-report.md "Fix round 3") made a LEGITIMATE
+  // parallel scenario fail: four founders' runs kicked off together right
+  // after a deploy each get their own cold Gateway (or share one that has
+  // never made a call), all with an honest estimate and ample budget. This
+  // proves the fix through the actual runAgent path, not just the gateway
+  // in isolation: 4 concurrent runs, none of which should ever see
+  // "budget cannot yet be safely judged" or any other budget-shaped
+  // refusal, since $10 of $10 was available the whole time.
+  it("four parallel runAgent calls on a cold, shared gateway with an honest estimate and ample budget: all four reach a non-budget terminal state", async () => {
+    const gateway = createGateway({
+      provider: {
+        name: "founders-deploy",
+        generate: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          return { text: '{"ok":true}', tokensIn: 1, tokensOut: 1, costUsd: 0.1, modelVersion: "m" };
+        },
+      },
+      budgetUsd: 10,
+      maxWallclockMs: 5000,
+      estimatedCostUsd: 0.1,
+    });
+    const run = () => runAgent({ ...base("research"), gateway, store: store() });
+
+    const results = await Promise.allSettled([run(), run(), run(), run()]);
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected") as PromiseRejectedResult[];
+    // Every rejection reason, if any, must be unrelated to budget -- the
+    // property this test exists to prove is "not failed_terminal for a
+    // budget reason", not merely "some of them happened to succeed".
+    for (const r of rejected) {
+      expect(String(r.reason)).not.toMatch(/budget/i);
+    }
+    expect(fulfilled).toHaveLength(4);
+    expect(gateway.spentUsd()).toBeCloseTo(0.4);
+  });
 });
 
 // Hard requirement (1): "persist the validated output durably... within the
