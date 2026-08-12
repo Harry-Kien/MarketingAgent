@@ -17,19 +17,73 @@
 import { z } from "zod";
 import { VERIFICATION_STATUSES } from "@smos/domain";
 
+// Fix round 1, MINOR 3: rejecting a "__proto__" key must live in the schema
+// itself, not only in parseAgentOutput's JSON.parse reviver -- otherwise a
+// caller that reaches straight for `someSchema.safeParse(json)` (bypassing
+// parseAgentOutput) would still get Zod 4.4.3's silent drop of that one key
+// (see the long comment on parseJson further down for how that was found).
+// z.preprocess runs on the RAW value, before Zod's own strictObject shape
+// checking has a chance to strip the key, so this is the one place that can
+// actually see it. Applied to every z.strictObject below, at every nesting
+// depth, not only the outermost ones -- an object nested inside an array
+// (a citation, a finding) is exactly as reachable by a direct caller as the
+// top-level shape is.
+const PROTO_KEY_MESSAGE = 'disallowed "__proto__" key';
+
+function noProtoKey<Output>(schema: z.ZodType<Output>): z.ZodType<Output> {
+  return z.preprocess((value, ctx) => {
+    if (value !== null && typeof value === "object" && Object.prototype.hasOwnProperty.call(value, "__proto__")) {
+      ctx.addIssue({ code: "custom", message: PROTO_KEY_MESSAGE });
+      return z.NEVER;
+    }
+    return value;
+  }, schema);
+}
+
+function strictObjectNoProto<Shape extends z.ZodRawShape>(shape: Shape) {
+  return noProtoKey(z.strictObject(shape));
+}
+
+// Fix round 1, MINOR 4: U+200B (ZERO WIDTH SPACE) and its relatives are
+// Unicode category Cf ("format") -- invisible, but not part of the
+// WhiteSpace/LineTerminator productions ECMA-262's String#trim() strips.
+// A model (or a hostile page it read) could pad an otherwise-empty
+// publicationContent with only these and defeat the brief's
+// `v.trim().length > 0` check. \p{Cf} in a Unicode-mode regex covers the
+// whole category, not just U+200B.
+//
+// Note on the database side: P1's content_version CHECK constraint uses
+// `~ '\S'` (PostgreSQL's ARE engine), whose `\s`/`\S` classes are ASCII
+// whitespace only -- Postgres does NOT treat U+200B as whitespace, so a
+// Cf-only string would pass that CHECK. This schema is therefore stricter
+// than the database for this one input class: it refuses something the
+// database alone would accept. That is the safe direction to diverge in
+// (fails closed, never lets through something the database would reject),
+// but T6 should not assume "passed the database CHECK" implies "passed this
+// schema" for content that never goes through parseAgentOutput.
+const BLANK_PATTERN = /^[\s\p{Cf}]*$/u;
+
+// Fix round 1, IMPORTANT 2: citation urls are model-supplied text that a
+// founder may click directly from the UI. z.string().url() (the brief's
+// literal spec) only checks that the value parses as *some* URL -- it does
+// not restrict the scheme, so "javascript:", "data:", and "file:" all
+// passed. Restricted to http/https at the schema level (not a .refine
+// bolted on afterwards) via z.url()'s own `protocol` option.
+const httpUrlSchema = z.url({ protocol: /^https?$/ });
+
 // Same shape as SourceCitation's public fields (packages/domain/src/
 // content.ts) minus `id` and `verificationStatus` -- those are assigned by
 // domain code when a SourceCitation is built, never trusted from model
 // output directly.
-const agentCitationSchema = z.strictObject({
-  url: z.string().url(),
+const agentCitationSchema = strictObjectNoProto({
+  url: httpUrlSchema,
   accessedAt: z.string().datetime(),
   excerpt: z.string().min(1),
 });
 
-export const researchOutputSchema = z.strictObject({
+export const researchOutputSchema = strictObjectNoProto({
   findings: z.array(
-    z.strictObject({
+    strictObjectNoProto({
       claim: z.string().min(1),
       // Reuses domain's single source of truth for the allowed values
       // instead of redeclaring a second list that could drift from it.
@@ -39,20 +93,20 @@ export const researchOutputSchema = z.strictObject({
   ),
 });
 
-export const contentOutputSchema = z.strictObject({
+export const contentOutputSchema = strictObjectNoProto({
   body: z.string().min(1),
-  publicationContent: z.string().refine((v) => v.trim().length > 0, {
+  publicationContent: z.string().refine((v) => !BLANK_PATTERN.test(v), {
     message: "publicationContent must not be blank",
   }),
   claimsUsed: z.array(z.string()),
 });
 
-export const qaOutputSchema = z.strictObject({
+export const qaOutputSchema = strictObjectNoProto({
   verdict: z.enum(["pass", "block"]),
   /** Display and veto signal only. Never a permission input (invariant 4). */
   qualityScore: z.number().int().min(0).max(100),
   findings: z.array(
-    z.strictObject({
+    strictObjectNoProto({
       severity: z.enum(["info", "warn", "block"]),
       message: z.string().min(1),
     }),
@@ -121,9 +175,15 @@ class ProtoKeyError extends Error {}
  * and silently drops it from the parsed result instead of reporting it as
  * an unrecognized key, which would quietly violate this file's closed-
  * schema invariant for that one key alone (every other made-up key is
- * correctly refused). The reviver below rejects `"__proto__"` at any
- * nesting depth before a Zod schema ever sees the value, so it is refused
- * the same way every other unrecognized key is: as a parse failure.
+ * correctly refused).
+ *
+ * The authoritative fix is `noProtoKey` above, on the schemas themselves, so
+ * it holds for any caller -- including one that calls a schema's
+ * `.safeParse` directly and never goes through `parseAgentOutput` at all.
+ * The reviver below is a second, earlier layer specific to this function:
+ * it rejects `"__proto__"` at any nesting depth before JSON.parse even
+ * finishes, so a caller going through parseAgentOutput gets the failure at
+ * the JSON-parsing stage rather than waiting for schema validation.
  */
 function parseJson(raw: string): unknown {
   try {
