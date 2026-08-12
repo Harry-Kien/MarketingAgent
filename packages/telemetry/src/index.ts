@@ -5,6 +5,7 @@ import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
 
 export { createLogger, logger, type Logger, type LogLevel, type LogSink } from "./logger.ts";
 export { redact, REDACTED } from "./redact.ts";
+export { withSpan } from "./spans.ts";
 
 export interface TelemetryOptions {
   serviceName: string;

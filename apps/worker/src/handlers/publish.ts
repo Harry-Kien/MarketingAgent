@@ -1,6 +1,6 @@
 import { hashPublicationContent, isId, type Id } from "@smos/domain";
 import { AdapterError, type ChannelAdapter, type PublishResult } from "@smos/integrations";
-import { logger } from "@smos/telemetry";
+import { logger, withSpan } from "@smos/telemetry";
 
 /**
  * The publication row as loaded from storage -- wider than the domain
@@ -147,12 +147,27 @@ export async function handlePublish(
   }
 
   try {
-    const result = await deps.adapter.publish({
-      idempotencyKey: pub.idempotencyKey,
-      publicationContent: pub.publicationContent,
-      contentHash: pub.contentHash,
-      targetAccountId: pub.targetAccountId,
-    });
+    // Task 6: the one place bytes actually leave this process. Wrapped in
+    // its own span (never the whole handler) so a trace can distinguish
+    // "the approval gate took time" from "the adapter call took time" --
+    // attributes carry only identifiers already safe to export (workspace,
+    // publication, adapter name, idempotency key), never publicationContent.
+    const result = await withSpan(
+      "adapter.publish",
+      {
+        "workspace.id": pub.workspaceId,
+        "publication.id": pub.id,
+        "adapter.name": deps.adapter.name,
+        "idempotency.key": pub.idempotencyKey,
+      },
+      () =>
+        deps.adapter.publish({
+          idempotencyKey: pub.idempotencyKey,
+          publicationContent: pub.publicationContent,
+          contentHash: pub.contentHash,
+          targetAccountId: pub.targetAccountId,
+        }),
+    );
     await deps.markSucceeded(pub.id, result);
     await deps.writeAudit({
       eventType: "publication.succeeded",
