@@ -5,6 +5,7 @@ import { getPool } from "../../../../server/db.ts";
 import { getApprovalRequestDetail } from "../../../../server/queries.ts";
 import { submitApproval } from "../../../../server/actions/submit-approval.ts";
 import { PageState } from "../../../../ui/PageState.tsx";
+import { ApprovalDecisionForm } from "../../../../ui/ApprovalDecisionForm.tsx";
 import { t } from "../../../../i18n/index.ts";
 
 /**
@@ -147,21 +148,7 @@ export default async function ApprovalDetailPage({ params }: { params: Promise<{
       ) : disabledReason !== null ? (
         <p style={{ color: "var(--color-brick)" }}>{disabledReason}</p>
       ) : (
-        <form action={submitApproval.bind(null, detail.id)}>
-          <label htmlFor="approval-reason">{t("approval.reasonLabel")}</label>
-          <textarea id="approval-reason" name="reason" required minLength={1} />
-          <div style={{ display: "flex", gap: 8 }}>
-            <button type="submit" name="decision" value="approve">
-              {t("approval.approve")}
-            </button>
-            <button type="submit" name="decision" value="reject">
-              {t("approval.reject")}
-            </button>
-            <button type="submit" name="decision" value="request_changes">
-              {t("approval.requestChanges")}
-            </button>
-          </div>
-        </form>
+        <ApprovalDecisionForm action={submitApproval.bind(null, detail.id)} />
       )}
     </div>
   );
