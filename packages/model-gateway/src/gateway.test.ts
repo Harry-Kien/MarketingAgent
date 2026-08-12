@@ -85,7 +85,21 @@ describe("gateway budget", () => {
     await expect(g.generate(req, ctx)).rejects.toThrow(/timed out/i);
   });
 
-  it("does not count a late-arriving result against the budget after the timeout already rejected", async () => {
+  // Fix round 5. This test previously asserted `expect(g.spentUsd()).toBe(0)`
+  // AFTER the abandoned provider call had already resolved with a real,
+  // valid costUsd of 0.9 -- it encoded the exact under-reporting defect
+  // this round exists to close. The vendor bills for a call the moment it
+  // reaches the provider and answers with a cost; this gateway giving up
+  // on waiting for that answer (its own wallclock timeout) does not
+  // un-spend the money. `runAgent` persists spentUsd() into
+  // agent_run.cost_usd, so a $0 ledger against a real $0.90 bill is an
+  // audit record that lies to the founder reading it.
+  //
+  // The property the original test was really protecting -- a late result
+  // must not revive the already-refused caller, nor be treated as this
+  // call's success -- is kept: the caller still sees /timed out/, and the
+  // late cost is recorded as spend rather than returned as a result.
+  it("records a late-arriving result's real cost as spend, even though the caller was already refused with a timeout", async () => {
     let resolved: GenerateResult | undefined;
     const slow: ModelProvider = {
       name: "slow-then-expensive",
@@ -98,12 +112,20 @@ describe("gateway budget", () => {
           }, 60);
         }),
     };
-    const g = createGateway({ provider: slow, budgetUsd: 1, maxWallclockMs: 20, estimatedCostUsd: 0.05 });
+    const g = createGateway({ provider: slow, budgetUsd: 1, maxWallclockMs: 20, estimatedCostUsd: 0.9 });
     await expect(g.generate(req, ctx)).rejects.toThrow(/timed out/i);
+    // At this instant nothing is KNOWN to have been billed: the provider
+    // has not answered yet, so there is no cost to record.
+    expect(g.spentUsd()).toBe(0);
     // Give the abandoned provider promise time to actually resolve.
     await new Promise((r) => setTimeout(r, 100));
     expect(resolved).toBeDefined();
-    expect(g.spentUsd()).toBe(0);
+    // The vendor charged 0.9 for that call. The ledger must say so.
+    expect(g.spentUsd()).toBeCloseTo(0.9);
+    // ...and it must count against the budget from then on: a fresh call
+    // is now correctly refused BEFORE the provider is invoked, instead of
+    // being funded by spend the gateway pretended never happened.
+    await expect(g.generate(req, ctx)).rejects.toThrow(/budget/i);
   });
 
   it("propagates a provider's own rejection without corrupting spend accounting", async () => {
@@ -240,6 +262,11 @@ describe("gateway budget", () => {
     // Let the abandoned n=2 call actually settle so it doesn't leak a
     // pending timer into later tests.
     await new Promise((r) => setTimeout(r, 250));
+    // Fix round 5: n=2 reached the provider and the vendor billed it 0.7
+    // when it finally answered, 180ms after this gateway stopped waiting.
+    // The ledger must show all three calls, not just the two whose answers
+    // arrived in time to be observed.
+    expect(g.spentUsd()).toBeCloseTo(2.1);
   });
 
   // Fix round 1, CRITICAL. `reserved += reservation` where
@@ -566,6 +593,43 @@ describe("gateway budget: estimatedCostUsd validation and contract (fix round 2,
     // reached the provider, not a single call's worth and not zero.
     expect(g.spentUsd()).toBeCloseTo(calls * 0.7);
     expect(calls).toBeGreaterThan(0);
+  });
+
+  // Fix round 5. Round 4's ledger fix (`spent += result.costUsd` moved
+  // ahead of the accept/refuse decision) only ever runs on the branch
+  // where THIS gateway observed the provider's answer. When the wallclock
+  // timeout wins the `Promise.race`, the provider promise is abandoned and
+  // its real, already-billed cost is never seen by the ledger at all --
+  // the same eight calls are billed, but whether they are RECORDED is a
+  // race between `deps.maxWallclockMs` and the provider's own latency.
+  // Measured against HEAD with a plain node script, provider 0.70/call,
+  // budget $1, identical config, only N varying: providerCalls=8 every
+  // time, ledger $0.00 / $0.00 / $5.60. This test pins the honest value:
+  // every call the vendor billed must land in the ledger, whichever side
+  // of that race the gateway happened to fall on.
+  it("cold burst, N=50, provider slower than maxWallclockMs: every call the vendor billed still lands in the ledger", async () => {
+    let calls = 0;
+    const provider: ModelProvider = {
+      name: "slower-than-wallclock",
+      generate: async () => {
+        calls++;
+        await new Promise((r) => setTimeout(r, 60));
+        return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 0.7, modelVersion: "m1" };
+      },
+    };
+    const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 20, estimatedCostUsd: 0.01 });
+    const settled = await Promise.allSettled(Array.from({ length: 50 }, () => g.generate(req, ctx)));
+    // Not one of them silently succeeded, and the K=8 cold cap still held.
+    expect(settled.filter((r) => r.status === "fulfilled")).toHaveLength(0);
+    expect(calls).toBeGreaterThan(0);
+    expect(calls).toBeLessThanOrEqual(8);
+    const billed = calls;
+    // Let every abandoned provider call actually answer -- that is the
+    // instant its real cost becomes known, and the instant it must appear
+    // in the ledger.
+    await new Promise((r) => setTimeout(r, 300));
+    expect(calls).toBe(billed); // no new calls were started while waiting
+    expect(g.spentUsd()).toBeCloseTo(billed * 0.7);
   });
 });
 
