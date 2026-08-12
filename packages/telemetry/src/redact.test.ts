@@ -70,4 +70,78 @@ describe("redact", () => {
     expect(redact({ tokens: ["a", "b"] })).toEqual({ tokens: "[redacted]" });
     expect(redact({ refreshTokens: ["a", "b"] })).toEqual({ refreshTokens: "[redacted]" });
   });
+
+  it("redacts all-lowercase concatenated token secrets, which have no camelCase/snake_case word boundary", () => {
+    const input = {
+      accesstoken: "SECRET1",
+      authtoken: "SECRET2",
+      sessiontoken: "SECRET3",
+      csrftoken: "SECRET4",
+      bearertoken: "SECRET5",
+      usertoken: "SECRET6",
+      clienttoken: "SECRET7",
+      mytoken: "SECRET8",
+    };
+    expect(redact(input)).toEqual({
+      accesstoken: "[redacted]",
+      authtoken: "[redacted]",
+      sessiontoken: "[redacted]",
+      csrftoken: "[redacted]",
+      bearertoken: "[redacted]",
+      usertoken: "[redacted]",
+      clienttoken: "[redacted]",
+      mytoken: "[redacted]",
+    });
+  });
+
+  it("exempts only the explicit count-shaped allowlist, camelCase and snake_case", () => {
+    expect(
+      redact({
+        tokensIn: 1,
+        tokensOut: 2,
+        tokenCount: 3,
+        tokensUsed: 4,
+        tokensTotal: 5,
+        tokens_in: 1,
+        tokens_out: 2,
+        token_count: 3,
+        tokens_used: 4,
+        tokens_total: 5,
+      }),
+    ).toEqual({
+      tokensIn: 1,
+      tokensOut: 2,
+      tokenCount: 3,
+      tokensUsed: 4,
+      tokensTotal: 5,
+      tokens_in: 1,
+      tokens_out: 2,
+      token_count: 3,
+      tokens_used: 4,
+      tokens_total: 5,
+    });
+  });
+
+  it("still redacts sessionToken, apiToken, accessToken, refresh_token, and a bare token", () => {
+    expect(
+      redact({ sessionToken: "a", apiToken: "b", accessToken: "c", refresh_token: "d", token: "e" }),
+    ).toEqual({
+      sessionToken: "[redacted]",
+      apiToken: "[redacted]",
+      accessToken: "[redacted]",
+      refresh_token: "[redacted]",
+      token: "[redacted]",
+    });
+  });
+
+  it("redacts an array under a plural token field name that isn't on the allowlist", () => {
+    expect(redact({ apiTokens: ["a", "b"] })).toEqual({ apiTokens: "[redacted]" });
+  });
+
+  it("redacts by default a token-shaped name nobody anticipated, rather than letting it survive", () => {
+    expect(redact({ webhookToken: "x", sometokenvalue: "y" })).toEqual({
+      webhookToken: "[redacted]",
+      sometokenvalue: "[redacted]",
+    });
+  });
 });

@@ -1,59 +1,42 @@
-// "token" is handled separately by isSensitiveKey below, because unlike the
-// other patterns here it has a legitimate non-secret sense (a count of
-// tokens), and a plain substring match redacts that sense too.
-const SENSITIVE_KEY = /(pass(word)?|secret|api[-_]?key|authorization|cookie|credential)/i;
+// Broad, deliberately blunt substring match -- this is the fail-closed base
+// rule (fix round 2). A round-1 attempt replaced the "token" arm with a
+// word-boundary-aware rule meant to spare count fields like `tokensIn`, but
+// that rule only recognized word boundaries at camelCase transitions, `_`,
+// or `-`. An all-lowercase concatenated key like `accesstoken` or
+// `authtoken` produces no boundary at all, so it silently slipped through
+// unredacted -- a live secret leak, worse than the over-redaction it was
+// meant to fix. Substring matching here is intentionally over-inclusive: of
+// the two failure directions, losing a token *count* from telemetry is
+// recoverable (it's just missing a number in a log line); leaking a secret
+// into a log is not.
+const SENSITIVE_KEY = /(pass(word)?|secret|token|api[-_]?key|authorization|cookie|credential)/i;
 const CONNECTION_STRING_PASSWORD = /(:\/\/[^:/@]+:)([^@]+)(@)/g;
 
-// Words that, immediately after a leading "token"/"tokens" segment, mark a
-// key as count-shaped (tokensIn, tokenCount, ...) rather than secret-shaped.
-const TOKEN_COUNT_SUFFIXES = new Set([
-  "in",
-  "out",
-  "count",
-  "used",
-  "consumed",
-  "remaining",
-  "total",
-  "limit",
-  "budget",
-  "spent",
-  "size",
-]);
+// The ONLY exemptions from SENSITIVE_KEY. Each entry here is a deliberate,
+// reviewable decision that a specific field name is known to hold a count,
+// not a credential -- never a heuristic. A key must match one of these
+// tightly anchored patterns *exactly* (start to end) to be spared; nothing
+// resembling "contains a count-shaped word" is accepted, because a loose
+// version of that idea is exactly what let secrets through in round 1.
+//
+// Anything not on this list defaults to redacted, including names nobody
+// has thought about yet (e.g. `webhookToken`, `sometokenvalue`) and plural
+// or array-shaped names that could hold real token values (e.g. `tokens`,
+// `apiTokens`, `refreshTokens`).
+//
+// Only the "token" family has a demonstrated legitimate non-secret sense in
+// this codebase today (@smos/model-gateway logs `tokensIn`/`tokensOut`).
+// None of password/secret/api-key/authorization/cookie/credential have a
+// known analogous case, so no exemptions were added for them -- widening
+// the allowlist beyond what's actually needed is how this bug reappears.
+const EXEMPT_KEY_PATTERNS: readonly RegExp[] = [/^tokens?[_]?(in|out|count|used|total)$/i];
+
+function isSensitiveKey(key: string): boolean {
+  if (EXEMPT_KEY_PATTERNS.some((pattern) => pattern.test(key))) return false;
+  return SENSITIVE_KEY.test(key);
+}
 
 export const REDACTED = "[redacted]";
-
-/** Splits a camelCase/snake_case/kebab-case key into lowercase words. */
-function keyWords(key: string): string[] {
-  return key
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .split(/[\s_-]+/)
-    .map((w) => w.toLowerCase())
-    .filter(Boolean);
-}
-
-/**
- * A key is secret-shaped if it matches one of the unconditionally sensitive
- * patterns, or if it contains "token"/"tokens" anywhere except as a leading
- * word immediately followed by exactly one recognized count suffix.
- *
- * This lets `tokensIn`, `tokensOut`, `tokenCount`, `tokensUsed` (and their
- * snake_case equivalents) through untouched, while still catching
- * `sessionToken`, `apiToken`, `accessToken`, `refreshTokens` (token/tokens
- * is not the leading word there) and a bare `tokens` field with no
- * qualifying suffix (which may genuinely hold token *values*, e.g. an
- * array of tokens) -- the default for anything ambiguous is to redact.
- */
-function isSensitiveKey(key: string): boolean {
-  if (SENSITIVE_KEY.test(key)) return true;
-
-  const words = keyWords(key);
-  const tokenIndex = words.findIndex((w) => w === "token" || w === "tokens");
-  if (tokenIndex === -1) return false;
-
-  const suffix = words[1];
-  const isCountShaped = tokenIndex === 0 && words.length === 2 && suffix !== undefined && TOKEN_COUNT_SUFFIXES.has(suffix);
-  return !isCountShaped;
-}
 
 /**
  * Remove secret-looking values before anything reaches a log sink or a
