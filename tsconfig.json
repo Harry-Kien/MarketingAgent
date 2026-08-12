@@ -4,6 +4,7 @@
     { "path": "./packages/contracts" },
     { "path": "./packages/domain" },
     { "path": "./packages/telemetry" },
+    { "path": "./packages/model-gateway" },
     { "path": "./packages/db" },
     { "path": "./packages/queue" },
     { "path": "./apps/worker" }
