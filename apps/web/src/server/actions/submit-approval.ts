@@ -5,6 +5,7 @@ import { withTenant, type TenantTx } from "@smos/db";
 import { newId, type ApprovalDecision, type ApprovalDecisionKind, type ApprovalRequest, type Id } from "@smos/domain";
 import { requireWorkspace } from "../auth.ts";
 import { getPool } from "../db.ts";
+import { isChannelConnected as checkChannelConnected } from "../channel-status.ts";
 import { performApproval, type ApprovalAuditEvent, type PerformApprovalDeps } from "./approve.ts";
 
 const VALID_DECISIONS: ReadonlySet<string> = new Set<ApprovalDecisionKind>([
@@ -87,16 +88,17 @@ async function writeAuditTx(tx: TenantTx, event: ApprovalAuditEvent): Promise<vo
  * actor from the server session, not from anything the form posted, so the
  * approvalRequestId is the only value the browser supplies here at all.
  *
- * `isChannelConnected` is a documented stub that always returns false:
- * there is no channel-integration-status table yet (out of this task's
- * scope -- adding one would be a schema change another track owns), and
- * treating "no data" as "connected" would silently defeat T17's gate. Fail
- * closed instead, exactly like `auth.ts`'s session backend fails closed by
- * always throwing until a real backend lands. This means every real
- * approve attempt in the running app refuses today with the
- * "kênh đích đang ngắt kết nối" message -- an honest reflection of the
- * fact that no channel is actually connected yet, not a fabricated
- * success.
+ * `isChannelConnected` is now wired to the real `integration` table
+ * (P4 Task 9, closing the gap this comment used to document: P3 wrote this
+ * as a stub that always returned `false` because there was no channel-
+ * integration table yet at the time -- 0028_integration.sql has since added
+ * one). `checkChannelConnected` (../channel-status.ts) reads it inside
+ * `withTenant`, scoped to this same `workspaceId`, and reports `true` only
+ * for a genuinely "connected" or sandbox-"verified" row -- never inferred
+ * from silence, never from a "not_implemented"/"disconnected" row. A
+ * workspace with no integration configured yet still refuses here, exactly
+ * as before, but now for the real, verifiable reason ("no row exists")
+ * rather than an unconditional stub.
  */
 export async function submitApproval(approvalRequestId: Id, formData: FormData): Promise<void> {
   const decisionRaw = formData.get("decision");
@@ -114,7 +116,7 @@ export async function submitApproval(approvalRequestId: Id, formData: FormData):
   await withTenant(getPool(), workspaceId, async (tx) => {
     const deps: PerformApprovalDeps = {
       loadRequest: (id) => loadApprovalRequestTx(tx, workspaceId, id),
-      isChannelConnected: async () => false,
+      isChannelConnected: (channel) => checkChannelConnected(getPool(), workspaceId, channel),
       saveDecision: (d) => saveDecisionTx(tx, d),
       writeAudit: (event) => writeAuditTx(tx, event),
     };

@@ -43,6 +43,16 @@ export const messages = {
     unauthorized: "Bạn không có quyền xem mục này", disconnected: "Kết nối đang gián đoạn",
     retry: "Thử lại",
   },
+  integrations: {
+    title: "Kết nối kênh",
+    intro: "Trạng thái phản ánh đúng bằng chứng đã kiểm chứng, không phải cấu hình.",
+    badgeNotImplemented: "Chưa triển khai",
+    badgeDisconnected: "Chưa kết nối",
+    badgeConnected: "Đã cấu hình, chưa xác minh",
+    badgeSandbox: "Sandbox (đã xác minh)",
+    connect: "Kết nối",
+    noProviders: "Chưa có kênh nào để hiển thị",
+  },
   lifecycle: {
     DRAFT: "Nháp", RESEARCHING: "Đang nghiên cứu", PLANNED: "Đã lên kế hoạch",
     IN_PROGRESS: "Đang thực hiện", INTERNAL_REVIEW: "Đang rà soát nội bộ",
