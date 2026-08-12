@@ -164,3 +164,95 @@ I did not attempt to fix this — doing so would mean either editing `packages/d
 - The `packages/db` failure above — I'm confident it's unrelated to my work but have not root-caused *why* the live DB is stale; whoever owns Task 3 (the migration writer) or the environment should confirm `npm run db:migrate` has actually applied `0026` as currently written to the shared instance.
 - Teredo (`2001::/32`) is a known, disclosed, unclosed gap in the egress guard (see table above).
 - No new npm dependency was added or needed for either task.
+
+---
+
+## Fix round 1 (independent review response)
+
+Reviewer ran 85 hostile URLs (81/81-that-should-refuse refused, zero bypasses), 14 parser-vs-`node:https` agreement checks (14/14), 8 legitimate URLs (8/8 pass), and 5 mutants (5/5 killed) against the code from the initial report. Two Important findings and a set of Minors came back. All addressed below, in `feat/p4-guards`, same worktree.
+
+### Important #1 — `assertResolvedAddressAllowed` fails open on unbracketed IPv6 and non-canonical IPv4
+
+**Failing tests written first, run, confirmed failing** (`packages/integrations/src/egress.test.ts`, new `describe("assertResolvedAddressAllowed (direct calls, not via assertEgressAllowed)")` block):
+
+```
+× throws for unbracketed ::1                    -> expected [Function] to throw an error
+× throws for unbracketed fd00:ec2::254           -> expected [Function] to throw an error
+× throws for unbracketed fe80::1                 -> expected [Function] to throw an error
+× throws for unbracketed ::ffff:127.0.0.1        -> expected [Function] to throw an error
+× throws for 2130706433                          -> expected [Function] to throw an error
+× throws for 0x7f000001                          -> expected [Function] to throw an error
+× throws for 127.1                               -> expected [Function] to throw an error
+× throws for 0177.0.0.1                          -> expected [Function] to throw an error
+× throws for 999.999.999.999 rather than returning silently -> expected [Function] to throw an error
+× throws for 300.1.2.3 rather than returning silently        -> expected [Function] to throw an error
+× throws for 1.2.3.4.5 rather than returning silently        -> expected [Function] to throw an error
+× throws for ::1::2 rather than returning silently           -> expected [Function] to throw an error
+× throws for fe80::zzzz rather than returning silently       -> expected [Function] to throw an error
+Test Files  1 failed (1)
+     Tests  13 failed | 2 passed | 56 skipped (71)
+```
+
+**Root cause:** the function required IPv6 to be bracketed and IPv4 to already be canonical dotted-decimal, silently falling through to "must be a domain name, therefore not checked" for anything else. `dns.resolve6` always returns unbracketed addresses; a raw caller can pass any encoding. The failure mode was silence, which is the wrong shape for a security boundary — the reviewer's framing is exactly right and is now the governing design rule for this function.
+
+**Fix:** rewrote the classification to mirror how a real host parser (WHATWG URL) actually decides what a string is, independent of bracket/canonical-form assumptions, and to fail closed:
+1. `localhost` / `*.localhost` (with a trailing FQDN dot stripped first) — blocked by name.
+2. Contains `:` — an IPv6 attempt, bracketed or not (a domain name or IPv4 address never contains a colon). Parsed and range-checked; throws if it doesn't parse (`assertIPv6AddressAllowed`, unchanged, now reachable without brackets).
+3. "Ends in a number" — mirrors the WHATWG URL host parser's own rule: the last `.`-separated label is decimal/octal/hex-number-shaped. If so, the *whole* host is an IPv4-parse attempt, all-or-nothing, using a from-scratch implementation of the URL spec's IPv4-number algorithm (`parseIPv4Part`, `parseIPv4Address` in `egress.ts`) — not a regex, not a reliance on `URL` canonicalization, since this function may now be called directly with raw strings. Throws if the parse fails (e.g. `999.999.999.999`'s out-of-range first octet) instead of falling through.
+4. Anything else is a plain domain name — the one intentional, still-documented pass-through.
+
+This also incidentally fixed the "IPV4_LITERAL doesn't range-check octets" Minor (`999.999.999.999` now throws on the direct path too — it was already refused via `assertEgressAllowed`'s protocol/allowlist checks, but not by the address check itself), and closed a self-found gap during the rewrite: a trailing FQDN dot (`"127.0.0.1."`) previously produced an empty last label, which `endsInANumber` read as "not IPv4-shaped" and let straight through as an unrecognised domain. Added a test and the one-line strip that closes it.
+
+**Passing after the fix:** 85/85 in `packages/integrations` (up from 71 before this fix round; +13 new tests, +1 trailing-dot test = 85, one pre-existing test was strengthened rather than counted as new — see mutation section).
+
+### Important #2 — `guardedFetch(url, allowedHosts, init?)` wrapper
+
+New file `packages/integrations/src/guarded-fetch.ts` + `guarded-fetch.test.ts`. Pins `redirect: "manual"` on every underlying `fetch` call (overriding whatever the caller's `init` said), re-runs the *full* `assertEgressAllowed` (not just the address check — the allowlist too) on the initial URL and on every resolved `Location` header before following it, and bounds the chain at `maxRedirects` (default 5, overridable via `init.maxRedirects`). `fetchImpl` is an injectable 4th parameter (defaults to global `fetch`) so tests never touch a real socket — driven entirely by a hand-rolled fake `fetch` built from the native `Response`/`Headers` globals (no new dependency).
+
+**Failing test run before `guarded-fetch.ts` existed** (whole file, module-not-found — covers all 7 cases below):
+```
+Error: Cannot find module './guarded-fetch.ts' imported from .../guarded-fetch.test.ts
+Test Files  1 failed (1)
+     Tests  no tests
+```
+
+**Passing after implementation**, 7/7:
+- refuses a 30x whose `Location` points at a forbidden (private-IP) host
+- refuses a 30x whose `Location` points at a host simply not on the allowlist
+- bounds a redirect loop instead of following it forever (proved via a real call counter, not just "eventually rejects")
+- follows a redirect chain that stays within the allowlist and returns the final response
+- still completes a legitimate, non-redirecting request against the fake (not simply refusing everything)
+- refuses the initial URL itself before ever calling `fetch`, if it fails the guard (0 fake-fetch calls made)
+- always calls the underlying fetch with `redirect: "manual"`, even if the caller's `init` said otherwise
+
+One test-quality issue found and fixed during mutation testing (see below): the first redirect test originally only asserted `.rejects.toThrow()` with no message check, so a mutant that skipped re-checking the guard on redirect hops still "passed" it — the fake fetch has no script entry for the forbidden URL either, so it throws its own unrelated `"no script entry"` error, which also satisfies a bare `.toThrow()`. Strengthened to assert the guard's own `/blocked|internal/i` wording, same as the second redirect test already did.
+
+### Mutation testing
+
+I do not have access to whatever tool the reviewer used to produce the stated baseline (35/26/3/2/1) — it isn't part of this repo's tooling (checked `scripts/`, `package.json`; no mutation-testing dependency or script exists), and no new dependency could be added to install one (e.g. Stryker) per the lockfile constraint. I built an equivalent-purpose manual mutation pass instead: 13 targeted mutations against the exact code this fix round changed (`egress.ts`'s new classification/parsing logic, `guarded-fetch.ts`), applied one at a time, full `packages/integrations` suite run against each, then reverted. These are **not the reviewer's original 35 mutants** — a different, smaller, hand-picked set aimed at the same code. Reported honestly as such rather than mapped onto their numbers.
+
+First pass (before two extra tests below were added): **12/13 killed, 1 survived.** Two of the "killed" results only held up because I stopped to check them:
+- A first automated (Node `execSync`-based) attempt reported all 15 mutations tried as "killed" including several that manual spot-checking proved were **false positives** — `execSync`'s nested shell (`cmd.exe` on Windows) behaved differently from the Bash tool's own git-bash environment, corrupting every run identically (`errors.test.ts`, which imports neither changed file, "failed" on every single mutation, which is not possible for a real per-mutation effect). Discarded entirely; redone as a plain shell script (`sed` + the same Bash tool environment used throughout this task), with a write/readback check and immediate restore after every mutation.
+- The first redirect-hop-skip mutation (see Important #2) revealed its "kill" was accidental (fake-fetch error, not guard error) — caught by manually reproducing it and reading the actual failure message rather than trusting a boolean pass/fail.
+
+Two mutations survived on the real (corrected) run and were closed with new tests:
+1. **Dropping `|| url.password !== ""` from the userinfo check** — every existing userinfo test set a non-empty *username*, so removing the password half of the check broke nothing. Verified empirically that `new URL("https://:secretpw@graph.facebook.com/")` gives `username=""`, `password="secretpw"` — a real, previously-untested code path. Added `refuses password-only userinfo (empty username) on an otherwise-legitimate host`.
+2. **Allowing `http:` alongside `https:`** — every existing `"refuses http://…"` case (the plan's own base cases) also targets a private/internal host, so the *address* check still caught them even with the protocol check disabled; the protocol check itself was never isolated. Added `refuses a plain http:// request to an otherwise-legitimate, allowlisted host` (`http://graph.facebook.com/...`, which is legitimate in every respect except scheme).
+
+Final run, 13 mutations, both fixes in place: **12 killed, 1 survived.** The one survivor — widening unique-local `fc00::/7` to `fc00::/6` — is over-broad, not under-broad (a /6 prefix matches a *superset* of what /7 matches), so it cannot create a bypass; it means no test currently pins the exact prefix length, which is a coverage-precision gap, not a security one. Left undecorated rather than adding a boundary-only test for a change that is safe in the direction it would actually go wrong.
+
+### Minors
+
+- **No port constraint** (`https://graph.facebook.com:22/` passes) — deliberately not fixing. The SSRF threat model here is about reaching *untrusted* infrastructure; once a host is confirmed on the allowlist it is trusted infrastructure by definition, and which port it listens on doesn't change that. Hardcoding `:443` would break legitimate non-default-port use (e.g. a sandboxed test server) for no corresponding security gain.
+- **`IPV4_LITERAL` didn't range-check octets** (`999.999.999.999`) — fixed as a side effect of the classification rewrite above (Important #1); the old regex-based literal check no longer exists.
+- **`fec0::/10`, `2001:db8::/32`, `100::/64`, `64:ff9b:1::/48` under-blocked** — fixed; all four added to `SIMPLE_BLOCKED_IPV6_PREFIXES` in `egress.ts`. Not currently exploitable via `assertEgressAllowed` (an IP literal never equals a domain name in `allowedHosts`, so the allowlist check already refuses them) but `assertResolvedAddressAllowed` is public and used standalone, where that backstop doesn't apply — cheap enough to close outright. `64:ff9b:1::/48` (RFC 8215 NAT64 *local-use*, distinct from the global well-known `64:ff9b::/96` already handled) is blocked as a whole range rather than having its embedded address extracted, since the embedding position within that /48 is operator-defined, not fixed by the RFC.
+
+### Branded input type — decided against
+
+Considered whether `assertResolvedAddressAllowed` should take a branded type (e.g. `ResolvedAddress`) instead of a bare `string`, to stop a caller passing an arbitrary raw string at the type level. Decided not to: a TypeScript brand only prevents *accidental* confusion for a caller who never explicitly casts; it does nothing against a caller who writes `x as ResolvedAddress` (trivial, and the exact failure mode this bug already was — passing a plain string where the function's real contract assumed more than the type expressed). The actual fix that matters for a security boundary is that the function's *runtime* behavior is fail-closed regardless of what shape of string arrives, which is what this fix round delivers. A brand adds ceremony at the one call site that matters (wrapping `dns.lookup`/`dns.resolve6` output) without closing any gap the runtime check doesn't already close, so it was left out.
+
+### Existing tests modified
+
+One: the first `guardedFetch` redirect test (`refuses a 30x whose Location points at a forbidden host`) had its assertion strengthened from a bare `.rejects.toThrow()` to `.rejects.toThrow(/blocked|internal/i)`. Justification: mutation testing showed the bare assertion could not distinguish "the guard caught it" from "the fake fetch had no script entry and threw for an unrelated reason" — both produce *a* throw. This is a strengthening of an existing assertion, not a weakening; no expected behavior changed, and the test still passes against the correct implementation.
+
+No other existing test was touched.
