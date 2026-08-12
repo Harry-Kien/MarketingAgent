@@ -42,6 +42,18 @@ describe("assertResolvedAddressAllowed (direct calls, not via assertEgressAllowe
     expect(() => assertResolvedAddressAllowed("8.8.8.8")).not.toThrow();
   });
 
+  // Fix round 2: distinct code path from "999.999.999.999" above (that one
+  // fails the "any-but-last octet > 255" check). This exercises the
+  // *last*-octet width check (`last >= maxLast`) instead. Reviewer's
+  // framing: if this check were missing, the shorthand-notation arithmetic
+  // would still produce *some* 32-bit value from "127.99999999" -- turning
+  // a malformed address into a silently-computed, possibly-public-looking
+  // one, i.e. a throw becomes an ALLOWED address. That is the worst
+  // direction a missing test can point, so it is pinned on its own.
+  it("throws on an over-large trailing octet rather than silently wrapping it into some other address", () => {
+    expect(() => assertResolvedAddressAllowed("127.99999999")).toThrow();
+  });
+
   it("blocks a loopback IPv4 written with a trailing FQDN dot, not just the bare form", () => {
     // Without stripping the trailing dot first, splitting "127.0.0.1." on
     // "." yields a final empty label, "ends in a number" sees an empty
@@ -142,6 +154,41 @@ describe("assertEgressAllowed", () => {
       ["multicast", "ff02::1"],
     ])("refuses %s ([%s])", (_label, addr) => {
       expect(() => assertEgressAllowed(`https://[${addr}]/`, ALLOW)).toThrow(/blocked|internal/i);
+    });
+  });
+
+  // Fix round 2: these four ranges were added in fix round 1 to close a
+  // review Minor, but shipped with zero tests of their own -- the exact
+  // way the original assertResolvedAddressAllowed bug arrived (a real
+  // fix, silently reopened by a later refactor because nothing pinned
+  // it). Each of these is proven, by mutation, to fail if its range is
+  // deleted -- see the "Fix round 2" section of the report for the
+  // failing-output transcript.
+  describe("IPv6 ranges added in fix round 1, now pinned individually", () => {
+    it("refuses deprecated site-local fec0::/10", () => {
+      expect(() => assertEgressAllowed("https://[fec0::1]/", ALLOW)).toThrow(/blocked|internal/i);
+    });
+
+    it("refuses the IPv6 documentation range 2001:db8::/32", () => {
+      expect(() => assertEgressAllowed("https://[2001:db8::1]/", ALLOW)).toThrow(/blocked|internal/i);
+    });
+
+    it("refuses the discard-only range 100::/64", () => {
+      expect(() => assertEgressAllowed("https://[100::1]/", ALLOW)).toThrow(/blocked|internal/i);
+    });
+
+    it("refuses the NAT64 local-use range 64:ff9b:1::/48", () => {
+      expect(() => assertEgressAllowed("https://[64:ff9b:1::1]/", ALLOW)).toThrow(/blocked|internal/i);
+    });
+
+    it("does not over-block: fbff::1 sits just below fc00::/7 and must stay allowed", () => {
+      // Pins the boundary for the fc00::/7 unique-local range. A /6
+      // mutant (fix round 1's one surviving mutation) does NOT catch
+      // this address either -- fbff's top 6 bits (111110) differ from
+      // fc00's (111111) -- so this test does not kill that specific
+      // mutant, and is not meant to. It exists to prove the range as
+      // shipped is not over-broad at this boundary, in either direction.
+      expect(() => assertEgressAllowed("https://[fbff::1]/", ["[fbff::1]"])).not.toThrow();
     });
   });
 

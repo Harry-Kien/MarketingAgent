@@ -40,6 +40,17 @@ export async function guardedFetch(
 ): Promise<Response> {
   const { maxRedirects = DEFAULT_MAX_REDIRECTS, ...requestInit } = init ?? {};
 
+  // hop >= Infinity and hop >= NaN are both always false, so an
+  // unvalidated non-finite value doesn't create an SSRF -- every hop is
+  // still guard-checked regardless -- but it does unbind the redirect
+  // loop into a hang. Reject up front, before the first fetch call,
+  // matching how @smos/model-gateway already treats invalid numeric
+  // input from a provider (Number.isFinite + refuse, never silently
+  // clamp or coerce).
+  if (!Number.isFinite(maxRedirects) || maxRedirects < 0) {
+    throw new Error(`guardedFetch: maxRedirects must be a finite, non-negative number, got ${maxRedirects}`);
+  }
+
   let currentUrl = url;
 
   for (let hop = 0; ; hop++) {
