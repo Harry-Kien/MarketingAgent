@@ -8,6 +8,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@smos/domain": "*",
     "zod": "4.4.3"
   }
 }
