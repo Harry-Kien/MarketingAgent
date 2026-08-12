@@ -10,6 +10,8 @@
   "dependencies": {
     "@smos/contracts": "*",
     "@smos/db": "*",
+    "@smos/domain": "*",
+    "@smos/integrations": "*",
     "@smos/queue": "*",
     "@smos/telemetry": "*"
   }

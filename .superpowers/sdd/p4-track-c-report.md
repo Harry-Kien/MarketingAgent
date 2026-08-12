@@ -450,3 +450,145 @@ None. Everything used (`fetch`, `Response`, `Headers`, `URL`, `DOMException`, `A
 - The plan's literal Task 4 test fixture (`allowedHosts: ["127.0.0.1"]`, implied real `node:http` server) cannot work against the guard as actually built, for reasons explained above. Whoever wrote or reviews the plan against the delivered guard should confirm this deviation (in-process fake, domain-name-shaped synthetic host, injectable `fetchImpl`) is the intended resolution, not just a implementer's workaround.
 - `createMetaAdapter`'s `fetchImpl` parameter is a new, adapter-level injection point (distinct from `guardedFetch`'s own, which it wraps). If a later task wires this adapter into `apps/worker`, the production call site should simply omit the second argument (defaults to real `fetch`) -- flagging so nobody accidentally wires the fake in outside tests.
 - The "no `id` in an otherwise-200 response" defensive branch in `publish()` is untested (see adversarial table above) -- every fake-server success path always sets `id`, so nothing in the committed suite exercises that specific line. Low risk (fails closed to `upstream_unavailable` either way) but noted for completeness.
+
+---
+
+## Task 3 -- Migration: integration, credential_reference, webhook_delivery, event, metric (E16)
+
+Files: `infra/migrations/0028_integration.sql`, test `packages/db/src/credential.test.ts`. Also required updates, in the same commit, to two shared files whose own header comments say a new workspace-owned table or composite tenant-to-tenant FK must land alongside them: `packages/db/src/cross-tenant.test.ts` (the exhaustive, catalog-driven E8/E14 backstop -- pinned `EXPECTED_TENANT_TABLES`/`EXPECTED_FK_PAIRS` lists, `buildProbeRow` cases, `fixtureIdForColumn` mappings, cleanup) and `packages/testing/src/tenant-fixtures.ts` (`TenantFixture` gained `integrationId` plus one seeded row per workspace in each of the five new tables, since the exhaustive suite requires a real fixture row per table to prove isolation against).
+
+### A partial, uncommitted draft was already on disk
+
+Per the brief, I inspected `infra/migrations/0028_integration.sql` before trusting it -- it was a full, coherent draft from an interrupted earlier attempt, not a stub. I reviewed it line by line against house style (0001, 0008, 0009, 0018+, 0022) and the four DB invariants and judged it already correct: `workspace_id` + RLS enabled/forced + USING-and-WITH-CHECK on all five tables; composite `(id, workspace_id)` FKs for `credential_reference -> integration`, `event -> publication`, `metric -> campaign` (with `publication` gaining the `UNIQUE (id, workspace_id)` it never needed before this migration, added immediately before the FK that depends on it, matching 0008's own ordering rule); `~ '\S'` (not `btrim`) on every content-bearing text column; no DELETE grant. I kept it essentially as found -- no rewrite was needed -- and moved straight to writing the failing test against it.
+
+### Exactly what `credential_reference` stores, and does not
+
+The only content-bearing column is `vault_key text NOT NULL CHECK (vault_key ~ '\S')` -- an opaque pointer such as `vault://<workspace>/<slug>` that this database never resolves. There is no `secret`, `token`, `password`, `access_token`, `api_key`, or `refresh_token` column, and `credential.test.ts` pins the exact column list and asserts none of those six names can ever appear. `lint:secrets` (pattern-based, scans all tracked text files) and `lint:migrations` (structural: workspace_id + RLS) both pass clean on the file.
+
+### TDD evidence
+
+Before the migration was applied (`git status` confirmed no table existed -- `schema_migration` topped out at `0026`, meaning even `0027`, already-committed by another track, hadn't been applied to the shared DB yet either):
+
+```
+npx vitest run packages/db/src/credential.test.ts
+ -> FAIL: relation "integration" does not exist
+    (top-level beforeAll -> seedTwoWorkspaces -> all 25 tests skipped)
+
+npx vitest run packages/db/src/cross-tenant.test.ts
+ -> FAIL: relation "integration" does not exist
+    (same cause -- cross-tenant.test.ts's own beforeAll seeds through the same fixture; 96 tests skipped)
+```
+
+Then `npm run db:migrate` applied `0027_agent_run_immutable_when_terminal.sql` (not mine -- already committed by another track, just not yet run against this shared DB) and `0028_integration.sql` cleanly. After that:
+
+```
+npx vitest run packages/db/src/credential.test.ts        -> PASS (25)
+npx vitest run packages/db/src/cross-tenant.test.ts       -> PASS (122)
+```
+
+(`cross-tenant.test.ts` needed one follow-up fix mid-flight: its exhaustive "workspace B's rows are invisible" suite requires a real fixture row per discovered table, which `tenant-fixtures.ts` didn't yet provide for the four new tables beyond `integration` -- added, then 122/122 green.)
+
+### Deletion-behaviour decision
+
+`credential_reference -> integration`: `ON DELETE CASCADE` -- a credential reference carries no audit content of its own, only a live pointer meaningless once its integration is gone. `event -> publication` and `metric -> campaign`: `ON DELETE RESTRICT` (spelled out explicitly) -- both are audit-bearing evidence of something that actually happened and must not silently vanish or be orphaned if a publication/campaign is later deleted; nothing in the schema currently grants DELETE on either parent table anyway, so this is forward-looking. `webhook_delivery` has no FK besides `workspace_id -> workspace`. None of the five tables grant `smos_app` DELETE (pinned by a new `credential.test.ts` check against `information_schema.role_table_grants`, `it.each` over all five).
+
+### Adversarial attempts and outcomes
+
+| Attempt | Outcome |
+|---|---|
+| Cross-tenant READ: workspace B selects workspace A's `credential_reference` by id, by explicit `WHERE workspace_id = A`, and via subquery | Blocked -- RLS returns 0 rows on all three forms |
+| Cross-tenant WRITE (plain RLS form): workspace B session inserts a `credential_reference` row tagged `workspace_id = A` | Blocked -- RLS `WITH CHECK` violation |
+| Cross-tenant WRITE (composite-FK-hijack form): workspace B session inserts a row correctly tagged `workspace_id = B` but with `integration_id` pointing at workspace A's integration | Blocked -- the composite FK, not RLS (RLS's `WITH CHECK` on `credential_reference` passes trivially since `workspace_id = B`; only the FK, evaluated with RLS bypassed on the *referenced* table, can catch a same-workspace-tagged-but-cross-workspace-FK row) |
+| `metric` missing `freshness_at`/`attribution_model`/`attribution_window`/`confidence` | Blocked -- NOT NULL |
+| `metric.campaign_id` pointing at another workspace's campaign | Blocked -- composite FK |
+| `event.publication_id` pointing at another workspace's publication | Blocked -- composite FK |
+| `event.publication_id = NULL` (out-of-order webhook, no matching publication yet) | Allowed, by design |
+| `webhook_delivery` with `signature_ok = false` | Stored as a real, queryable row -- not silently dropped |
+| Two `webhook_delivery` rows sharing `(workspace_id, provider, external_id)` | Blocked -- UNIQUE |
+| `integration.status` outside the four known values | Blocked -- CHECK |
+| The exhaustive `cross-tenant.test.ts` suite's own generic forms of the above (catalog-discovered, not hand-written) | All green across all five new tables, 122/122 |
+
+### Existing tests modified
+
+`packages/db/src/cross-tenant.test.ts` and `packages/testing/src/tenant-fixtures.ts` were both extended, never weakened -- every existing assertion, table, and FK pair already pinned stays exactly as before; only new tables/FKs/fixture rows were added, exactly as those files' own header comments require of any migration that adds a workspace-owned table. No assertion anywhere was loosened or deleted.
+
+### Uncertain / worth a second look
+
+- I also applied `0027_agent_run_immutable_when_terminal.sql` via `npm run db:migrate` as a side effect of catching the shared DB up to my own migration number -- it is not my file and I did not edit it, but the earlier track report (P4 T1-T2) flagged the shared DB as stale on `0026`. It is now current through `0028`.
+- Running my migration against the shared dev database changed what `cross-tenant.test.ts` discovers from the catalog. I observed (via background log tails from other worktrees, not something I ran myself) that the *other* worktrees' own un-updated copies of `cross-tenant.test.ts` (`D:\Marketing Agent`, and transitively `D:\MA-p3`'s `apps/web` server-query tests, which call `withTenant`) began failing against the now-changed shared schema. This is the same class of cross-worktree interference CARRY-FORWARD.md already documents for migration 0027 -- not something I can or should fix from this worktree, since I cannot edit other worktrees' files, but flagging it explicitly since it's a direct, observed consequence of this task.
+
+---
+
+## Task 5 -- Publish handler: the last gate before anything leaves the system
+
+Files: `apps/worker/src/handlers/publish.ts`, test `apps/worker/src/handlers/publish.test.ts`. `apps/worker/package.json` gained `@smos/domain` and `@smos/integrations` as dependencies (previously only `@smos/contracts`, `@smos/db`, `@smos/queue`, `@smos/telemetry`).
+
+### Deliberate strengthening beyond the plan's literal example, disclosed up front
+
+The plan's own example `PublishDeps`/`handlePublish` is illustrative pseudocode, not a contract I copied verbatim -- three changes, each closing a real gap the brief's adversarial mandate asks me to attack:
+
+1. **`loadApprovalDecision` returns a `LoadedApprovalDecision` enriched with `contentVersionId`** (obtained, in a real implementation, by joining `approval_decision -> approval_request -> content_version_id`, since `approval_decision` itself has no such column). `handlePublish` checks `decision.contentVersionId !== pub.contentVersionId` and refuses. Without this, the plan's literal interface (`{ id, decision }`) gives the handler no way to confirm the decision it loaded was actually about the same content -- it could only ever check "does *some* approve decision exist at this id."
+2. **A real-user-actor check independent of the database.** `decision.actorUserId` must satisfy `isId()` (the exact shape `newId()`/a real `user_account.id` produces). The database already makes an agent/system actor impossible on `approval_decision` (0007's FK to `user_account` + `actor_kind` CHECK), but `PublishDeps` is an injected interface -- a future, misimplemented loader could still hand back a decision object without a real user id, and this line is what stops the handler trusting it anyway.
+3. **`markExecuting(id): Promise<boolean>`, not `Promise<void>`.** The plan's literal signature gives the handler no way to know whether *it* won a race against a concurrent delivery of the same job. Two concurrent `handlePublish` calls for the same publication could both read `state = "prepared"` before either transitions it -- classic TOCTOU, and the plan's own test #6 ("refuses to publish twice") only checks the state *at read time*, which does not close this. A real implementation performs one atomic `UPDATE publication SET state='executing' WHERE id=$1 AND state='prepared'` and reports whether it affected a row; `handlePublish` treats `false` as "someone else already claimed this" and returns without calling the adapter.
+
+Also: `PublicationRecord.state` is `"prepared" | "executing" | "succeeded" | "failed"` (not the plan's implicit single literal) because this is the row as loaded from storage mid-lifecycle, not the domain `Publication` type from `packages/domain/src/publication.ts` (whose `state` is pinned to `"prepared"` because that type only ever describes a freshly-built publication, before `buildPublication`'s caller ever inserts it).
+
+### TDD evidence
+
+Failing run (test written first, implementation file moved aside to prove it, not merely "written after and never run against nothing"):
+
+```
+mv apps/worker/src/handlers/publish.ts apps/worker/src/handlers/publish.ts.bak
+npx vitest run apps/worker/src/handlers/publish.test.ts
+ -> FAIL: Cannot find module './publish.ts' imported from .../publish.test.ts
+    Test Files 1 failed (1) / Tests 0
+```
+
+Restored the implementation; passing run: **15/15** (`npx vitest run apps/worker/src/handlers/publish.test.ts --reporter=verbose`):
+
+```
+- publishes when the approval decision is a real, matching, approved user decision and the hash matches
+- refuses when there is no approval decision, and never calls the adapter
+- refuses when the decision was a rejection
+- refuses when the decision was 'request_changes'
+- refuses when the decision has no recorded user actor -- never trusts a flag it computed itself
+- refuses when the decision's actorUserId is not a well-formed id (e.g. an agent run id shape)
+- refuses when the approval decision belongs to a different workspace than the publication
+- refuses when the approval decision was recorded for a different content version
+- refuses when the content drifted after approval
+- does not auto-retry a permanent failure
+- wraps a non-AdapterError thrown by the adapter as upstream_unavailable, never a fake success
+- refuses to publish twice for the same publication (already succeeded), without calling the adapter
+- refuses to call the adapter when markExecuting reports it lost the race to another concurrent call
+- refuses when the publication's workspaceId does not match the job's workspaceId
+- throws when the publication does not exist
+```
+
+`npx tsc --build --verbose` (root, includes `apps/worker`): clean. `apps/worker` has no package-level `tsconfig.json` `references` array (matching every other package in this repo -- `packages/agents` imports four cross-package deps with zero package-level references either; only the root `tsconfig.json`'s reference list matters, and `apps/worker` was already in it). Since every package's own `tsconfig.json` excludes `*.test.ts` (repo-wide, pre-existing, not something I changed), I additionally ran an ad hoc `tsc --noEmit` including test files for both `apps/worker` and the touched parts of `packages/db`/`packages/testing` (temporary configs, deleted after) -- zero new errors in any file I touched; the one pre-existing unrelated warning found (`cross-tenant.test.ts` importing a `.mjs` guard module with no type declarations) predates this task's changes.
+
+### Confirmation: every outbound call goes through `guardedFetch`
+
+`apps/worker/src/handlers/publish.ts` never imports `fetch` or any network primitive -- verified by inspection (only the doc comment mentions the word `fetch`, explaining *why* it's absent from the code). The only way a byte can leave `handlePublish` is `deps.adapter.publish(...)`, an injected `ChannelAdapter`. In production that adapter is `createMetaAdapter` (Task 4, `packages/integrations/src/meta/client.ts`), which routes every call through `guardedFetch(...)` (line 74) -- confirmed by re-reading the file, not assumed from memory.
+
+### Adversarial self-review
+
+| Attempt | Outcome |
+|---|---|
+| Publish with no approval decision recorded (`loadApprovalDecision` returns `null`) | Refused, adapter never called |
+| Publish with a decision by an agent/system actor (`actorUserId` missing or not a well-formed `Id`) | Refused by `isId()` check -- independent of the DB, which already makes this row impossible to create in the first place |
+| Publish with an approval decision belonging to a different workspace | Refused -- `decision.workspaceId !== pub.workspaceId` |
+| Publish with an approval decision belonging to a different content version | Refused -- `decision.contentVersionId !== pub.contentVersionId` |
+| Publish with a `reject` or `request_changes` decision | Refused |
+| Publish with drifted content (`hashPublicationContent(pub.publicationContent) !== pub.contentHash`) | Refused |
+| Race approval-check and publish (decision recorded concurrently with the check) | Not exploitable by construction: `approval_decision` is immutable (insert-only, 0007's trigger) -- once a decision exists at check time it can never later change, and if it doesn't exist yet the handler refuses; there is no window where the check reads a decision that later gets un-recorded or altered |
+| Race publish and publish (two concurrent deliveries of the same job) | Closed by `markExecuting`'s atomic-transition contract -- the second caller receives `false` and returns without ever calling the adapter (test: "refuses to call the adapter when markExecuting reports it lost the race") |
+| Make an outbound call reach a non-allowlisted host, or follow a redirect to a blocked one | Not reachable from this file at all -- no network code exists here; delegated entirely to `guardedFetch` via the injected adapter, already adversarially tested 100/100 in `packages/integrations` (re-run clean as part of this task's final consolidated test pass) |
+| Publish twice for an already-succeeded publication | Refused via the `state === "succeeded"` fast path, adapter never called |
+
+### Boundaries intentionally left out of scope
+
+`loadPublication`/`loadApprovalDecision`/`markExecuting`/etc. are injected interfaces; no PostgreSQL-backed implementation of them was written. The File Structure Map for P4 assigns only `apps/worker/src/handlers/publish.ts` to this task -- wiring real DB-backed deps (including deriving `targetAccountId`, which has no column on `publication` and must come from the workspace's `integration`/`credential_reference` rows added in Task 3) is a later, unassigned task. This mirrors Task 4's own report, which left `ChannelAdapter` wiring into `apps/worker` explicitly for later.
+
+### Existing tests modified
+
+None. `apps/worker/src/handlers/publish.ts` and `publish.test.ts` are both new files; `apps/worker/package.json` only gained two dependency lines.
