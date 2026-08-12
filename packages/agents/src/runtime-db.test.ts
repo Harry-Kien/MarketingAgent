@@ -204,14 +204,30 @@ describe("runAgent + the real RunStore, end to end", () => {
       await client.query("begin");
       await client.query("set local role smos_app");
       await client.query("select set_config('app.workspace_id', $1, true)", [workspaceId]);
-      await expect(
-        client.query(
-          `insert into agent_run (id,workspace_id,agent_version_id,campaign_id,state,prompt_version,model_version)
-           values ($1,$2,$3,$4,'pending','p1','m1')`,
-          [newId(), workspaceId, agentVersionId, campaignId],
-        ),
-      ).rejects.toThrow(/not activated/i);
-      await client.query("rollback");
+      // Rollback lives in its own try/finally, nested inside the assertion:
+      // if the insert unexpectedly SUCCEEDS (e.g. the 0025 trigger this
+      // asserts against is dropped, exactly the mutation-testing scenario
+      // this suite is re-run under), `.rejects.toThrow()` itself throws a
+      // Vitest AssertionError -- which, without this nesting, would skip
+      // the rollback below entirely and release a connection back to the
+      // pool with an open transaction still on it (a real row inserted,
+      // uncommitted), corrupting whichever later test in this file happens
+      // to reuse that pooled connection next. Reproduced live during fix
+      // round 2's own mutation re-run: dropping 0025 made this test fail
+      // as expected, but ALSO nondeterministically failed the next test in
+      // the file ("a refused tool call is recorded...") depending on pool
+      // connection reuse -- exactly this leak.
+      try {
+        await expect(
+          client.query(
+            `insert into agent_run (id,workspace_id,agent_version_id,campaign_id,state,prompt_version,model_version)
+             values ($1,$2,$3,$4,'pending','p1','m1')`,
+            [newId(), workspaceId, agentVersionId, campaignId],
+          ),
+        ).rejects.toThrow(/not activated/i);
+      } finally {
+        await client.query("rollback").catch(() => undefined);
+      }
     } finally {
       client.release();
       await adminPool.query(`update agent_version set activated = true where id = $1`, [agentVersionId]);

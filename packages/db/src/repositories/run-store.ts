@@ -13,6 +13,66 @@ import type pg from "pg";
 import { newId, type Id } from "@smos/domain";
 import { withTenant } from "../tenant-scope.ts";
 
+// Fix round 2, MINOR: tool_name and args are attacker-influenced (a model
+// chose them) and were otherwise unbounded. Reproduced live: a tool_name
+// containing the null control character made the INSERT itself throw an
+// "invalid byte sequence for encoding UTF8" error -- PostgreSQL's text
+// type cannot store that code point at all, in any column. The tool call
+// still failed closed (T4's registry never runs the handler either way),
+// but the audit row 0024_agent_run.sql's own header says a refused call
+// must never be silently omitted was never written. Sanitised and bounded
+// the same way packages/agents/src/tools.ts already truncates a refused
+// tool name before logging it (MAX_LOGGED_TOOL_NAME_LENGTH).
+const MAX_TOOL_NAME_LENGTH = 200;
+// Generous but bounded: args is arbitrary, model-chosen JSON with no
+// schema of its own at this layer -- this exists to stop unbounded storage
+// growth, not to validate shape.
+const MAX_ARGS_JSON_LENGTH = 10_000;
+
+// The one code point PostgreSQL's text type rejects outright. Built via
+// String.fromCharCode rather than any escape sequence written directly in
+// this file's source, so there is no ambiguity about what character is
+// actually present here.
+const REJECTED_CONTROL_CHAR = String.fromCharCode(0);
+
+function sanitizeToolNameForStorage(name: string): string {
+  // Stripped rather than escaped -- an audit name has no need to preserve
+  // the exact rejected byte. `tool_call.tool_name` also carries
+  // `CHECK (tool_name ~ '\S')` (0024_agent_run.sql): if stripping leaves
+  // nothing at all (a name made only of the rejected character), fall
+  // back to a fixed placeholder rather than let the INSERT fail that CHECK
+  // instead of the encoding error it replaced.
+  const stripped = name.split(REJECTED_CONTROL_CHAR).join("");
+  const safe = /\S/u.test(stripped) ? stripped : "[empty-after-sanitization]";
+  if (safe.length <= MAX_TOOL_NAME_LENGTH) return safe;
+  return `${safe.slice(0, MAX_TOOL_NAME_LENGTH)}...[truncated, ${safe.length} chars total]`;
+}
+
+// The textual escape sequence JSON.stringify emits for the rejected
+// control character: backslash, u, 0, 0, 0, 0 -- six ordinary characters,
+// never a raw control byte. Built from character codes (92 is backslash)
+// rather than a source-code escape, for the same reason REJECTED_CONTROL_CHAR
+// is above. PostgreSQL's jsonb input function refuses this exact escape
+// sequence too ("unsupported Unicode escape sequence"), not only the raw
+// byte tool_name is vulnerable to -- discovered when the first version of
+// this fix sanitised only tool_name and args still failed the INSERT.
+const JSON_ESCAPED_REJECTED_CHAR = String.fromCharCode(92) + "u0000";
+
+function sanitizeArgsJsonForStorage(args: unknown): string {
+  const raw = JSON.stringify(args ?? {});
+  // Stripped as a literal substring of the JSON TEXT (not a byte-level
+  // operation) -- safe to do unconditionally, since this exact six-
+  // character sequence can only ever appear here as JSON.stringify's own
+  // escape output, never as meaningful application data.
+  const json = raw.split(JSON_ESCAPED_REJECTED_CHAR).join("");
+  if (json.length <= MAX_ARGS_JSON_LENGTH) return json;
+  return JSON.stringify({
+    truncated: true,
+    originalLength: json.length,
+    preview: json.slice(0, 500),
+  });
+}
+
 export interface RunStore {
   createRun(r: { workspaceId: Id; agentVersionId: Id; campaignId: Id; correlationId: Id }): Promise<Id>;
   checkpoint(runId: Id, step: string, blob: Record<string, unknown>): Promise<void>;
@@ -142,20 +202,25 @@ export function createRunStore(pool: pg.Pool, workspaceId: Id): RunStore {
       });
     },
 
+    // Fix round 2, MINOR: this repository's OWN withTenant call, separate
+    // from finishRun's/checkpoint's -- a refused tool call is recorded
+    // durably on its own, and does NOT roll back if the run it belongs to
+    // later fails for an unrelated reason. This is deliberate, not an
+    // oversight: 0024_agent_run.sql's own header says a refused call must
+    // never be silently omitted from the audit trail, and "the run that
+    // attempted it later failed" is not a reason to un-record that the
+    // attempt happened -- if anything, the refused attempt may be exactly
+    // WHY the run failed. Measured directly: a refused publish.meta call
+    // survives in tool_call even when the surrounding run ends
+    // failed_terminal (packages/agents/src/runtime-db.test.ts).
     async recordToolCall(runId, call) {
+      const safeName = sanitizeToolNameForStorage(call.name);
+      const safeArgsJson = sanitizeArgsJsonForStorage(call.args);
       await withTenant(pool, workspaceId, (tx) =>
         tx.query(
           `insert into tool_call (id,workspace_id,agent_run_id,tool_name,allowed,args,error_code)
            values ($1,$2,$3,$4,$5,$6::jsonb,$7)`,
-          [
-            newId(),
-            workspaceId,
-            runId,
-            call.name,
-            call.allowed,
-            JSON.stringify(call.args ?? {}),
-            call.errorCode ?? null,
-          ],
+          [newId(), workspaceId, runId, safeName, call.allowed, safeArgsJson, call.errorCode ?? null],
         ));
     },
   };

@@ -1,18 +1,31 @@
 // Task 7 fix round 1, IMPORTANT finding 3: "no terminal state is actually
-// terminal." Reproduced live (see task-7-report.md, Fix round 1) before this
-// file's migration (0026_agent_run_terminal_state.sql) existed:
-// `finishRun(run, {state:"succeeded", ...})` followed by
-// `finishRun(run, {state:"running", costUsd:0})` both succeeded as
-// smos_app, leaving `{state:"running", cost_usd:"0.000000"}` with the
-// `output_persisted` checkpoint (written while the run still claimed to be
-// succeeded) orphaned behind it. Nothing -- CHECK, FK, or code -- stopped a
-// run already in a terminal state from moving to any other state, terminal
-// or not.
+// terminal." Reproduced live (see task-7-report.md, Fix round 1) before
+// 0026_agent_run_terminal_state.sql existed: `finishRun(run,
+// {state:"succeeded", ...})` followed by `finishRun(run, {state:"running",
+// costUsd:0})` both succeeded as smos_app, leaving `{state:"running",
+// cost_usd:"0.000000"}` with the `output_persisted` checkpoint (written
+// while the run still claimed to be succeeded) orphaned behind it.
 //
-// Same pattern as 0019_campaign_state_transition_guard.sql /
-// 0023_campaign_state_noop_update.sql for campaign.state: a BEFORE UPDATE OF
-// state trigger, proved here with a direct SQL write as smos_app -- no
-// TypeScript-level check anywhere in this file's call path.
+// Fix round 2, IMPORTANT: 0026's trigger was `BEFORE UPDATE OF state`, so
+// an UPDATE that never names `state` in its SET clause never fires it at
+// all. Reproduced live as smos_app on a succeeded run: `update agent_run
+// set cost_usd=999, tokens_out=999, error_code='rewritten'` was ACCEPTED.
+// A terminal run is an audit record, not merely a state machine that
+// stopped moving -- 0027_agent_run_immutable_when_terminal.sql widens the
+// guard (same function name, CREATE OR REPLACE, per this repo's forward-
+// only convention -- 0026 is applied and never edited) to freeze every
+// column except `updated_at` the instant `state` is terminal, following
+// the same principle P1 used for approval_decision (0007) and publication
+// (0011) immutability.
+//
+// This file's own round-1 test, "still allows a no-op update that names
+// state but does not change it, even for a terminal run", asserted that
+// changing cost_usd on a terminal row (while leaving state unchanged)
+// SUCCEEDS -- that is now WRONG per round 2's finding (cost_usd must be
+// frozen too) and has been corrected below, not silently left in place.
+//
+// Proved with direct SQL as smos_app throughout -- no TypeScript-level
+// check anywhere in this file's call path.
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { newId } from "@smos/domain";
 import { createDbPool } from "./client.ts";
@@ -116,24 +129,61 @@ describe("agent_run terminal state is actually terminal (fix round 1, IMPORTANT)
     ).rejects.toThrow(/terminal/i);
   });
 
-  it("still allows a no-op update that names state but does not change it, even for a terminal run", async () => {
+  // CORRECTED from round 1 (see file header): a genuine no-op -- nothing
+  // but `updated_at` changing -- must still succeed on a terminal run.
+  // `succeeded -> succeeded` is exactly the coordinator's own required
+  // case.
+  it("still allows a genuine no-op update (state re-asserted to its own value, nothing else touched) on a terminal run", async () => {
     const runId = await seedRunAt("succeeded");
-    // Matches 0023_campaign_state_noop_update.sql's own reasoning: a
-    // full-row UPDATE naming every column, most unchanged, must not be
-    // mistaken for an illegal re-entry attempt.
     await withTenant(pool, workspaceId, (tx) =>
-      tx.query(`update agent_run set state='succeeded', cost_usd=1.23 where id=$1`, [runId]));
+      tx.query(`update agent_run set state='succeeded' where id=$1`, [runId]));
 
-    const row = await adminPool.query(`select state, cost_usd from agent_run where id=$1`, [runId]);
+    const row = await adminPool.query(`select state from agent_run where id=$1`, [runId]);
     expect(row.rows[0].state).toBe("succeeded");
-    expect(row.rows[0].cost_usd).toBe("1.230000");
   });
 
-  it("control: a non-terminal run can still freely change state", async () => {
+  // Fix round 2, IMPORTANT: the exact bug reproduced live -- an UPDATE that
+  // never names `state` at all must still be refused once the row is
+  // terminal, not only UPDATEs that touch `state`.
+  it("refuses rewriting audit columns (cost_usd, tokens_out, error_code) on a terminal run, even when state is never named in the SET clause", async () => {
+    const runId = await seedRunAt("succeeded");
+    await expect(
+      withTenant(pool, workspaceId, (tx) =>
+        tx.query(`update agent_run set cost_usd=999, tokens_out=999, error_code='rewritten' where id=$1`, [runId])),
+    ).rejects.toThrow(/terminal|immutable/i);
+
+    const row = await adminPool.query(`select cost_usd, tokens_out, error_code from agent_run where id=$1`, [runId]);
+    expect(row.rows[0].cost_usd).not.toBe("999.000000");
+    expect(row.rows[0].tokens_out).not.toBe(999);
+    expect(row.rows[0].error_code).not.toBe("rewritten");
+  });
+
+  it("refuses a full-row-shaped update that re-asserts the same state but also changes cost_usd, once terminal", async () => {
+    const runId = await seedRunAt("succeeded");
+    await expect(
+      withTenant(pool, workspaceId, (tx) =>
+        tx.query(`update agent_run set state='succeeded', cost_usd=1.23 where id=$1`, [runId])),
+    ).rejects.toThrow(/terminal|immutable/i);
+
+    const row = await adminPool.query(`select cost_usd from agent_run where id=$1`, [runId]);
+    expect(row.rows[0].cost_usd).not.toBe("1.230000");
+  });
+
+  it("control: running -> terminal (a genuine transition into a terminal state) still succeeds", async () => {
     const runId = await seedRunAt("running");
     await withTenant(pool, workspaceId, (tx) =>
-      tx.query(`update agent_run set state='failed_retryable' where id=$1`, [runId]));
-    const row = await adminPool.query(`select state from agent_run where id=$1`, [runId]);
+      tx.query(`update agent_run set state='succeeded', cost_usd=0.42 where id=$1`, [runId]));
+    const row = await adminPool.query(`select state, cost_usd from agent_run where id=$1`, [runId]);
+    expect(row.rows[0].state).toBe("succeeded");
+    expect(row.rows[0].cost_usd).toBe("0.420000");
+  });
+
+  it("control: a non-terminal run can still freely change state and other columns", async () => {
+    const runId = await seedRunAt("running");
+    await withTenant(pool, workspaceId, (tx) =>
+      tx.query(`update agent_run set state='failed_retryable', cost_usd=0.1 where id=$1`, [runId]));
+    const row = await adminPool.query(`select state, cost_usd from agent_run where id=$1`, [runId]);
     expect(row.rows[0].state).toBe("failed_retryable");
+    expect(row.rows[0].cost_usd).toBe("0.100000");
   });
 });

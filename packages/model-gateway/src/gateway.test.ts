@@ -28,7 +28,11 @@ describe("gateway budget", () => {
         return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 0.6, modelVersion: "m1" };
       },
     };
-    const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.05 });
+    // Fix round 2: estimatedCostUsd is now contractually the MAXIMUM this
+    // call may cost -- must be >= the real 0.6 the provider returns, or
+    // the first (successful, within-budget) call would itself be refused
+    // as a contract violation.
+    const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.6 });
     await g.generate(req, ctx);
     await expect(g.generate(req, ctx)).rejects.toThrow(/budget/i);
     expect(calls).toBe(1);
@@ -103,7 +107,7 @@ describe("gateway budget", () => {
     expect(g.spentUsd()).toBe(0);
 
     // The gateway must still work normally afterward.
-    const g2 = createGateway({ provider: costing(0.1), budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.05 });
+    const g2 = createGateway({ provider: costing(0.1), budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.1 });
     await g2.generate(req, ctx);
     expect(g2.spentUsd()).toBeCloseTo(0.1);
   });
@@ -153,7 +157,11 @@ describe("gateway budget", () => {
         return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 0.7, modelVersion: "m1" };
       },
     };
-    const g = createGateway({ provider, budgetUsd: 1.4, maxWallclockMs: 5000, estimatedCostUsd: 0.05 });
+    // estimatedCostUsd = 0.7 exactly matches the real per-call cost -- the
+    // declared maximum is honest here, so the warm-up call (which needs to
+    // actually succeed to establish maxCostSeen) is not itself refused as
+    // a contract violation.
+    const g = createGateway({ provider, budgetUsd: 1.4, maxWallclockMs: 5000, estimatedCostUsd: 0.7 });
     // Warm-up call establishes maxCostSeen = 0.7 and leaves exactly 0.7
     // remaining -- budget "fits exactly one more call at 0.7".
     await g.generate(req, ctx);
@@ -172,7 +180,7 @@ describe("gateway budget", () => {
   });
 
   it("does not strand a reservation after a successful call, so a second call that exactly fits still succeeds", async () => {
-    const g = createGateway({ provider: costing(0.7), budgetUsd: 1.4, maxWallclockMs: 5000, estimatedCostUsd: 0.05 });
+    const g = createGateway({ provider: costing(0.7), budgetUsd: 1.4, maxWallclockMs: 5000, estimatedCostUsd: 0.7 });
     await g.generate(req, ctx);
     // If the first call's reservation were never released, this call would
     // be wrongly refused even though the real remaining budget (0.7) is
@@ -191,7 +199,7 @@ describe("gateway budget", () => {
         return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 0.7, modelVersion: "m1" };
       },
     };
-    const g = createGateway({ provider, budgetUsd: 1.4, maxWallclockMs: 5000, estimatedCostUsd: 0.05 });
+    const g = createGateway({ provider, budgetUsd: 1.4, maxWallclockMs: 5000, estimatedCostUsd: 0.7 });
     await g.generate(req, ctx); // n=1: spent=0.7, maxCostSeen=0.7, remaining=0.7
     await expect(g.generate(req, ctx)).rejects.toThrow(/boom/); // n=2: throws after reserving 0.7
     // Only succeeds if the failed call's reservation was released -- real
@@ -212,7 +220,7 @@ describe("gateway budget", () => {
         return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 0.7, modelVersion: "m1" };
       },
     };
-    const g = createGateway({ provider, budgetUsd: 1.4, maxWallclockMs: 20, estimatedCostUsd: 0.05 });
+    const g = createGateway({ provider, budgetUsd: 1.4, maxWallclockMs: 20, estimatedCostUsd: 0.7 });
     await g.generate(req, ctx); // n=1: fast, spent=0.7, maxCostSeen=0.7, remaining=0.7
     await expect(g.generate(req, ctx)).rejects.toThrow(/timed out/i); // n=2: times out after reserving 0.7
     // Only succeeds if the timed-out call's reservation was released.
@@ -232,6 +240,15 @@ describe("gateway budget", () => {
   // runs a sequential warm-up call first, which is precisely what makes
   // maxCostSeen non-zero before the race starts. These two tests fire
   // straight into a gateway that has NEVER made a call.
+  // Fix round 2 update: the cold-start GATE (see gateway.ts's header,
+  // defence 2) now bounds a truly cold burst to exactly ONE call reaching
+  // the provider, regardless of budget/estimate arithmetic -- tighter than
+  // round 1's "however many fit the estimate" bound. Assertions below were
+  // "calls * 0.15 <= budget" in round 1; now exact, since the gate makes
+  // the outcome deterministic (verified: JS evaluates each synchronous
+  // `generate()` call-prefix, including acquiring the gate, to completion
+  // before the next one in the array begins -- there is no interleaving
+  // before the first `await`).
   it("cold gateway, N=50 concurrent: provider invocation count never exceeds what the budget can pay for (round 1 CRITICAL)", async () => {
     let calls = 0;
     const provider: ModelProvider = {
@@ -242,15 +259,11 @@ describe("gateway budget", () => {
         return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 0.15, modelVersion: "m1" };
       },
     };
-    // estimatedCostUsd matches the real per-call cost (0.15) -- this is the
-    // caller's conservative pre-knowledge of what this provider tends to
-    // cost, exactly the value the CRITICAL fix requires a caller to supply.
+    // estimatedCostUsd matches the real per-call cost (0.15) -- an honest
+    // declared maximum, so no contract violation fires either.
     const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.15 });
     await Promise.allSettled(Array.from({ length: 50 }, () => g.generate(req, ctx)));
-    // At $0.15/call and a $1 budget, at most 6 calls can ever be afforded
-    // (6 * 0.15 = 0.9; a 7th would need 1.05). This is the property that
-    // matters -- real vendor spend -- not "did exactly one run survive".
-    expect(calls * 0.15).toBeLessThanOrEqual(1 + 1e-9);
+    expect(calls).toBe(1);
   });
 
   it("cold gateway, N=10 concurrent: same property at smaller N", async () => {
@@ -265,8 +278,7 @@ describe("gateway budget", () => {
     };
     const g = createGateway({ provider, budgetUsd: 0.5, maxWallclockMs: 5000, estimatedCostUsd: 0.15 });
     await Promise.allSettled(Array.from({ length: 10 }, () => g.generate(req, ctx)));
-    // At $0.15/call and a $0.5 budget, at most 3 calls can ever be afforded.
-    expect(calls * 0.15).toBeLessThanOrEqual(0.5 + 1e-9);
+    expect(calls).toBe(1);
   });
 
   it("a hostile negative-cost result cannot be used to fund a later over-budget call", async () => {
@@ -279,10 +291,160 @@ describe("gateway budget", () => {
         return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 0.5, modelVersion: "m1" };
       },
     };
-    const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.05 });
+    const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.5 });
     await expect(g.generate(req, ctx)).rejects.toThrow(/cost/i);
     expect(g.spentUsd()).toBe(0);
     await g.generate(req, ctx);
     expect(g.spentUsd()).toBeCloseTo(0.5);
+  });
+});
+
+// Fix round 2, CRITICAL. Round 1's estimatedCostUsd closed the $0-reservation
+// leak but was never validated -- every bad value except +Infinity failed
+// OPEN. Measured against the pre-fix code (see task-7-report.md, "Fix round
+// 2"): estimate 0 / negative / NaN / omitted all let a full N=50 cold burst
+// through ($35 of real spend against a $1 budget at $0.70/call); NaN was
+// PERMANENT (200/200 sequential calls still got through, because
+// `NaN > remaining` is always false); an honest-looking low estimate (0.01
+// vs a real 0.70) also let all 50 through, since every concurrent call in
+// the burst reserves the same too-low number before any of them can prove
+// it wrong.
+describe("gateway budget: estimatedCostUsd validation and contract (fix round 2, CRITICAL)", () => {
+  it.each([
+    ["zero", 0],
+    ["negative", -5],
+    ["NaN", Number.NaN],
+    ["+Infinity", Number.POSITIVE_INFINITY],
+    ["-Infinity", Number.NEGATIVE_INFINITY],
+    ["missing (undefined)", undefined],
+  ])("constructing a gateway with estimatedCostUsd = %s throws immediately", (_label, badValue) => {
+    expect(() =>
+      createGateway({
+        provider: costing(0.1),
+        budgetUsd: 1,
+        maxWallclockMs: 5000,
+        // Cast away the type to reproduce the reviewer's exact attack: an
+        // un-typechecked JS caller, not merely a TypeScript compile error.
+        estimatedCostUsd: badValue as never,
+      }),
+    ).toThrow(/estimatedCostUsd/i);
+  });
+
+  it.each([
+    ["zero", 0],
+    ["negative", -5],
+    ["NaN", Number.NaN],
+    ["+Infinity", Number.POSITIVE_INFINITY],
+  ])(
+    "cold gateway, N=50, hostile estimate %s: construction itself refuses, so the provider is invoked zero times",
+    (_label, badValue) => {
+      let calls = 0;
+      const provider: ModelProvider = {
+        name: "hostile-estimate",
+        generate: async () => {
+          calls++;
+          return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 0.7, modelVersion: "m1" };
+        },
+      };
+      expect(() =>
+        createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: badValue as never }),
+      ).toThrow();
+      // Never even reached the point of firing 50 calls -- construction
+      // failed first, so there is no gateway instance to call generate() on.
+      expect(calls).toBe(0);
+    },
+  );
+
+  it("cold gateway, N=50, an honest-looking but WRONG low estimate (0.01 declared vs 0.70 real): the cold-start gate caps exposure to exactly one call, not fifty", async () => {
+    let calls = 0;
+    const provider: ModelProvider = {
+      name: "underestimated",
+      generate: async () => {
+        calls++;
+        await new Promise((r) => setTimeout(r, 5));
+        return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 0.7, modelVersion: "m1" };
+      },
+    };
+    const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.01 });
+    const settled = await Promise.allSettled(Array.from({ length: 50 }, () => g.generate(req, ctx)));
+    // Round 1 alone measured 50/50 here. The cold-start gate closes the
+    // rest: only the ONE call that acquires the gate can ever reach the
+    // provider while the gateway is cold, regardless of how wrong the
+    // declared estimate turns out to be.
+    expect(calls).toBe(1);
+    // That one call still surfaces the contract violation loudly rather
+    // than silently succeeding (see the dedicated test below) -- so it is
+    // among the 50 rejections, not the sole fulfillment.
+    expect(settled.filter((r) => r.status === "fulfilled")).toHaveLength(0);
+  });
+
+  it("after a bad-ESTIMATE gateway fails to even construct, a correctly-constructed gateway is completely unaffected (no shared, corruptible module state)", () => {
+    expect(() => createGateway({ provider: costing(0.1), budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: Number.NaN })).toThrow();
+    // A fresh, validly-constructed gateway works normally -- construction
+    // validation is per-instance, not a poisoned global.
+    const g = createGateway({ provider: costing(0.1), budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.1 });
+    expect(g.spentUsd()).toBe(0);
+  });
+
+  // The permanence case: reproduced live pre-fix as 200/200 sequential calls
+  // still reaching the provider after ONE NaN-flavoured attempt, because
+  // `NaN > remaining` can never become true. A NaN *estimate* can no longer
+  // exist (construction throws), so this proves the remaining, still-live
+  // route to a bad number: a NaN/negative *actual* cost from the provider
+  // itself. The invalid-cost check must not corrupt maxCostSeen, and the
+  // very next call must still be judged correctly.
+  it("after a provider returns an invalid (NaN) actual cost, the budget check still works correctly for the next 10 sequential calls", async () => {
+    let call = 0;
+    const provider: ModelProvider = {
+      name: "nan-then-honest",
+      generate: async () => {
+        call++;
+        if (call === 1) return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: Number.NaN, modelVersion: "m1" };
+        return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 0.1, modelVersion: "m1" };
+      },
+    };
+    const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.1 });
+    await expect(g.generate(req, ctx)).rejects.toThrow(/cost/i); // call 1: NaN, refused
+    expect(g.spentUsd()).toBe(0);
+
+    // 10 more real, honest calls at $0.10 each -- budget check must still
+    // correctly track spend and correctly refuse once exhausted, proving
+    // the NaN attempt left no permanent damage (round 1's bug: this stayed
+    // broken forever after a single NaN-flavoured value).
+    for (let i = 0; i < 10; i++) {
+      await g.generate(req, ctx);
+    }
+    expect(g.spentUsd()).toBeCloseTo(1.0);
+    await expect(g.generate(req, ctx)).rejects.toThrow(/budget/i);
+  });
+
+  it("an actual cost exceeding the declared estimatedCostUsd is surfaced as a thrown contract violation, not silently absorbed", async () => {
+    const g = createGateway({ provider: costing(0.7), budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.01 });
+    await expect(g.generate(req, ctx)).rejects.toThrow(/contract violation|exceeding/i);
+    // The real spend is still recorded -- surfacing the violation is not
+    // the same as pretending the money was never spent.
+    expect(g.spentUsd()).toBeCloseTo(0.7);
+  });
+
+  it("subsequent reservations self-correct after a contract violation: a second call no longer under-reserves", async () => {
+    let call = 0;
+    const provider: ModelProvider = {
+      name: "escalating",
+      generate: async () => {
+        call++;
+        // Both calls cost 0.7 -- the SECOND call proves maxCostSeen was
+        // corrected by the first, even though the first call itself threw.
+        return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 0.7, modelVersion: "m1" };
+      },
+    };
+    const g = createGateway({ provider, budgetUsd: 0.75, maxWallclockMs: 5000, estimatedCostUsd: 0.01 });
+    await expect(g.generate(req, ctx)).rejects.toThrow(/contract violation|exceeding/i); // call 1: violates estimate, but spends 0.7
+    expect(g.spentUsd()).toBeCloseTo(0.7);
+    // Only 0.05 remains. If the second call's reservation still used the
+    // stale 0.01 estimate, it would wrongly proceed and try to spend past
+    // the budget; maxCostSeen (now 0.7) correctly refuses it pre-call
+    // instead.
+    await expect(g.generate(req, ctx)).rejects.toThrow(/budget/i);
+    expect(call).toBe(1); // the second call never reached the provider at all
   });
 });

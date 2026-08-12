@@ -251,4 +251,47 @@ describe("createRunStore: persists a run, its checkpoints and its terminal state
       tx.query("select id from agent_run where id=$1", [runId]));
     expect(seenFromB.rowCount).toBe(0);
   });
+
+  // Fix round 2, MINOR: tool_name and args are attacker-influenced (a
+  // model chose them) and otherwise unbounded. Reproduced live: a NUL byte
+  // in the name made the INSERT itself throw an "invalid byte sequence for
+  // encoding UTF8" error -- PostgreSQL's text type cannot store U+0000 at
+  // all. The call still fails closed (T4's registry never runs the handler
+  // either way), but the audit row T6's own header says a refused call
+  // must never be silently omitted was never written. Sanitised the same
+  // way tools.ts already truncates a refused tool name before logging it
+  // (MAX_LOGGED_TOOL_NAME_LENGTH).
+  it("a tool name containing a NUL byte still produces an audit row instead of throwing", async () => {
+    const store = createRunStore(pool, workspaceId);
+    const runId = await store.createRun({ workspaceId, agentVersionId, campaignId, correlationId: newId() });
+    createdRunIds.push(runId);
+
+    // Built via String.fromCharCode, never a literal escape sequence in
+    // source, so the real U+0000 code point is unambiguous here.
+    const nul = String.fromCharCode(0);
+    const hostileName = ["publish", "meta"].join(nul);
+    const hostileArgs = { note: ["hi", "there"].join(nul) };
+
+    // Must not throw -- this is the reproduced bug.
+    await store.recordToolCall(runId, { name: hostileName, allowed: false, args: hostileArgs });
+
+    const row = await withTenant(pool, workspaceId, (tx) =>
+      tx.query("select tool_name, args from tool_call where agent_run_id=$1", [runId]));
+    expect(row.rows).toHaveLength(1);
+    expect((row.rows[0].tool_name as string).includes(nul)).toBe(false);
+    expect(JSON.stringify(row.rows[0].args).includes(nul)).toBe(false);
+  });
+
+  it("an oversized tool name is bounded rather than stored in full", async () => {
+    const store = createRunStore(pool, workspaceId);
+    const runId = await store.createRun({ workspaceId, agentVersionId, campaignId, correlationId: newId() });
+    createdRunIds.push(runId);
+
+    const hugeName = "a".repeat(5000);
+    await store.recordToolCall(runId, { name: hugeName, allowed: false, args: {} });
+
+    const row = await withTenant(pool, workspaceId, (tx) =>
+      tx.query("select tool_name from tool_call where agent_run_id=$1", [runId]));
+    expect((row.rows[0].tool_name as string).length).toBeLessThan(5000);
+  });
 });
