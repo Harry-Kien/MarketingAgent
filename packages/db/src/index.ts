@@ -1,4 +1,14 @@
 export { createDb, createDbPool, type Db } from "./client.ts";
+// Repositories and other infrastructure code (P3's apps/web/src/server/
+// queries.ts, packages/db's own repositories/) keep using the full
+// TenantTx via withTenant, per tool-tx.ts's own header -- only agent tool
+// bodies get the narrower, SQL-free ToolTx below. Not exporting this
+// earlier was scope, not a security boundary against non-tool callers:
+// packages/agents/src/runtime-db.test.ts documents the one place this stays
+// deliberately withheld (the agent *runtime*, which hosts tool bodies and
+// sits on the same side of the boundary tool-tx.ts draws), not application
+// code that reads data on a user's behalf.
+export { withTenant, type TenantTx } from "./tenant-scope.ts";
 // drainOutbox must run against a pool connected as smos_worker
 // (DATABASE_WORKER_URL), never smos_app -- see outbox.ts's own header for
 // why. Exported here (final whole-branch review, FINDING 7) so

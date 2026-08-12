@@ -1,5 +1,9 @@
 export const messages = {
   nav: { today: "Sổ điều hành", campaigns: "Chiến dịch", content: "Nội dung", approvals: "Phê duyệt", analytics: "Kết quả" },
+  shell: {
+    commandBarOpen: "Mở thanh lệnh (⌘K)",
+    landmark: "Điều hướng chính",
+  },
   home: { title: "Sổ điều hành", briefTitle: "Tóm tắt hôm nay", needsYou: "Cần bạn xử lý", atRisk: "Chiến dịch có rủi ro" },
   approval: {
     pendingTitle: "Đang chờ bạn phê duyệt",
@@ -8,10 +12,31 @@ export const messages = {
     evidence: "Bằng chứng và nguồn", targetChannel: "Kênh đích", estimatedImpact: "Tác động ước tính",
     missingEvidence: "Thiếu bằng chứng nên chưa thể phê duyệt",
     disconnected: "Kênh đích đang ngắt kết nối nên chưa thể phê duyệt",
+    estimatedImpactLabel: "ước lượng",
+    reasonLabel: "Lý do quyết định",
+    reasonRequired: "Cần nhập lý do trước khi gửi quyết định",
+    citationUrl: "Đường dẫn nguồn",
+    citationAccessedAt: "Truy cập lúc",
+    policyFlags: "Cảnh báo chính sách",
+    noPending: "Không có mục nào đang chờ duyệt",
+    alreadyDecided: "Yêu cầu này đã được quyết định",
+    decidedAt: "Quyết định lúc",
   },
-  campaign: { title: "Chiến dịch", lifecycle: "Vòng đời", budget: "Ngân sách", conversion: "Chuyển đổi" },
-  content: { title: "Nội dung", version: "Phiên bản", publicationContent: "Nội dung sẽ đăng", citations: "Nguồn trích dẫn" },
-  analytics: { title: "Kết quả", freshness: "Cập nhật lúc", attributionModel: "Mô hình quy thuộc", confidence: "Độ tin cậy", missingData: "Thiếu dữ liệu" },
+  campaign: {
+    title: "Chiến dịch", lifecycle: "Vòng đời", budget: "Ngân sách", conversion: "Chuyển đổi",
+    name: "Tên chiến dịch", updatedAt: "Cập nhật lúc", notFound: "Không tìm thấy chiến dịch này",
+  },
+  content: {
+    title: "Nội dung", version: "Phiên bản", publicationContent: "Nội dung sẽ đăng", citations: "Nguồn trích dẫn",
+    notFound: "Không tìm thấy nội dung này", body: "Nội dung", diffBefore: "Trước", diffAfter: "Sau",
+  },
+  analytics: {
+    title: "Kết quả", freshness: "Cập nhật lúc", attributionModel: "Mô hình quy thuộc", confidence: "Độ tin cậy", missingData: "Thiếu dữ liệu",
+    window: "Khung quy thuộc",
+    confidenceHigh: "Cao", confidenceMedium: "Trung bình", confidenceLow: "Thấp",
+    freshnessUnknown: "Không rõ thời điểm cập nhật nên chưa thể hiển thị số liệu",
+    noDataSource: "Chưa có nguồn dữ liệu phân tích nào được kết nối",
+  },
   state: {
     loading: "Đang tải", empty: "Chưa có dữ liệu", error: "Không tải được dữ liệu",
     partial: "Dữ liệu chưa đầy đủ", stale: "Dữ liệu đã cũ",
