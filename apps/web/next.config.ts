@@ -15,7 +15,7 @@ const config: NextConfig = {
   reactStrictMode: true,
   // Workspace packages ship TypeScript source rather than build output, so
   // Next has to compile them itself.
-  transpilePackages: ["@smos/contracts", "@smos/db", "@smos/telemetry"],
+  transpilePackages: ["@smos/contracts", "@smos/db", "@smos/domain", "@smos/telemetry", "@smos/worker"],
 };
 
 export default config;

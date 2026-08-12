@@ -20,3 +20,13 @@ export {
 // The Postgres-backed RunStore T7's runtime.ts consumes -- see task-7-report.md
 // requirement 1 for why this (task 10's file) was pulled forward into T7.
 export { createRunStore, type RunStore } from "./repositories/run-store.ts";
+// P4 Task 7/8: the first tasks in this track to wire real Postgres-backed
+// reads/writes into apps/web and apps/worker directly (every prior task --
+// see p4-track-c-report.md, Task 5 -- deliberately left DB-backed
+// implementations as injected interfaces). `withTenant`/`TenantTx` were
+// already the documented public interface per STANDING-CONTEXT.md #4 but
+// had never actually been re-exported here because nothing outside this
+// package needed them yet. `traceToGoal` is E12's audit-chain walk, needed
+// by Task 8's Golden Sequence proof.
+export { withTenant, type TenantTx } from "./tenant-scope.ts";
+export { traceToGoal, type TraceChain, type AuditTraceEvent } from "./audit-trace.ts";
