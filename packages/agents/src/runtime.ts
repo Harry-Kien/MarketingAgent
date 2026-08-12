@@ -46,7 +46,7 @@
 import { assertActivated, type AgentRegistryEntry, type AgentRole, type Id } from "@smos/domain";
 import type { Gateway } from "@smos/model-gateway";
 import type { RunStore } from "@smos/db";
-import { logger } from "@smos/telemetry";
+import { logger, withSpan } from "@smos/telemetry";
 import { wrapUntrusted } from "./untrusted.ts";
 import type { ToolRegistry } from "./tools.ts";
 
@@ -94,7 +94,26 @@ export interface RunAgentResult {
   costUsd: number;
 }
 
+// Task 6: the whole run -- activation gate through terminal state, success
+// or failure -- lives inside one "agent.run" span. Attributes are plain
+// strings (role/workspace/campaign/correlation ids), so `withSpan`'s own
+// redaction pass is a no-op here in practice; it stays wired anyway because
+// this function's inputs are caller-controlled and nothing here promises
+// they can never contain a secret-shaped field name in the future.
 export async function runAgent(input: RunAgentInput): Promise<RunAgentResult> {
+  return withSpan(
+    "agent.run",
+    {
+      "agent.role": input.role,
+      "workspace.id": input.workspaceId,
+      "campaign.id": input.campaignId,
+      "correlation.id": input.correlationId,
+    },
+    () => runAgentSpan(input),
+  );
+}
+
+async function runAgentSpan(input: RunAgentInput): Promise<RunAgentResult> {
   // The activation gate runs before anything is recorded or spent, so a
   // non-activated agent costs nothing and leaves no AgentRun (invariant 5).
   assertActivated(input.role, input.registry);

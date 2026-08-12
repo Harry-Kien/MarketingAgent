@@ -3,6 +3,10 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "scripts": {
     "build": "tsc --build",
     "start": "node dist/main.js"
@@ -10,6 +14,8 @@
   "dependencies": {
     "@smos/contracts": "*",
     "@smos/db": "*",
+    "@smos/domain": "*",
+    "@smos/integrations": "*",
     "@smos/queue": "*",
     "@smos/telemetry": "*"
   }

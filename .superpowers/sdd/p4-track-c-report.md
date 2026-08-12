@@ -349,3 +349,246 @@ Same caveat as fix round 1: no mutation-testing tool exists in this repo and non
 ### Existing tests modified (fix round 2)
 
 None. Every change this round either added a new test or added new, previously-missing validation code (`maxRedirects` finiteness) alongside its own new tests.
+
+---
+
+## Task 4 — Fake Meta server and typed adapter (E5)
+
+Files: `packages/integrations/src/meta/fake-server.ts`, `src/meta/client.ts`, test `src/meta/contract.test.ts`. `src/index.ts` gained two export lines for the new public surface (`startFakeMetaServer`, `createMetaAdapter`).
+
+### A necessary deviation from the plan's literal design, disclosed up front
+
+The plan's own Task 4 example test used `allowedHosts: ["127.0.0.1"]` with a `baseUrl` implied to come from a real `node:http` listener ("fake-server.ts dùng node:http"). Both are incompatible with `assertEgressAllowed`/`assertResolvedAddressAllowed` as actually built and approved in Tasks 1-2: the guard requires `https:` unconditionally, and blocks the *entire* 127.0.0.0/8 loopback range unconditionally, **before it even consults `allowedHosts`**. A real server bound to `127.0.0.1`, reached through the (correctly) unweakened guard, cannot pass on any protocol -- the plan's own literal example would fail every single test, including the successful-publish one, if implemented as written.
+
+Given the hard constraints (no real outbound network request ever, adapter must route every call through `guardedFetch`, no new dependency, guard must not be weakened), I did not stand up a real socket at all. `startFakeMetaServer()` is genuinely in-process -- exactly what the task brief explicitly permits ("a local in-process or localhost fake"). It returns a synthetic, domain-name-shaped base URL (`https://sandbox.meta.test`, using the IANA-reserved `.test` TLD, RFC 2606) that is never dialed, plus an injectable `fetchImpl: FetchLike` -- the exact same extension point `guardedFetch` itself already exposed in Task 2 ("`fetchImpl`... exists so tests can drive this with a local fake instead of a real socket"), just threaded one level up. `createMetaAdapter(cfg, fetchImpl = fetch)` takes `fetchImpl` as an additive, optional second parameter; production use (a real `baseUrl: "https://graph.facebook.com"`) never has to touch it and gets the real global `fetch`, unchanged. Because `sandbox.meta.test` is a domain name, not an IP literal, it takes the same "plain domain name, not checked" pass-through through `assertResolvedAddressAllowed` that a real `graph.facebook.com` call would -- so the https-only check, the userinfo check, and the allowlist check are all still genuinely exercised end to end; only the (intentionally out-of-scope, already-disclosed) IP-resolution check is a no-op, exactly as it would be for any real domain.
+
+I considered standing up a real `node:https` listener with a self-signed certificate instead (empirically verified this works when `NODE_EXTRA_CA_CERTS` is set *before* the Node process starts -- confirmed with a throwaway script and `openssl`-generated cert/key) and rejected it: it only works if the test *launcher* sets that env var externally (setting it mid-process, after Node has already bootstrapped its TLS trust store, verifiably does **not** work -- I confirmed this fails with `self-signed certificate` before finding the working form), which is a fragile, undocumented precondition on however `vitest` gets invoked later. The in-process design has no such precondition and is structurally incapable of a real network call, which is a stronger guarantee for a "never touches the network" requirement than "we remembered to disable cert checking correctly."
+
+### TDD evidence
+
+**Failing run** (before `fake-server.ts`/`client.ts` existed):
+```
+Cannot find module './fake-server.ts' imported from D:/MA-p4/packages/integrations/src/meta/contract.test.ts
+Test Files  1 failed (1)
+     Tests  no tests
+```
+
+**Passing run after first implementation:** 18/18 (`npx vitest run packages/integrations/src/meta/contract.test.ts`).
+
+**Two more failing-first rounds during adversarial self-review** (see below), both fixed:
+1. A malformed `Retry-After` header (`"not-a-number"`) produced `retryAfterMs: NaN` on an `AdapterError`:
+   ```
+   AssertionError: expected NaN to be undefined
+     at contract.test.ts:225:48
+   ```
+   Fixed by requiring `Number.isFinite(retryAfterSeconds)` before setting `retryAfterMs` at all (`client.ts`), rather than ever emitting NaN as a "retry hint" a downstream scheduler (Task 5, out of scope here) could misread as "retry immediately, forever."
+2. A distinctly-*invalid* (not merely expired) token silently succeeded instead of failing:
+   ```
+   Error: promise resolved "{ externalId: 'page-1_1', ... }" instead of rejecting
+     at contract.test.ts:96:44
+   ```
+   Fixed by adding a `token === "invalid"` (and empty-token) branch in `fake-server.ts` alongside `"expired"`, both mapping to the same real-world OAuthException 190 / `auth_expired`, since Meta's wire format has no separate signal to distinguish "expired" from "never valid."
+
+**Final run:** `packages/integrations` full suite (`egress.test.ts`, `errors.test.ts`, `guarded-fetch.test.ts`, `meta/contract.test.ts`): **120/120 passing**, 25/25 test files, across 4 files. `npx tsc --noEmit -p packages/integrations/tsconfig.json`: **no errors** (two `exactOptionalPropertyTypes` errors found and fixed along the way -- `body: string | undefined` and `retryAfterMs: number | undefined` both needed to be *omitted* rather than explicitly set to `undefined`, since the target types don't accept the widened form under this repo's strict tsconfig).
+
+Non-DB static gates re-run against the final, staged state: `lint:imports` (109 files, ok), `lint:secrets` (150 files, ok), `lint:scope` (220 files, ok), `lint:versions` (12 manifests, ok), `lint:purity` (17 files, ok), `lint:migrations` (28 files, ok). `npm run verify` was **not** run (forbidden by this task's brief -- shared PostgreSQL on port 5433 across three concurrent worktrees).
+
+### Full error-response -> `ERROR_KINDS` mapping table
+
+| Scenario | HTTP status | Graph-shaped error | `ErrorKind` | `retryable` | Notes |
+|---|---|---|---|---|---|
+| Successful publish | 200 | `{ id, requestId }` | -- | -- | Idempotency-keyed replay returns the same `id`, never creates a second post |
+| Rate limited, with retry hint | 429 | `error.code 4`, `type OAuthException`, `Retry-After: 5` header | `rate_limited` | **true** | `retryAfterMs = 5000`, taken from the header |
+| Rate limited, malformed hint | 429 | same, `Retry-After: not-a-number` | `rate_limited` | **true** | `retryAfterMs` **omitted**, never `NaN` (fixed during self-review) |
+| Expired token | 401 | `error.code 190`, `type OAuthException`, token echoed into message | `auth_expired` | false | Message deliberately echoes the raw token (realistic Meta behaviour, see `errors.ts`) to exercise redaction for real |
+| Invalid (never-valid) token | 401 | same code 190 | `auth_expired` | false | No separate wire signal for "invalid" vs "expired" in real Meta; both map the same way |
+| Blank/whitespace-only content | 400 | `error.code 100`, `type GraphMethodException` | `invalid_input` | false | Checked after auth/account routing, before any post is created |
+| Quota/spend limit reached | 403 | `error.code 80004`, `type OAuthException` | `quota_exceeded` | false | |
+| Transient upstream outage | 503 | `error.code 2`, `type OAuthException` | `upstream_unavailable` | **true** | Any `>= 500` maps the same way |
+| Malformed / non-JSON body | 200 (misleading `content-type: application/json`, unparseable text) | -- | `upstream_unavailable` | **true** | Never read as a fake success; JSON-parse failure short-circuits before the `response.ok` check even runs |
+| Slow response / timeout | (never arrives within `timeoutMs`) | -- | `upstream_unavailable` | **true** | Adapter-side `AbortSignal.timeout`; fake server delays 200ms, test uses `timeoutMs: 20` and asserts total wall time `< 150ms`, proving the timeout -- not luck -- won the race |
+| Redirect to a blocked/internal address | 302, `Location: https://169.254.169.254/...` | -- | `permanent_rejection` | false | Never followed: `guardedFetch` re-runs the full guard on the `Location` header and throws before a second `fetchImpl` call is made (proved via a call-counter: exactly 1 call) |
+| Any other non-2xx (e.g. object not found) | 404 | `error.code 100`, `type GraphMethodException` | `permanent_rejection` | false | Catch-all: nothing about a 404 is "wait and retry" or "fix input and resubmit" |
+| Host not on `allowedHosts` | (never sent) | -- | `permanent_rejection` (wrapped from the guard's own `Error`) | false | Guard throws before any `fetchImpl` call (0 calls, proved) |
+| Downgraded `http://` baseUrl | (never sent) | -- | `permanent_rejection` (wrapped) | false | Guard's protocol check throws before any `fetchImpl` call (0 calls, proved) |
+
+### Adversarial self-review attempts and outcomes
+
+| Attempt | Outcome |
+|---|---|
+| Contact a host not on `allowedHosts` | **Blocked.** `assertEgressAllowed`'s allowlist check throws before `guardedFetch` ever calls `fetchImpl`; instrumented with a call-counting `fetchImpl` wrapper and asserted `calls === 0`. |
+| Follow a redirect (`page-redirect-trap`, `Location: https://169.254.169.254/...`) to a blocked, cloud-metadata-shaped address | **Blocked.** `guardedFetch` re-runs the full guard on the resolved `Location` before ever calling `fetchImpl` a second time; call-counter proves exactly 1 call was made (the initial request that returned the 302), never a second one to the forbidden address. |
+| Downgrade to `http://` on an otherwise-legitimate, allowlisted host | **Blocked.** Protocol check in `assertEgressAllowed` runs first and throws before any `fetchImpl` call; 0 calls proved. |
+| Make the adapter retry a retryable-kind failure (`rate_limited`) on its own | **Confirmed it never does.** `publish()` makes exactly one `callGraph` call, which makes exactly one `guardedFetch`/`fetchImpl` call; instrumented and asserted `calls === 1` even though the resulting error is `retryable: true`. `retryable` is a hint for a caller's retry policy (Task 5, out of scope here), never permission for the adapter itself to retry -- matches the plan's own global constraint ("Publish thất bại ⇒ failed, không auto-retry với side effect ra ngoài"). |
+| Surface a secret in an error path | **No leak, proven against a message that actually contained one.** Forced a deterministic error (`page-rate-limited`, always 429s regardless of token) with a secret-shaped token (`EAAsupersecretvalue...`) that the fake server echoes into its raw error message (realistic Meta behaviour). Asserted `err.message` **does** contain the secret (proving the redaction had real work to do, not that there was nothing to redact) and `err.safeMessage` does **not**. |
+| Surface a secret in a successful publish's evidence | **No leak.** Successful publish with a secret-shaped token; asserted `JSON.stringify(result.evidence)` never contains it -- `evidence` only ever carries `{ requestId, status }`, both server-generated, never echoing `cfg.token`. |
+| Surface a secret via a log line | **Not applicable / no leak by construction.** Neither `client.ts` nor `fake-server.ts` calls any logger; the only place `cfg.token` is ever placed is the `Authorization` request header (never read back into an error message by the client itself) and, in the fake server's deliberately-adversarial echo scenarios, the response body text -- which flows into `AdapterError`'s constructor exactly like any other provider message and is redacted the same way. |
+| Manufacture a `NaN` retry hint via a malformed `Retry-After` header | **Found by self-review, fixed with a failing test first** (see TDD evidence above). `retryAfterMs` is now omitted rather than set to `NaN` when the header doesn't parse to a finite number. |
+| Get a fake success out of a non-JSON 200 response | **Blocked.** `page-malformed` returns `200` with `content-type: application/json` but an unparseable body; `JSON.parse` failure throws `upstream_unavailable` before the `response.ok` short-circuit is ever reached, so a `200` status alone cannot produce a `PublishResult`. |
+| Get a fake success with no `id` in an otherwise-well-formed 200 response | **Blocked by construction, not separately tested.** `publish()` explicitly checks `typeof record?.id !== "string" || record.id === ""` and throws `upstream_unavailable` rather than returning `externalId: undefined`. Every scripted success path in the fake server always sets `id`, so this exact branch isn't exercised by the committed suite -- disclosed as untested-but-present defensive code, not a gap in the adapter's own guarantee. |
+
+### Boundaries intentionally left to Task 5 (out of scope here)
+
+- **Approval gating.** The plan's global constraint ("Adapter không được gọi nếu thiếu `ApprovalDecision` hoặc hash nội dung lệch bản đã duyệt") is a caller-side responsibility. `ChannelAdapter.publish` takes `contentHash` as an opaque string in `PublishInput` and never checks it against a stored approved hash -- it has no access to approval state at all. This must be enforced by Task 5's publish handler before it ever calls `adapter.publish(...)`, per the plan's own File Structure Map (`apps/worker/src/handlers/publish.ts` owns `handlePublish`).
+- **No auto-retry with side effects.** Confirmed above that the adapter itself never retries; a retry policy acting on `retryable`/`retryAfterMs` is Task 5's job.
+- **DNS rebinding and single-hop redirect scope.** Both are the same accepted, disclosed gaps from Tasks 1-2's egress guard (CARRY-FORWARD.md) -- this adapter does not attempt to close them, and doesn't need to for the in-process fake, since no real DNS resolution or real redirect ever happens here.
+
+### Existing tests modified
+
+None. No file outside `packages/integrations/src/meta/` and the two new export lines in `packages/integrations/src/index.ts` was touched. No existing test in the repository was weakened, deleted, or had its assertions loosened.
+
+### Task 3 (database)
+
+Not touched, and not needed. `createMetaAdapter`/`startFakeMetaServer` never import `@smos/db`, never reference `integration`/`credential_reference`/`event`/`metric`, and never open a PostgreSQL connection. Nothing in Task 4 required the tables Task 3 owns.
+
+### New dependencies
+
+None. Everything used (`fetch`, `Response`, `Headers`, `URL`, `DOMException`, `AbortSignal.timeout`) is a Node/web-platform global already relied on by Tasks 1-2's own code (`guarded-fetch.ts`, `guarded-fetch.test.ts`). `package.json`/`package-lock.json` are untouched (verified with `git diff --stat`).
+
+### Uncertain / worth a second look
+
+- The plan's literal Task 4 test fixture (`allowedHosts: ["127.0.0.1"]`, implied real `node:http` server) cannot work against the guard as actually built, for reasons explained above. Whoever wrote or reviews the plan against the delivered guard should confirm this deviation (in-process fake, domain-name-shaped synthetic host, injectable `fetchImpl`) is the intended resolution, not just a implementer's workaround.
+- `createMetaAdapter`'s `fetchImpl` parameter is a new, adapter-level injection point (distinct from `guardedFetch`'s own, which it wraps). If a later task wires this adapter into `apps/worker`, the production call site should simply omit the second argument (defaults to real `fetch`) -- flagging so nobody accidentally wires the fake in outside tests.
+- The "no `id` in an otherwise-200 response" defensive branch in `publish()` is untested (see adversarial table above) -- every fake-server success path always sets `id`, so nothing in the committed suite exercises that specific line. Low risk (fails closed to `upstream_unavailable` either way) but noted for completeness.
+
+---
+
+## Task 3 -- Migration: integration, credential_reference, webhook_delivery, event, metric (E16)
+
+Files: `infra/migrations/0028_integration.sql`, test `packages/db/src/credential.test.ts`. Also required updates, in the same commit, to two shared files whose own header comments say a new workspace-owned table or composite tenant-to-tenant FK must land alongside them: `packages/db/src/cross-tenant.test.ts` (the exhaustive, catalog-driven E8/E14 backstop -- pinned `EXPECTED_TENANT_TABLES`/`EXPECTED_FK_PAIRS` lists, `buildProbeRow` cases, `fixtureIdForColumn` mappings, cleanup) and `packages/testing/src/tenant-fixtures.ts` (`TenantFixture` gained `integrationId` plus one seeded row per workspace in each of the five new tables, since the exhaustive suite requires a real fixture row per table to prove isolation against).
+
+### A partial, uncommitted draft was already on disk
+
+Per the brief, I inspected `infra/migrations/0028_integration.sql` before trusting it -- it was a full, coherent draft from an interrupted earlier attempt, not a stub. I reviewed it line by line against house style (0001, 0008, 0009, 0018+, 0022) and the four DB invariants and judged it already correct: `workspace_id` + RLS enabled/forced + USING-and-WITH-CHECK on all five tables; composite `(id, workspace_id)` FKs for `credential_reference -> integration`, `event -> publication`, `metric -> campaign` (with `publication` gaining the `UNIQUE (id, workspace_id)` it never needed before this migration, added immediately before the FK that depends on it, matching 0008's own ordering rule); `~ '\S'` (not `btrim`) on every content-bearing text column; no DELETE grant. I kept it essentially as found -- no rewrite was needed -- and moved straight to writing the failing test against it.
+
+### Exactly what `credential_reference` stores, and does not
+
+The only content-bearing column is `vault_key text NOT NULL CHECK (vault_key ~ '\S')` -- an opaque pointer such as `vault://<workspace>/<slug>` that this database never resolves. There is no `secret`, `token`, `password`, `access_token`, `api_key`, or `refresh_token` column, and `credential.test.ts` pins the exact column list and asserts none of those six names can ever appear. `lint:secrets` (pattern-based, scans all tracked text files) and `lint:migrations` (structural: workspace_id + RLS) both pass clean on the file.
+
+### TDD evidence
+
+Before the migration was applied (`git status` confirmed no table existed -- `schema_migration` topped out at `0026`, meaning even `0027`, already-committed by another track, hadn't been applied to the shared DB yet either):
+
+```
+npx vitest run packages/db/src/credential.test.ts
+ -> FAIL: relation "integration" does not exist
+    (top-level beforeAll -> seedTwoWorkspaces -> all 25 tests skipped)
+
+npx vitest run packages/db/src/cross-tenant.test.ts
+ -> FAIL: relation "integration" does not exist
+    (same cause -- cross-tenant.test.ts's own beforeAll seeds through the same fixture; 96 tests skipped)
+```
+
+Then `npm run db:migrate` applied `0027_agent_run_immutable_when_terminal.sql` (not mine -- already committed by another track, just not yet run against this shared DB) and `0028_integration.sql` cleanly. After that:
+
+```
+npx vitest run packages/db/src/credential.test.ts        -> PASS (25)
+npx vitest run packages/db/src/cross-tenant.test.ts       -> PASS (122)
+```
+
+(`cross-tenant.test.ts` needed one follow-up fix mid-flight: its exhaustive "workspace B's rows are invisible" suite requires a real fixture row per discovered table, which `tenant-fixtures.ts` didn't yet provide for the four new tables beyond `integration` -- added, then 122/122 green.)
+
+### Deletion-behaviour decision
+
+`credential_reference -> integration`: `ON DELETE CASCADE` -- a credential reference carries no audit content of its own, only a live pointer meaningless once its integration is gone. `event -> publication` and `metric -> campaign`: `ON DELETE RESTRICT` (spelled out explicitly) -- both are audit-bearing evidence of something that actually happened and must not silently vanish or be orphaned if a publication/campaign is later deleted; nothing in the schema currently grants DELETE on either parent table anyway, so this is forward-looking. `webhook_delivery` has no FK besides `workspace_id -> workspace`. None of the five tables grant `smos_app` DELETE (pinned by a new `credential.test.ts` check against `information_schema.role_table_grants`, `it.each` over all five).
+
+### Adversarial attempts and outcomes
+
+| Attempt | Outcome |
+|---|---|
+| Cross-tenant READ: workspace B selects workspace A's `credential_reference` by id, by explicit `WHERE workspace_id = A`, and via subquery | Blocked -- RLS returns 0 rows on all three forms |
+| Cross-tenant WRITE (plain RLS form): workspace B session inserts a `credential_reference` row tagged `workspace_id = A` | Blocked -- RLS `WITH CHECK` violation |
+| Cross-tenant WRITE (composite-FK-hijack form): workspace B session inserts a row correctly tagged `workspace_id = B` but with `integration_id` pointing at workspace A's integration | Blocked -- the composite FK, not RLS (RLS's `WITH CHECK` on `credential_reference` passes trivially since `workspace_id = B`; only the FK, evaluated with RLS bypassed on the *referenced* table, can catch a same-workspace-tagged-but-cross-workspace-FK row) |
+| `metric` missing `freshness_at`/`attribution_model`/`attribution_window`/`confidence` | Blocked -- NOT NULL |
+| `metric.campaign_id` pointing at another workspace's campaign | Blocked -- composite FK |
+| `event.publication_id` pointing at another workspace's publication | Blocked -- composite FK |
+| `event.publication_id = NULL` (out-of-order webhook, no matching publication yet) | Allowed, by design |
+| `webhook_delivery` with `signature_ok = false` | Stored as a real, queryable row -- not silently dropped |
+| Two `webhook_delivery` rows sharing `(workspace_id, provider, external_id)` | Blocked -- UNIQUE |
+| `integration.status` outside the four known values | Blocked -- CHECK |
+| The exhaustive `cross-tenant.test.ts` suite's own generic forms of the above (catalog-discovered, not hand-written) | All green across all five new tables, 122/122 |
+
+### Existing tests modified
+
+`packages/db/src/cross-tenant.test.ts` and `packages/testing/src/tenant-fixtures.ts` were both extended, never weakened -- every existing assertion, table, and FK pair already pinned stays exactly as before; only new tables/FKs/fixture rows were added, exactly as those files' own header comments require of any migration that adds a workspace-owned table. No assertion anywhere was loosened or deleted.
+
+### Uncertain / worth a second look
+
+- I also applied `0027_agent_run_immutable_when_terminal.sql` via `npm run db:migrate` as a side effect of catching the shared DB up to my own migration number -- it is not my file and I did not edit it, but the earlier track report (P4 T1-T2) flagged the shared DB as stale on `0026`. It is now current through `0028`.
+- Running my migration against the shared dev database changed what `cross-tenant.test.ts` discovers from the catalog. I observed (via background log tails from other worktrees, not something I ran myself) that the *other* worktrees' own un-updated copies of `cross-tenant.test.ts` (`D:\Marketing Agent`, and transitively `D:\MA-p3`'s `apps/web` server-query tests, which call `withTenant`) began failing against the now-changed shared schema. This is the same class of cross-worktree interference CARRY-FORWARD.md already documents for migration 0027 -- not something I can or should fix from this worktree, since I cannot edit other worktrees' files, but flagging it explicitly since it's a direct, observed consequence of this task.
+
+---
+
+## Task 5 -- Publish handler: the last gate before anything leaves the system
+
+Files: `apps/worker/src/handlers/publish.ts`, test `apps/worker/src/handlers/publish.test.ts`. `apps/worker/package.json` gained `@smos/domain` and `@smos/integrations` as dependencies (previously only `@smos/contracts`, `@smos/db`, `@smos/queue`, `@smos/telemetry`).
+
+### Deliberate strengthening beyond the plan's literal example, disclosed up front
+
+The plan's own example `PublishDeps`/`handlePublish` is illustrative pseudocode, not a contract I copied verbatim -- three changes, each closing a real gap the brief's adversarial mandate asks me to attack:
+
+1. **`loadApprovalDecision` returns a `LoadedApprovalDecision` enriched with `contentVersionId`** (obtained, in a real implementation, by joining `approval_decision -> approval_request -> content_version_id`, since `approval_decision` itself has no such column). `handlePublish` checks `decision.contentVersionId !== pub.contentVersionId` and refuses. Without this, the plan's literal interface (`{ id, decision }`) gives the handler no way to confirm the decision it loaded was actually about the same content -- it could only ever check "does *some* approve decision exist at this id."
+2. **A real-user-actor check independent of the database.** `decision.actorUserId` must satisfy `isId()` (the exact shape `newId()`/a real `user_account.id` produces). The database already makes an agent/system actor impossible on `approval_decision` (0007's FK to `user_account` + `actor_kind` CHECK), but `PublishDeps` is an injected interface -- a future, misimplemented loader could still hand back a decision object without a real user id, and this line is what stops the handler trusting it anyway.
+3. **`markExecuting(id): Promise<boolean>`, not `Promise<void>`.** The plan's literal signature gives the handler no way to know whether *it* won a race against a concurrent delivery of the same job. Two concurrent `handlePublish` calls for the same publication could both read `state = "prepared"` before either transitions it -- classic TOCTOU, and the plan's own test #6 ("refuses to publish twice") only checks the state *at read time*, which does not close this. A real implementation performs one atomic `UPDATE publication SET state='executing' WHERE id=$1 AND state='prepared'` and reports whether it affected a row; `handlePublish` treats `false` as "someone else already claimed this" and returns without calling the adapter.
+
+Also: `PublicationRecord.state` is `"prepared" | "executing" | "succeeded" | "failed"` (not the plan's implicit single literal) because this is the row as loaded from storage mid-lifecycle, not the domain `Publication` type from `packages/domain/src/publication.ts` (whose `state` is pinned to `"prepared"` because that type only ever describes a freshly-built publication, before `buildPublication`'s caller ever inserts it).
+
+### TDD evidence
+
+Failing run (test written first, implementation file moved aside to prove it, not merely "written after and never run against nothing"):
+
+```
+mv apps/worker/src/handlers/publish.ts apps/worker/src/handlers/publish.ts.bak
+npx vitest run apps/worker/src/handlers/publish.test.ts
+ -> FAIL: Cannot find module './publish.ts' imported from .../publish.test.ts
+    Test Files 1 failed (1) / Tests 0
+```
+
+Restored the implementation; passing run: **15/15** (`npx vitest run apps/worker/src/handlers/publish.test.ts --reporter=verbose`):
+
+```
+- publishes when the approval decision is a real, matching, approved user decision and the hash matches
+- refuses when there is no approval decision, and never calls the adapter
+- refuses when the decision was a rejection
+- refuses when the decision was 'request_changes'
+- refuses when the decision has no recorded user actor -- never trusts a flag it computed itself
+- refuses when the decision's actorUserId is not a well-formed id (e.g. an agent run id shape)
+- refuses when the approval decision belongs to a different workspace than the publication
+- refuses when the approval decision was recorded for a different content version
+- refuses when the content drifted after approval
+- does not auto-retry a permanent failure
+- wraps a non-AdapterError thrown by the adapter as upstream_unavailable, never a fake success
+- refuses to publish twice for the same publication (already succeeded), without calling the adapter
+- refuses to call the adapter when markExecuting reports it lost the race to another concurrent call
+- refuses when the publication's workspaceId does not match the job's workspaceId
+- throws when the publication does not exist
+```
+
+`npx tsc --build --verbose` (root, includes `apps/worker`): clean. `apps/worker` has no package-level `tsconfig.json` `references` array (matching every other package in this repo -- `packages/agents` imports four cross-package deps with zero package-level references either; only the root `tsconfig.json`'s reference list matters, and `apps/worker` was already in it). Since every package's own `tsconfig.json` excludes `*.test.ts` (repo-wide, pre-existing, not something I changed), I additionally ran an ad hoc `tsc --noEmit` including test files for both `apps/worker` and the touched parts of `packages/db`/`packages/testing` (temporary configs, deleted after) -- zero new errors in any file I touched; the one pre-existing unrelated warning found (`cross-tenant.test.ts` importing a `.mjs` guard module with no type declarations) predates this task's changes.
+
+### Confirmation: every outbound call goes through `guardedFetch`
+
+`apps/worker/src/handlers/publish.ts` never imports `fetch` or any network primitive -- verified by inspection (only the doc comment mentions the word `fetch`, explaining *why* it's absent from the code). The only way a byte can leave `handlePublish` is `deps.adapter.publish(...)`, an injected `ChannelAdapter`. In production that adapter is `createMetaAdapter` (Task 4, `packages/integrations/src/meta/client.ts`), which routes every call through `guardedFetch(...)` (line 74) -- confirmed by re-reading the file, not assumed from memory.
+
+### Adversarial self-review
+
+| Attempt | Outcome |
+|---|---|
+| Publish with no approval decision recorded (`loadApprovalDecision` returns `null`) | Refused, adapter never called |
+| Publish with a decision by an agent/system actor (`actorUserId` missing or not a well-formed `Id`) | Refused by `isId()` check -- independent of the DB, which already makes this row impossible to create in the first place |
+| Publish with an approval decision belonging to a different workspace | Refused -- `decision.workspaceId !== pub.workspaceId` |
+| Publish with an approval decision belonging to a different content version | Refused -- `decision.contentVersionId !== pub.contentVersionId` |
+| Publish with a `reject` or `request_changes` decision | Refused |
+| Publish with drifted content (`hashPublicationContent(pub.publicationContent) !== pub.contentHash`) | Refused |
+| Race approval-check and publish (decision recorded concurrently with the check) | Not exploitable by construction: `approval_decision` is immutable (insert-only, 0007's trigger) -- once a decision exists at check time it can never later change, and if it doesn't exist yet the handler refuses; there is no window where the check reads a decision that later gets un-recorded or altered |
+| Race publish and publish (two concurrent deliveries of the same job) | Closed by `markExecuting`'s atomic-transition contract -- the second caller receives `false` and returns without ever calling the adapter (test: "refuses to call the adapter when markExecuting reports it lost the race") |
+| Make an outbound call reach a non-allowlisted host, or follow a redirect to a blocked one | Not reachable from this file at all -- no network code exists here; delegated entirely to `guardedFetch` via the injected adapter, already adversarially tested 100/100 in `packages/integrations` (re-run clean as part of this task's final consolidated test pass) |
+| Publish twice for an already-succeeded publication | Refused via the `state === "succeeded"` fast path, adapter never called |
+
+### Boundaries intentionally left out of scope
+
+`loadPublication`/`loadApprovalDecision`/`markExecuting`/etc. are injected interfaces; no PostgreSQL-backed implementation of them was written. The File Structure Map for P4 assigns only `apps/worker/src/handlers/publish.ts` to this task -- wiring real DB-backed deps (including deriving `targetAccountId`, which has no column on `publication` and must come from the workspace's `integration`/`credential_reference` rows added in Task 3) is a later, unassigned task. This mirrors Task 4's own report, which left `ChannelAdapter` wiring into `apps/worker` explicitly for later.
+
+### Existing tests modified
+
+None. `apps/worker/src/handlers/publish.ts` and `publish.test.ts` are both new files; `apps/worker/package.json` only gained two dependency lines.

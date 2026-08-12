@@ -158,10 +158,15 @@ const FK_PAIRS = await discoverTenantToTenantFks(TENANT_TABLES);
 // P2 task 6 adds agent_run, tool_call, run_checkpoint -- updated in the same
 // commit as infra/migrations/0024_agent_run.sql per this list's own rule
 // above.
+// P4 task 3 (infra/migrations/0028_integration.sql) adds integration,
+// credential_reference, webhook_delivery, event, metric -- all five
+// workspace-owned, per this list's own rule, updated in the same commit as
+// the migration that adds them.
 const EXPECTED_TENANT_TABLES = [
   "agent_definition", "agent_run", "agent_version", "approval_decision", "approval_request",
-  "audit_log", "campaign", "content_item", "content_version", "goal",
-  "outbox", "publication", "run_checkpoint", "source_citation", "tool_call",
+  "audit_log", "campaign", "content_item", "content_version", "credential_reference",
+  "event", "goal", "integration", "metric", "outbox",
+  "publication", "run_checkpoint", "source_citation", "tool_call", "webhook_delivery",
 ].toSorted();
 
 const EXPECTED_FK_PAIRS = [
@@ -174,6 +179,9 @@ const EXPECTED_FK_PAIRS = [
   "campaign->goal",
   "content_item->campaign",
   "content_version->content_item",
+  "credential_reference->integration",
+  "event->publication",
+  "metric->campaign",
   "publication->approval_decision",
   "publication->campaign",
   "publication->content_version",
@@ -216,6 +224,15 @@ afterAll(async () => {
     await adminPool.query("delete from agent_version where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
     await adminPool.query("delete from agent_definition where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
     await adminPool.query("delete from outbox where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
+    // P4 task 3: none of these five are referenced by anything else seeded
+    // above (credential_reference -> integration cascades on delete), so
+    // order among them doesn't matter, only that they come before the
+    // integration delete below.
+    await adminPool.query("delete from credential_reference where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
+    await adminPool.query("delete from event where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
+    await adminPool.query("delete from metric where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
+    await adminPool.query("delete from webhook_delivery where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
+    await adminPool.query("delete from integration where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
   }
   await pool.end();
   await adminPool.end();
@@ -353,6 +370,44 @@ function buildProbeRow(table: string, ws: TenantFixture, id: string): { columns:
         columns: ["id", "workspace_id", "agent_run_id", "step_name"],
         cells: [{ value: id }, { value: ws.workspaceId }, { value: ws.agentRunId }, { value: `e12-probe-step-${id}` }],
       };
+    // P4 task 3 (infra/migrations/0028_integration.sql):
+    case "integration":
+      return {
+        columns: ["id", "workspace_id", "provider", "status"],
+        cells: [{ value: id }, { value: ws.workspaceId }, { value: `e12-probe-provider-${id}` }, { value: "connected" }],
+      };
+    case "credential_reference":
+      return {
+        columns: ["id", "workspace_id", "integration_id", "vault_key"],
+        cells: [{ value: id }, { value: ws.workspaceId }, { value: ws.integrationId }, { value: `vault://e12-probe/${id}` }],
+      };
+    case "webhook_delivery":
+      return {
+        columns: ["id", "workspace_id", "provider", "external_id", "signature_ok", "payload"],
+        cells: [
+          { value: id }, { value: ws.workspaceId }, { value: "meta" },
+          { value: `e12-probe-ext-${id}` }, { value: true }, { value: "{}", sql: (p) => `${p}::jsonb` },
+        ],
+      };
+    case "event":
+      return {
+        columns: ["id", "workspace_id", "publication_id", "event_type", "occurred_at"],
+        cells: [
+          { value: id }, { value: ws.workspaceId }, { value: ws.publicationId },
+          { value: "e12.probe.event" }, { value: new Date() },
+        ],
+      };
+    case "metric":
+      return {
+        columns: [
+          "id", "workspace_id", "campaign_id", "name", "value",
+          "freshness_at", "attribution_model", "attribution_window", "confidence",
+        ],
+        cells: [
+          { value: id }, { value: ws.workspaceId }, { value: ws.campaignId }, { value: "e12_probe_metric" }, { value: 1 },
+          { value: new Date() }, { value: "last_touch" }, { value: "7d" }, { value: "low" },
+        ],
+      };
     default:
       // Fails loudly rather than silently skipping: a table discovered from
       // the catalog with no probe-row builder here would otherwise pass this
@@ -385,6 +440,9 @@ function fixtureIdForColumn(ws: TenantFixture, column: string): string {
     agent_definition_id: "agentDefinitionId",
     agent_version_id: "agentVersionId",
     agent_run_id: "agentRunId",
+    // P4 task 3 (infra/migrations/0028_integration.sql):
+    integration_id: "integrationId",
+    publication_id: "publicationId",
   };
   const key = map[column];
   if (!key) {

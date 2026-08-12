@@ -30,6 +30,12 @@ export interface TenantFixture {
   agentRunId: Id;
   toolCallId: Id;
   runCheckpointId: Id;
+  // P4 task 3: one connected integration row per workspace, so
+  // credential_reference's composite FK (integration_id, workspace_id) has a
+  // same-workspace parent to point at, and so cross-tenant.test.ts's
+  // exhaustive probe can hijack it across workspaces the same way it does
+  // every other composite tenant-to-tenant FK.
+  integrationId: Id;
 }
 
 async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixture> {
@@ -50,6 +56,7 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
   const agentRunId = newId();
   const toolCallId = newId();
   const runCheckpointId = newId();
+  const integrationId = newId();
 
   // Seeded directly as the connecting (superuser) role, which always bypasses
   // RLS -- these rows exist to be *subjects* of the isolation proof, not to
@@ -148,6 +155,36 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
     `insert into run_checkpoint (id, workspace_id, agent_run_id, step_name) values ($1, $2, $3, 'e12_seed_step')`,
     [runCheckpointId, workspaceId, agentRunId],
   );
+  // P4 task 3: one connected integration row so credential_reference's
+  // composite FK (integration_id, workspace_id) has a same-workspace parent.
+  await client.query(
+    `insert into integration (id, workspace_id, provider, status) values ($1, $2, 'meta', 'connected')`,
+    [integrationId, workspaceId],
+  );
+  // cross-tenant.test.ts's exhaustive "workspace B's rows are invisible from
+  // workspace A's scope" suite (E8/E14) runs over EVERY discovered
+  // workspace-owned table and requires a real fixture row for workspace B to
+  // exist already -- so every new table from 0028_integration.sql needs one
+  // row here too, not just the ones another table's composite FK points at.
+  await client.query(
+    `insert into credential_reference (id, workspace_id, integration_id, vault_key) values (gen_random_uuid(), $1, $2, $3)`,
+    [workspaceId, integrationId, `vault://e12-${label}/${integrationId}`],
+  );
+  await client.query(
+    `insert into webhook_delivery (id, workspace_id, provider, external_id, signature_ok, payload)
+     values (gen_random_uuid(), $1, 'meta', $2, true, '{}'::jsonb)`,
+    [workspaceId, `e12-${label}-webhook-${workspaceId}`],
+  );
+  await client.query(
+    `insert into event (id, workspace_id, publication_id, event_type, occurred_at)
+     values (gen_random_uuid(), $1, $2, 'e12.seed.event', now())`,
+    [workspaceId, publicationId],
+  );
+  await client.query(
+    `insert into metric (id, workspace_id, campaign_id, name, value, freshness_at, attribution_model, attribution_window, confidence)
+     values (gen_random_uuid(), $1, $2, 'e12_seed_metric', 1, now(), 'last_touch', '7d', 'low')`,
+    [workspaceId, campaignId],
+  );
 
   return {
     workspaceId,
@@ -167,6 +204,7 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
     agentRunId,
     toolCallId,
     runCheckpointId,
+    integrationId,
   };
 }
 
