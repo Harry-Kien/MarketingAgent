@@ -156,3 +156,50 @@ describe("findHardcodedVietnamese -- TSX generic component tags are not truncate
     expect(findHardcodedVietnamese(src).length).toBeGreaterThan(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Fix round 4: ATTR_STRING only matched double-quoted attribute values.
+// Single-quoted JSX attributes -- `placeholder='...'` -- are plain, ordinary,
+// valid JSX (half the ways a developer writes an attribute, not a trick),
+// and evaded the guard entirely: not found at all, so isUserVisibleAttr
+// never even got a chance to apply. Every attribute, visible or not, was
+// affected, since the bug is in the value-extraction pattern itself, not
+// the visibility logic layered on top of it.
+// ---------------------------------------------------------------------------
+
+describe("findHardcodedVietnamese -- single-quoted attributes are not invisible (fix round 4)", () => {
+  it("flags a single-quoted placeholder", () => {
+    const src = `<input placeholder='Nhập tên chiến dịch' />`;
+    expect(findHardcodedVietnamese(src).length).toBeGreaterThan(0);
+  });
+  it("flags a single-quoted aria-label", () => {
+    expect(findHardcodedVietnamese(`<button aria-label='Huỷ' />`).length).toBeGreaterThan(0);
+  });
+  it("flags a single-quoted alt", () => {
+    expect(findHardcodedVietnamese(`<img alt='Ảnh chiến dịch' />`).length).toBeGreaterThan(0);
+  });
+  it("flags a single-quoted title", () => {
+    expect(findHardcodedVietnamese(`<span title='Chiến dịch' />`).length).toBeGreaterThan(0);
+  });
+  it("still does not flag a single-quoted data-testid (the denylist still applies with single quotes)", () => {
+    expect(findHardcodedVietnamese(`<div data-testid='đã-đăng-card' />`)).toEqual([]);
+  });
+  it("flags both a single-quoted placeholder containing // and a single-quoted aria-label on the same tag", () => {
+    const src = `<input placeholder='Giá // 100' aria-label='Huỷ' />`;
+    const hits = findHardcodedVietnamese(src);
+    expect(hits).toContain("Giá // 100");
+    expect(hits).toContain("Huỷ");
+  });
+  it("does not break the scan on an escaped apostrophe inside a single-quoted value, and still finds both attributes", () => {
+    const src = `<input placeholder='Đừng quên \\'lưu\\' nhé' aria-label="Huỷ" />`;
+    const hits = findHardcodedVietnamese(src);
+    expect(hits.some((h) => h.includes("Đừng quên"))).toBe(true);
+    expect(hits).toContain("Huỷ");
+  });
+  it("flags both attributes when quote styles are mixed on one tag", () => {
+    const src = `<input placeholder='Nhập tên' aria-label="Huỷ" />`;
+    const hits = findHardcodedVietnamese(src);
+    expect(hits).toContain("Nhập tên");
+    expect(hits).toContain("Huỷ");
+  });
+});

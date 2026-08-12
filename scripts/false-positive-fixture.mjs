@@ -7,7 +7,9 @@
 // which used to blank the rest of its line) and a TSX generic component
 // instantiation (`<Select<string> ...>`, which used to truncate the tag
 // scan) -- both ordinary code, both previously reachable false-negative
-// vectors, now permanently exercised here.
+// vectors, now permanently exercised here. Fix round 4 added single-quoted
+// attributes (`type='button'`, `data-testid='...'`) -- previously invisible
+// to the i18n guard's attribute matcher entirely, regardless of visibility.
 export const FALSE_POSITIVE_FIXTURE = `
 import { t } from "../i18n/index.ts";
 
@@ -61,6 +63,9 @@ export function CampaignCard({ score, threshold, name }: Props) {
         {t("nav.campaigns")}
       </a>
       <Select<string> options={statusOptions} placeholder={t("campaign.title")} />
+      <button type='button' className='btn' data-testid='huỷ-button' aria-label={t("approval.reject")}>
+        {t("approval.reject")}
+      </button>
     </div>
   );
 }

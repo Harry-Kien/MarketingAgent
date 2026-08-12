@@ -39,7 +39,18 @@ const TEMPLATE_EXPR = /\{\s*`([^`]*)`\s*\}/g;
 // a `>` inside a conditional/generic attribute expression -- e.g.
 // `<Badge variant={score > threshold ? "a" : "b"} placeholder="...">` --
 // does not truncate the scan the way the round-1 `<[^>]*>` regex did.
-const ATTR_STRING = /\b([a-zA-Z][\w-]*)\s*=\s*"([^"{}]*)"/g;
+//
+// Fix round 4: this only matched double-quoted values (`attr="..."`) --
+// `attr='...'` is plain, ordinary, valid JSX (half the ways a developer
+// writes an attribute, not an edge case) and was invisible to the guard
+// entirely, for EVERY attribute, visible or not, since the bug is in value
+// extraction itself, before isUserVisibleAttr ever runs. Two alternatives
+// (double-quoted / single-quoted) via named groups, each escape-aware
+// (`(?:[^"\\]|\\.)*` / `(?:[^'\\]|\\.)*`) so a `\'` inside a single-quoted
+// value, or a `\"` inside a double-quoted one, doesn't end the match early
+// and corrupt the rest of the scan.
+const ATTR_STRING =
+  /\b(?<dname>[a-zA-Z][\w-]*)\s*=\s*"(?<dval>(?:[^"\\]|\\.)*)"|\b(?<sname>[a-zA-Z][\w-]*)\s*=\s*'(?<sval>(?:[^'\\]|\\.)*)'/g;
 const ATTR_TEMPLATE = /\b([a-zA-Z][\w-]*)\s*=\s*\{\s*`([^`]*)`\s*\}/g;
 
 // Fix round 2: attributes that never render text to a human -- structural or
@@ -96,7 +107,9 @@ export function findHardcodedVietnamese(source) {
   for (const tok of scanTags(scan)) {
     if (tok.kind !== "open") continue;
     for (const a of tok.attrs.matchAll(ATTR_STRING)) {
-      if (isUserVisibleAttr(a[1])) pushIfVietnamese(hits, a[2]);
+      const name = a.groups.dname ?? a.groups.sname;
+      const value = a.groups.dval ?? a.groups.sval;
+      if (isUserVisibleAttr(name)) pushIfVietnamese(hits, value);
     }
     for (const a of tok.attrs.matchAll(ATTR_TEMPLATE)) {
       if (isUserVisibleAttr(a[1])) pushIfVietnamese(hits, a[2]);
