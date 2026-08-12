@@ -17,3 +17,6 @@ export {
   type ToolContentVersion,
   type ToolSourceCitation,
 } from "./tool-tx.ts";
+// The Postgres-backed RunStore T7's runtime.ts consumes -- see task-7-report.md
+// requirement 1 for why this (task 10's file) was pulled forward into T7.
+export { createRunStore, type RunStore } from "./repositories/run-store.ts";

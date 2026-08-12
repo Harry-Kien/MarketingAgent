@@ -10,6 +10,10 @@
   "dependencies": {
     "@smos/db": "*",
     "@smos/domain": "*",
+    "@smos/model-gateway": "*",
     "@smos/telemetry": "*"
+  },
+  "devDependencies": {
+    "@smos/contracts": "*"
   }
 }

@@ -7,3 +7,4 @@ export {
   type ToolDef,
   type ToolRegistry,
 } from "./tools.ts";
+export { runAgent, type RunStore, type RunAgentInput, type RunAgentResult } from "./runtime.ts";
