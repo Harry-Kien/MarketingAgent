@@ -30,7 +30,13 @@ export const messages = {
     title: "Nội dung", version: "Phiên bản", publicationContent: "Nội dung sẽ đăng", citations: "Nguồn trích dẫn",
     notFound: "Không tìm thấy nội dung này", body: "Nội dung", diffBefore: "Trước", diffAfter: "Sau",
   },
-  analytics: { title: "Kết quả", freshness: "Cập nhật lúc", attributionModel: "Mô hình quy thuộc", confidence: "Độ tin cậy", missingData: "Thiếu dữ liệu" },
+  analytics: {
+    title: "Kết quả", freshness: "Cập nhật lúc", attributionModel: "Mô hình quy thuộc", confidence: "Độ tin cậy", missingData: "Thiếu dữ liệu",
+    window: "Khung quy thuộc",
+    confidenceHigh: "Cao", confidenceMedium: "Trung bình", confidenceLow: "Thấp",
+    freshnessUnknown: "Không rõ thời điểm cập nhật nên chưa thể hiển thị số liệu",
+    noDataSource: "Chưa có nguồn dữ liệu phân tích nào được kết nối",
+  },
   state: {
     loading: "Đang tải", empty: "Chưa có dữ liệu", error: "Không tải được dữ liệu",
     partial: "Dữ liệu chưa đầy đủ", stale: "Dữ liệu đã cũ",
