@@ -73,6 +73,14 @@ export function assertEgressAllowed(rawUrl: string, allowedHosts: readonly strin
  * A plain domain name (anything that is not "localhost", an IPv4 literal,
  * or a bracketed IPv6 literal) is not resolved and not checked here -- see
  * the DNS-rebinding note on `assertEgressAllowed`.
+ *
+ * Expects an already-canonical address: plain dotted-decimal IPv4 (what
+ * Node's `dns`/`net` modules and WHATWG `URL` both produce) or a bracketed
+ * IPv6 literal. It does NOT itself re-interpret decimal/octal/hex IPv4
+ * encodings ("2130706433", "0x7f000001", ...) -- that canonicalization is
+ * done for `assertEgressAllowed` by the `URL` constructor before this
+ * function ever sees the hostname. A caller feeding this function a raw,
+ * un-canonicalized numeric string bypasses that protection.
  */
 export function assertResolvedAddressAllowed(hostname: string): void {
   const lower = hostname.toLowerCase();
