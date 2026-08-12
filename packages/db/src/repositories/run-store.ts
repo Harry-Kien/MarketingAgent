@@ -36,7 +36,46 @@ export interface RunStore {
        * run-store.test.ts, "rolls back the output checkpoint too").
        */
       output?: unknown;
+      /**
+       * Fix round 1, MINOR: agent_run.tokens_in/tokens_out/wallclock_ms
+       * (T6's audit columns, T12's exit criteria) were never written by the
+       * original implementation -- only their DEFAULT 0 ever landed.
+       * runtime.ts now accumulates real values across every model call a
+       * run makes (including every round of a tool-calling loop) and
+       * forwards them here on both the success and the failure path, so a
+       * run that fails after spending real tokens still records that it
+       * did.
+       */
+      tokensIn?: number;
+      tokensOut?: number;
+      wallclockMs?: number;
+      /**
+       * The real model_version the provider actually reported on its last
+       * successful call, if any. Left as COALESCE against the existing
+       * column value at the SQL layer (not overwritten with a literal) so
+       * a run that fails before any call ever returns doesn't lose the
+       * 'm1' placeholder createRun seeded it with. prompt_version has no
+       * equivalent fix here: nothing in RunAgentInput/buildPrompt's brief-
+       * pinned return shape (`{ system, input, schemaName }`) identifies
+       * "which prompt template version" independently of schemaName, so
+       * inventing a mapping would be guessing, not fixing -- flagged as an
+       * open question in task-7-report.md rather than silently papered
+       * over.
+       */
+      modelVersion?: string;
     },
+  ): Promise<void>;
+  /**
+   * Fix round 1, IMPORTANT: one row per tool invocation ATTEMPT a run
+   * makes, whether T4's registry allowed it or refused it -- exactly what
+   * 0024_agent_run.sql's own header comment says tool_call exists for
+   * ("T7's runtime record both, since a refused call is exactly the kind
+   * of event an audit trail must not silently omit"), which nothing
+   * previously called.
+   */
+  recordToolCall(
+    runId: Id,
+    call: { name: string; allowed: boolean; args: unknown; errorCode?: string },
   ): Promise<void>;
 }
 
@@ -73,8 +112,23 @@ export function createRunStore(pool: pg.Pool, workspaceId: Id): RunStore {
       // terminal state" -- true by construction rather than by convention.
       await withTenant(pool, workspaceId, async (tx) => {
         await tx.query(
-          `update agent_run set state=$2, cost_usd=$3, budget_exceeded=$4, error_code=$5, updated_at=now() where id=$1`,
-          [runId, patch.state, patch.costUsd, patch.budgetExceeded, patch.errorCode ?? null],
+          `update agent_run
+           set state=$2, cost_usd=$3, budget_exceeded=$4, error_code=$5,
+               tokens_in=$6, tokens_out=$7, wallclock_ms=$8,
+               model_version=COALESCE($9, model_version),
+               updated_at=now()
+           where id=$1`,
+          [
+            runId,
+            patch.state,
+            patch.costUsd,
+            patch.budgetExceeded,
+            patch.errorCode ?? null,
+            patch.tokensIn ?? 0,
+            patch.tokensOut ?? 0,
+            patch.wallclockMs ?? 0,
+            patch.modelVersion ?? null,
+          ],
         );
 
         if (patch.output !== undefined) {
@@ -86,6 +140,23 @@ export function createRunStore(pool: pg.Pool, workspaceId: Id): RunStore {
           );
         }
       });
+    },
+
+    async recordToolCall(runId, call) {
+      await withTenant(pool, workspaceId, (tx) =>
+        tx.query(
+          `insert into tool_call (id,workspace_id,agent_run_id,tool_name,allowed,args,error_code)
+           values ($1,$2,$3,$4,$5,$6::jsonb,$7)`,
+          [
+            newId(),
+            workspaceId,
+            runId,
+            call.name,
+            call.allowed,
+            JSON.stringify(call.args ?? {}),
+            call.errorCode ?? null,
+          ],
+        ));
     },
   };
 }

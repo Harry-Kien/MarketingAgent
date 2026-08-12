@@ -7,4 +7,11 @@ export {
   type ToolDef,
   type ToolRegistry,
 } from "./tools.ts";
-export { runAgent, type RunStore, type RunAgentInput, type RunAgentResult } from "./runtime.ts";
+export {
+  runAgent,
+  MAX_TOOL_CALLS_PER_RUN,
+  type RunStore,
+  type RunAgentInput,
+  type RunAgentResult,
+  type ToolCallRequest,
+} from "./runtime.ts";

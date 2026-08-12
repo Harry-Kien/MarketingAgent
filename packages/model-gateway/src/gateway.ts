@@ -11,6 +11,23 @@ export interface GatewayDeps {
   provider: ModelProvider;
   budgetUsd: number;
   maxWallclockMs: number;
+  /**
+   * Fix round 1, CRITICAL (task-7-report.md): a conservative estimate of
+   * what a single call to `provider` might cost, used as the pre-call
+   * reservation whenever it exceeds `maxCostSeen` -- which, on a gateway
+   * that has never yet made a call, is always (maxCostSeen starts at 0).
+   * Required rather than defaulted to 0, which would silently reintroduce
+   * the exact bug this field exists to close: a $0 reservation reserves
+   * nothing, so a burst of concurrent calls against a cold gateway all pass
+   * the pre-call check and all reach the real, paid provider before any of
+   * them has returned a real cost to learn from. Deliberately the caller's
+   * choice, not a gateway-computed default: only the caller knows roughly
+   * what a call to this provider/model/prompt combination tends to cost.
+   * Over-estimating merely refuses a call sooner than strictly necessary;
+   * under-estimating lets real vendor spend blow through the budget, so
+   * callers should round up.
+   */
+  estimatedCostUsd: number;
 }
 
 /**
@@ -55,12 +72,33 @@ export function createGateway(deps: GatewayDeps): Gateway {
       const committed = spent + reserved;
       const remaining = deps.budgetUsd - committed;
 
+      // Fix round 1, CRITICAL: the reservation this call will make is the
+      // worst of "what we've actually observed this provider cost before"
+      // and "what the caller told us to conservatively assume before we've
+      // observed anything" -- computed BEFORE the pre-call check, so the
+      // check judges the same value that gets reserved. On a cold gateway
+      // (maxCostSeen === 0, true for every call until the first one
+      // returns) this is what keeps the reservation non-zero: previously
+      // `reservation = maxCostSeen` was exactly 0 here, so a $0 reservation
+      // reserved nothing and an entire concurrent burst passed the pre-call
+      // check before any of them had a real cost to compare against
+      // (reproduced live: N=50 concurrent against a $1 budget invoked the
+      // real provider all 50 times). estimatedCostUsd closes that without
+      // serialising every call behind a lock: it only throttles calls made
+      // before the gateway has learned a real cost, and even then only to
+      // the extent the budget requires -- concurrent calls beyond what
+      // estimatedCostUsd-per-call affords are still refused pre-call, but
+      // calls that do fit both proceed and reach the provider concurrently
+      // (proved in gateway.test.ts's own concurrency tests, unaffected by
+      // this change).
+      const reservation = Math.max(maxCostSeen, deps.estimatedCostUsd);
+
       // Pre-call check: refuse before the provider is ever invoked once the
       // budget (net of what's already spent and what concurrent in-flight
-      // calls have reserved) is exhausted, or once the worst cost we've
-      // ever seen from this provider would no longer fit in what's left. A
-      // spy on the provider proves this branch never calls it.
-      if (remaining <= 0 || maxCostSeen > remaining) {
+      // calls have reserved) is exhausted, or once this call's reservation
+      // would no longer fit in what's left. A spy on the provider proves
+      // this branch never calls it.
+      if (remaining <= 0 || reservation > remaining) {
         const message = `Run budget of ${deps.budgetUsd} USD exhausted (spent ${spent} USD, reserved ${reserved} USD, ${remaining.toFixed(6)} USD remaining)`;
         logger.warn("model call refused: budget exhausted before call", {
           workspaceId: ctx.workspaceId,
@@ -71,14 +109,14 @@ export function createGateway(deps: GatewayDeps): Gateway {
           spentUsd: spent,
           reservedUsd: reserved,
           maxCostSeenUsd: maxCostSeen,
+          estimatedCostUsd: deps.estimatedCostUsd,
         });
         throw new Error(message);
       }
 
-      // Reserve the worst-known cost synchronously, in the same tick as the
-      // check above and before the first `await` -- this is what makes a
-      // concurrent second caller see this call's claim on the budget.
-      const reservation = maxCostSeen;
+      // Reserve synchronously, in the same tick as the check above and
+      // before the first `await` -- this is what makes a concurrent second
+      // caller see this call's claim on the budget.
       reserved += reservation;
 
       try {

@@ -13,7 +13,7 @@ const req: GenerateRequest = { system: "s", input: "i", schemaName: "x", maxOutp
 
 describe("gateway budget", () => {
   it("accumulates spend across calls", async () => {
-    const g = createGateway({ provider: costing(0.01), budgetUsd: 1, maxWallclockMs: 5000 });
+    const g = createGateway({ provider: costing(0.01), budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.05 });
     await g.generate(req, ctx);
     await g.generate(req, ctx);
     expect(g.spentUsd()).toBeCloseTo(0.02);
@@ -28,14 +28,14 @@ describe("gateway budget", () => {
         return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 0.6, modelVersion: "m1" };
       },
     };
-    const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000 });
+    const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.05 });
     await g.generate(req, ctx);
     await expect(g.generate(req, ctx)).rejects.toThrow(/budget/i);
     expect(calls).toBe(1);
   });
 
   it("stops hard rather than degrading silently when a single call's cost alone exceeds the whole budget", async () => {
-    const g = createGateway({ provider: costing(2), budgetUsd: 1, maxWallclockMs: 5000 });
+    const g = createGateway({ provider: costing(2), budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.05 });
     await expect(g.generate(req, ctx)).rejects.toThrow(/budget/i);
     expect(g.spentUsd()).toBe(0);
   });
@@ -49,7 +49,7 @@ describe("gateway budget", () => {
         return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 2, modelVersion: "m1" };
       },
     };
-    const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000 });
+    const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.05 });
     await expect(g.generate(req, ctx)).rejects.toThrow(/budget/i);
     expect(calls).toBe(1);
     await expect(g.generate(req, ctx)).rejects.toThrow(/budget/i);
@@ -66,7 +66,7 @@ describe("gateway budget", () => {
       generate: () =>
         new Promise((r) => setTimeout(() => r({ text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 0, modelVersion: "m" }), 200)),
     };
-    const g = createGateway({ provider: slow, budgetUsd: 1, maxWallclockMs: 20 });
+    const g = createGateway({ provider: slow, budgetUsd: 1, maxWallclockMs: 20, estimatedCostUsd: 0.05 });
     await expect(g.generate(req, ctx)).rejects.toThrow(/timed out/i);
   });
 
@@ -83,7 +83,7 @@ describe("gateway budget", () => {
           }, 60);
         }),
     };
-    const g = createGateway({ provider: slow, budgetUsd: 1, maxWallclockMs: 20 });
+    const g = createGateway({ provider: slow, budgetUsd: 1, maxWallclockMs: 20, estimatedCostUsd: 0.05 });
     await expect(g.generate(req, ctx)).rejects.toThrow(/timed out/i);
     // Give the abandoned provider promise time to actually resolve.
     await new Promise((r) => setTimeout(r, 100));
@@ -98,24 +98,24 @@ describe("gateway budget", () => {
         throw new Error("provider blew up");
       },
     };
-    const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000 });
+    const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.05 });
     await expect(g.generate(req, ctx)).rejects.toThrow(/provider blew up/);
     expect(g.spentUsd()).toBe(0);
 
     // The gateway must still work normally afterward.
-    const g2 = createGateway({ provider: costing(0.1), budgetUsd: 1, maxWallclockMs: 5000 });
+    const g2 = createGateway({ provider: costing(0.1), budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.05 });
     await g2.generate(req, ctx);
     expect(g2.spentUsd()).toBeCloseTo(0.1);
   });
 
   it("rejects a negative cost from the provider instead of letting it reduce the running total", async () => {
-    const g = createGateway({ provider: costing(-5), budgetUsd: 1, maxWallclockMs: 5000 });
+    const g = createGateway({ provider: costing(-5), budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.05 });
     await expect(g.generate(req, ctx)).rejects.toThrow(/cost/i);
     expect(g.spentUsd()).toBe(0);
   });
 
   it("rejects a NaN cost from the provider instead of corrupting the running total", async () => {
-    const g = createGateway({ provider: costing(Number.NaN), budgetUsd: 1, maxWallclockMs: 5000 });
+    const g = createGateway({ provider: costing(Number.NaN), budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.05 });
     await expect(g.generate(req, ctx)).rejects.toThrow(/cost/i);
     expect(g.spentUsd()).toBe(0);
   });
@@ -128,7 +128,7 @@ describe("gateway budget", () => {
       return true;
     }) as typeof process.stdout.write;
     try {
-      const g = createGateway({ provider: costing(0.01), budgetUsd: 1, maxWallclockMs: 5000 });
+      const g = createGateway({ provider: costing(0.01), budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.05 });
       await g.generate(req, ctx);
     } finally {
       process.stdout.write = write;
@@ -153,7 +153,7 @@ describe("gateway budget", () => {
         return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 0.7, modelVersion: "m1" };
       },
     };
-    const g = createGateway({ provider, budgetUsd: 1.4, maxWallclockMs: 5000 });
+    const g = createGateway({ provider, budgetUsd: 1.4, maxWallclockMs: 5000, estimatedCostUsd: 0.05 });
     // Warm-up call establishes maxCostSeen = 0.7 and leaves exactly 0.7
     // remaining -- budget "fits exactly one more call at 0.7".
     await g.generate(req, ctx);
@@ -172,7 +172,7 @@ describe("gateway budget", () => {
   });
 
   it("does not strand a reservation after a successful call, so a second call that exactly fits still succeeds", async () => {
-    const g = createGateway({ provider: costing(0.7), budgetUsd: 1.4, maxWallclockMs: 5000 });
+    const g = createGateway({ provider: costing(0.7), budgetUsd: 1.4, maxWallclockMs: 5000, estimatedCostUsd: 0.05 });
     await g.generate(req, ctx);
     // If the first call's reservation were never released, this call would
     // be wrongly refused even though the real remaining budget (0.7) is
@@ -191,7 +191,7 @@ describe("gateway budget", () => {
         return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 0.7, modelVersion: "m1" };
       },
     };
-    const g = createGateway({ provider, budgetUsd: 1.4, maxWallclockMs: 5000 });
+    const g = createGateway({ provider, budgetUsd: 1.4, maxWallclockMs: 5000, estimatedCostUsd: 0.05 });
     await g.generate(req, ctx); // n=1: spent=0.7, maxCostSeen=0.7, remaining=0.7
     await expect(g.generate(req, ctx)).rejects.toThrow(/boom/); // n=2: throws after reserving 0.7
     // Only succeeds if the failed call's reservation was released -- real
@@ -212,7 +212,7 @@ describe("gateway budget", () => {
         return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 0.7, modelVersion: "m1" };
       },
     };
-    const g = createGateway({ provider, budgetUsd: 1.4, maxWallclockMs: 20 });
+    const g = createGateway({ provider, budgetUsd: 1.4, maxWallclockMs: 20, estimatedCostUsd: 0.05 });
     await g.generate(req, ctx); // n=1: fast, spent=0.7, maxCostSeen=0.7, remaining=0.7
     await expect(g.generate(req, ctx)).rejects.toThrow(/timed out/i); // n=2: times out after reserving 0.7
     // Only succeeds if the timed-out call's reservation was released.
@@ -221,6 +221,52 @@ describe("gateway budget", () => {
     // Let the abandoned n=2 call actually settle so it doesn't leak a
     // pending timer into later tests.
     await new Promise((r) => setTimeout(r, 250));
+  });
+
+  // Fix round 1, CRITICAL. `reserved += reservation` where
+  // `reservation = maxCostSeen` (pre-fix) is 0 until the FIRST call ever
+  // returns -- a reservation of $0 reserves nothing. A cold burst of
+  // concurrent calls therefore all pass the pre-call check and all reach
+  // the real provider, even though only a handful fit the budget. The
+  // "exactly once" concurrency test above never catches this: it always
+  // runs a sequential warm-up call first, which is precisely what makes
+  // maxCostSeen non-zero before the race starts. These two tests fire
+  // straight into a gateway that has NEVER made a call.
+  it("cold gateway, N=50 concurrent: provider invocation count never exceeds what the budget can pay for (round 1 CRITICAL)", async () => {
+    let calls = 0;
+    const provider: ModelProvider = {
+      name: "cold-burst-50",
+      generate: async () => {
+        calls++;
+        await new Promise((r) => setTimeout(r, 5));
+        return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 0.15, modelVersion: "m1" };
+      },
+    };
+    // estimatedCostUsd matches the real per-call cost (0.15) -- this is the
+    // caller's conservative pre-knowledge of what this provider tends to
+    // cost, exactly the value the CRITICAL fix requires a caller to supply.
+    const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.15 });
+    await Promise.allSettled(Array.from({ length: 50 }, () => g.generate(req, ctx)));
+    // At $0.15/call and a $1 budget, at most 6 calls can ever be afforded
+    // (6 * 0.15 = 0.9; a 7th would need 1.05). This is the property that
+    // matters -- real vendor spend -- not "did exactly one run survive".
+    expect(calls * 0.15).toBeLessThanOrEqual(1 + 1e-9);
+  });
+
+  it("cold gateway, N=10 concurrent: same property at smaller N", async () => {
+    let calls = 0;
+    const provider: ModelProvider = {
+      name: "cold-burst-10",
+      generate: async () => {
+        calls++;
+        await new Promise((r) => setTimeout(r, 5));
+        return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 0.15, modelVersion: "m1" };
+      },
+    };
+    const g = createGateway({ provider, budgetUsd: 0.5, maxWallclockMs: 5000, estimatedCostUsd: 0.15 });
+    await Promise.allSettled(Array.from({ length: 10 }, () => g.generate(req, ctx)));
+    // At $0.15/call and a $0.5 budget, at most 3 calls can ever be afforded.
+    expect(calls * 0.15).toBeLessThanOrEqual(0.5 + 1e-9);
   });
 
   it("a hostile negative-cost result cannot be used to fund a later over-budget call", async () => {
@@ -233,7 +279,7 @@ describe("gateway budget", () => {
         return { text: "{}", tokensIn: 1, tokensOut: 1, costUsd: 0.5, modelVersion: "m1" };
       },
     };
-    const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000 });
+    const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.05 });
     await expect(g.generate(req, ctx)).rejects.toThrow(/cost/i);
     expect(g.spentUsd()).toBe(0);
     await g.generate(req, ctx);

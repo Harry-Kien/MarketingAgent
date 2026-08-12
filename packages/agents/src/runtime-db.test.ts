@@ -6,7 +6,7 @@
 // though this task never calls it), T5 (parseAgentOutput), T6 (schema),
 // P1 (assertActivated + the database activation gate this task adds in
 // 0025) all have to actually compose for these three tests to pass.
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   ALL_AGENT_ROLES,
   M1_ACTIVATED_AGENTS,
@@ -95,6 +95,7 @@ describe("runAgent + the real RunStore, end to end", () => {
         provider: createFakeProvider({ "content.v1": JSON.stringify(validOutput) }),
         budgetUsd: 1,
         maxWallclockMs: 5000,
+        estimatedCostUsd: 0.05,
       }),
       tools: createToolRegistry([]),
       workspaceId,
@@ -139,6 +140,7 @@ describe("runAgent + the real RunStore, end to end", () => {
           provider: createFakeProvider({ "content.v1": "this is not json" }),
           budgetUsd: 1,
           maxWallclockMs: 5000,
+          estimatedCostUsd: 0.05,
         }),
         tools: createToolRegistry([]),
         workspaceId,
@@ -170,7 +172,7 @@ describe("runAgent + the real RunStore, end to end", () => {
       runAgent({
         role: "content",
         registry: registryWith(false), // this workspace's content agent_version really is activated=false in the DB below
-        gateway: createGateway({ provider: { name: "spy", generate: async () => { throw new Error("must never be called"); } }, budgetUsd: 1, maxWallclockMs: 100 }),
+        gateway: createGateway({ provider: { name: "spy", generate: async () => { throw new Error("must never be called"); } }, budgetUsd: 1, maxWallclockMs: 100, estimatedCostUsd: 0.05 }),
         tools: createToolRegistry([]),
         workspaceId,
         campaignId,
@@ -214,5 +216,50 @@ describe("runAgent + the real RunStore, end to end", () => {
       client.release();
       await adminPool.query(`update agent_version set activated = true where id = $1`, [agentVersionId]);
     }
+  });
+
+  // Fix round 1, IMPORTANT: proves tool dispatch end to end against the
+  // real database, not the mock store -- a refused tool call must actually
+  // land a row in tool_call (T6), not just call a mock's recordToolCall.
+  it("a refused tool call is recorded in the real tool_call table, and the run still ends failed_terminal", async () => {
+    const publish = vi.fn();
+    const tools = createToolRegistry([{ name: "publish.meta", handler: publish }]);
+    const registryNoTools = registryWith(true).map((e) => ({ ...e, toolAllowlist: [] }));
+
+    const result = await runAgent({
+      role: "content",
+      registry: registryNoTools,
+      gateway: createGateway({
+        provider: createFakeProvider({ "content.v1": '{"toolCall":true}' }),
+        budgetUsd: 1,
+        maxWallclockMs: 5000,
+        estimatedCostUsd: 0.05,
+      }),
+      tools,
+      workspaceId,
+      campaignId,
+      correlationId: newId(),
+      buildPrompt: () => ({ system: "s", input: "i", schemaName: "content.v1" }),
+      parse: (raw) => parseAgentOutput(contentOutputSchema, raw),
+      interpretToolCall: () => ({ name: "publish.meta", args: {} }),
+      store: createRunStore(pool, workspaceId),
+    }).catch((error: unknown) => {
+      expect(String(error)).toMatch(/not on the tool allowlist/i);
+      return undefined;
+    });
+    expect(result).toBeUndefined();
+    expect(publish).not.toHaveBeenCalled();
+
+    const runs = await adminPool.query(
+      `select id, state from agent_run where workspace_id = $1 order by created_at desc limit 1`,
+      [workspaceId],
+    );
+    expect(runs.rows[0].state).toBe("failed_terminal");
+
+    const calls = await adminPool.query(
+      `select tool_name, allowed from tool_call where agent_run_id = $1`,
+      [runs.rows[0].id],
+    );
+    expect(calls.rows).toEqual([{ tool_name: "publish.meta", allowed: false }]);
   });
 });

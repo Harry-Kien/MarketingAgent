@@ -177,6 +177,69 @@ describe("createRunStore: persists a run, its checkpoints and its terminal state
     expect(cp.rowCount).toBe(0);
   });
 
+  // Fix round 1, IMPORTANT: the reviewer proved by mutation that the test
+  // above ("rolls back the output checkpoint too...") never actually
+  // exercises atomicity -- it forces the UPDATE (statement 1) itself to
+  // fail via an invalid state value, so the INSERT (statement 2) never even
+  // runs; splitting finishRun into two separate transactions makes 0 of 836
+  // tests fail. This test instead forces the SECOND statement (the
+  // run_checkpoint INSERT) to fail while the FIRST statement (the agent_run
+  // UPDATE) is entirely valid and would succeed on its own -- via a
+  // temporary trigger installed for the duration of this one test, through
+  // the migration role (smos_app has no CREATE anywhere, per
+  // STANDING-CONTEXT.md). If finishRun's two writes are in one transaction
+  // (the real implementation), the failed INSERT rolls the UPDATE back too,
+  // so `state` never becomes "succeeded". If they were split into two
+  // withTenant calls, the UPDATE would already have committed by the time
+  // the INSERT fails -- exactly the "run marked complete with its output
+  // missing" failure requirement (1) exists to prevent.
+  it("MUTATION GUARD: forcing only the output checkpoint write to fail must also undo the terminal-state write", async () => {
+    const store = createRunStore(pool, workspaceId);
+    const runId = await store.createRun({ workspaceId, agentVersionId, campaignId, correlationId: newId() });
+    createdRunIds.push(runId);
+
+    await adminPool.query(`
+      CREATE OR REPLACE FUNCTION t7_mutation_guard_block_output_checkpoint() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.state_blob ? 'output' THEN
+          RAISE EXCEPTION 'MUTATION GUARD: forced failure for atomicity test';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+
+      DROP TRIGGER IF EXISTS t7_mutation_guard_block_output_checkpoint ON run_checkpoint;
+      CREATE TRIGGER t7_mutation_guard_block_output_checkpoint
+        BEFORE INSERT ON run_checkpoint
+        FOR EACH ROW
+        EXECUTE FUNCTION t7_mutation_guard_block_output_checkpoint();
+    `);
+
+    try {
+      await expect(
+        store.finishRun(runId, {
+          state: "succeeded",
+          costUsd: 0.5,
+          budgetExceeded: false,
+          output: { should: "never persist" },
+        }),
+      ).rejects.toThrow(/MUTATION GUARD/i);
+
+      const run = await adminPool.query(`select state, cost_usd from agent_run where id=$1`, [runId]);
+      // "running" is what createRun set it to; the point is specifically
+      // that it must NOT be "succeeded" -- the terminal state the failed
+      // call asked for -- because that write was never allowed to commit
+      // on its own.
+      expect(run.rows[0].state).not.toBe("succeeded");
+      expect(run.rows[0].cost_usd).not.toBe("0.500000");
+    } finally {
+      await adminPool.query(`
+        DROP TRIGGER IF EXISTS t7_mutation_guard_block_output_checkpoint ON run_checkpoint;
+        DROP FUNCTION IF EXISTS t7_mutation_guard_block_output_checkpoint();
+      `);
+    }
+  });
+
   // E15 / adversarial check: a run created in one workspace must be
   // completely invisible to a RunStore scoped to a different workspace.
   it("E15: a run in workspace B cannot see a run in workspace A", async () => {
