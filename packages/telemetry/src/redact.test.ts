@@ -41,4 +41,33 @@ describe("redact", () => {
     a["self"] = a;
     expect(() => redact(a)).not.toThrow();
   });
+
+  it("preserves count-shaped token fields instead of redacting them", () => {
+    expect(redact({ tokensIn: 5, tokensOut: 7 })).toEqual({ tokensIn: 5, tokensOut: 7 });
+    expect(redact({ tokenCount: 42 })).toEqual({ tokenCount: 42 });
+    expect(redact({ tokensUsed: 3 })).toEqual({ tokensUsed: 3 });
+    // snake_case variants
+    expect(redact({ tokens_in: 5, tokens_out: 7, token_count: 42 })).toEqual({
+      tokens_in: 5,
+      tokens_out: 7,
+      token_count: 42,
+    });
+  });
+
+  it("still redacts real token secrets regardless of casing or separator", () => {
+    expect(redact({ sessionToken: "x", apiToken: "y", accessToken: "z" })).toEqual({
+      sessionToken: "[redacted]",
+      apiToken: "[redacted]",
+      accessToken: "[redacted]",
+    });
+    expect(redact({ session_token: "x", refresh_token: "y" })).toEqual({
+      session_token: "[redacted]",
+      refresh_token: "[redacted]",
+    });
+  });
+
+  it("redacts a bare field genuinely holding an array of tokens, since it is not count-shaped", () => {
+    expect(redact({ tokens: ["a", "b"] })).toEqual({ tokens: "[redacted]" });
+    expect(redact({ refreshTokens: ["a", "b"] })).toEqual({ refreshTokens: "[redacted]" });
+  });
 });
