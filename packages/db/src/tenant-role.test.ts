@@ -9,6 +9,7 @@
 // so there is no superuser identity left to fall back to.
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
+import { TenantViolationError } from "@smos/domain";
 import { createDb, createDbPool } from "./client.ts";
 import { withTenant } from "./tenant-scope.ts";
 
@@ -99,7 +100,13 @@ describe("smos_app connects directly (ADR-007)", () => {
     ).rejects.toThrow(/permission denied/i);
   });
 
-  it("set_config to another workspace id mid-transaction still succeeds -- a different, still-open mechanism", async () => {
+  it("CLOSED: set_config to another workspace id mid-transaction is caught at the withTenant boundary before COMMIT", async () => {
+    // This test used to prove the opposite: that re-scoping mid-callback
+    // "still succeeds -- a different, still-open mechanism", and it linked
+    // to task-5b-report.md's recommended follow-up. That follow-up is this
+    // task: withTenant now reads back current_setting('app.workspace_id')
+    // (and current_user) right before COMMIT and refuses to let a scope
+    // that no longer matches what it opened ever persist.
     const marker = `role-fix.set-config.${Date.now()}`;
     await withTenant(pool, B, (tx) =>
       tx.query(
@@ -108,30 +115,23 @@ describe("smos_app connects directly (ADR-007)", () => {
         [B, marker],
       ));
 
-    const sawOtherWorkspaceRow = await withTenant(pool, A, async (tx) => {
-      // No role escalation attempted here -- still smos_app throughout.
-      // The callback just overwrites the session variable RLS itself
-      // reads.
-      await tx.query("select set_config('app.workspace_id', $1, true)", [B]);
-      const r = await tx.query("select count(*)::int as n from audit_log where event_type = $1", [
-        marker,
-      ]);
-      return r.rows[0].n > 0;
-    });
-
-    // Reporting this plainly rather than hiding it (per task brief): this
-    // still succeeds. RLS is still fully active and never bypassed -- the
-    // policy is evaluated against `app.workspace_id` on every row, exactly
-    // as designed -- but that session variable is itself just a value the
-    // connected role (smos_app) is always allowed to set, so a callback
-    // that deliberately overwrites it can still read outside the scope
-    // `withTenant`'s caller asked for. This is NOT a superuser/BYPASSRLS
-    // escape (layer 2 of ADR-007 never comes down), so it is a smaller and
-    // different problem than what this task closes, but it is real and
-    // undocumented elsewhere would be misleading to omit. See
-    // task-5b-report.md for the recommended follow-up (likely: making
-    // `withTenant`'s `TenantTx` not expose a raw `query` that can reach
-    // `set_config` at all, which is a bigger, separate change).
-    expect(sawOtherWorkspaceRow).toBe(true);
+    // No role escalation attempted here -- still smos_app throughout. The
+    // callback just overwrites the session variable RLS itself reads, which
+    // is still real and still worth documenting: the read below succeeds
+    // and does see B's row (the boundary check runs only after the
+    // callback returns, so it cannot erase what the callback already saw).
+    // What is different now is that this can no longer resolve normally --
+    // the mismatch is caught before COMMIT and surfaced as a
+    // TenantViolationError instead of a silent, wrong `true`.
+    await expect(
+      withTenant(pool, A, async (tx) => {
+        await tx.query("select set_config('app.workspace_id', $1, true)", [B]);
+        const r = await tx.query(
+          "select count(*)::int as n from audit_log where event_type = $1",
+          [marker],
+        );
+        return r.rows[0].n > 0;
+      }),
+    ).rejects.toThrow(TenantViolationError);
   });
 });

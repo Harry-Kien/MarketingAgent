@@ -28,6 +28,12 @@ export interface TenantTx {
  * insurance if a future connection string is ever misconfigured back to a
  * privileged role.
  */
+// The role every scope is opened as. withTenant only ever issues `set local
+// role smos_app` (see below) -- this constant is what the boundary check
+// below compares `current_user` back against, and it exists so both places
+// stay in sync by construction rather than by convention.
+const TENANT_ROLE = "smos_app";
+
 export async function withTenant<T>(
   pool: pg.Pool,
   workspaceId: Id,
@@ -39,9 +45,39 @@ export async function withTenant<T>(
   const client = await pool.connect();
   try {
     await client.query("begin");
-    await client.query("set local role smos_app");
+    await client.query(`set local role ${TENANT_ROLE}`);
     await client.query("select set_config('app.workspace_id', $1, true)", [workspaceId]);
     const result = await fn({ query: (text, values) => client.query(text, values as never) });
+
+    // Boundary check (closes the hole documented in tenant-role.test.ts and
+    // tenant-scope.test.ts's DEFEAT ATTEMPT tests): `tx.query` is a thin,
+    // uninspected wrapper over the raw connection, so nothing stops callback
+    // code from calling `set_config('app.workspace_id', ...)` or `set role`
+    // itself and re-scoping the rest of its own body to a different tenant.
+    // Read back what the session actually ends the callback holding and
+    // compare it to what this call opened; if either drifted, refuse to let
+    // anything the callback did reach COMMIT.
+    //
+    // Honest limits: this runs *after* `fn` has already returned, so it
+    // cannot retroactively hide rows a hijacked callback already read while
+    // re-scoped -- only reads are unaffected by a rollback. What it does
+    // guarantee is that nothing a hijacked scope wrote can ever be
+    // persisted, and that the caller gets a loud TenantViolationError
+    // instead of a silently wrong result.
+    const [wsCheck, userCheck] = await Promise.all([
+      client.query("select current_setting('app.workspace_id', true) as ws"),
+      client.query("select current_user as u"),
+    ]);
+    const endedWorkspaceId: string | null = wsCheck.rows[0].ws;
+    const endedUser: string = userCheck.rows[0].u;
+    if (endedWorkspaceId !== workspaceId || endedUser !== TENANT_ROLE) {
+      throw new TenantViolationError(
+        `Tenant scope hijacked inside withTenant: opened for workspace "${workspaceId}" as ` +
+          `"${TENANT_ROLE}", but ended scoped to workspace "${String(endedWorkspaceId)}" as user ` +
+          `"${endedUser}". The transaction was rolled back; nothing the callback did was committed.`,
+      );
+    }
+
     await client.query("commit");
     return result;
   } catch (error) {

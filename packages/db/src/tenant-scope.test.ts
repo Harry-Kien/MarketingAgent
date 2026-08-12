@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
+import { TenantViolationError } from "@smos/domain";
 import { createDb, createDbPool } from "./client.ts";
 import { withTenant } from "./tenant-scope.ts";
 
@@ -10,6 +11,15 @@ const db = createDb(pool);
 const A = "11111111-1111-7111-8111-111111111111";
 const B = "22222222-2222-7222-8222-222222222222";
 
+// Only used to set up/tear down a throwaway role for the "callback changes
+// current_user" defeat attempt below -- smos_app itself is never a member of
+// any other role today, so proving that half of the boundary check fires at
+// all requires a role that can grant it membership for the duration of one
+// test.
+const adminUrl =
+  process.env["DATABASE_MIGRATION_URL"] ?? "postgres://smos:smos_local_dev@127.0.0.1:5433/smos";
+const adminPool = createDbPool(adminUrl);
+
 beforeAll(async () => {
   await db.execute(
     sql`insert into workspace (id, name) values (${A}::uuid, 'A'), (${B}::uuid, 'B') on conflict do nothing`,
@@ -18,6 +28,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await pool.end();
+  await adminPool.end();
 });
 
 describe("withTenant", () => {
@@ -242,7 +253,10 @@ describe("withTenant", () => {
     }
   });
 
-  it("DEFEAT ATTEMPT: set_config to another workspace id (still as smos_app) reads that workspace's rows", async () => {
+  it("DEFEAT ATTEMPT (closed): re-scoping to another workspace and only READING still triggers the violation at the boundary", async () => {
+    // This used to be the open hole: this exact test, unmodified apart from
+    // its name and final assertion, used to resolve with
+    // sawOtherWorkspaceRowWhileScopedToA === true and no error at all.
     const marker = `defeat.set-config.${Date.now()}`;
     await withTenant(pool, B, (tx) =>
       tx.query(
@@ -251,20 +265,81 @@ describe("withTenant", () => {
         [B, marker],
       ));
 
-    let sawOtherWorkspaceRowWhileScopedToA: boolean | undefined;
-    const result = await withTenant(pool, A, async (tx) => {
-      // Still smos_app, still inside withTenant's own transaction -- but the
-      // callback itself overrides the session variable RLS reads.
-      await tx.query("select set_config('app.workspace_id', $1, true)", [B]);
-      const seen = await tx.query(
-        "select count(*)::int as n from audit_log where event_type = $1",
-        [marker],
-      );
-      return seen.rows[0].n > 0;
-    });
-    sawOtherWorkspaceRowWhileScopedToA = result;
+    // Honest caveat (see tenant-scope.ts's header): the read below still
+    // happens, and it still sees B's row -- the boundary check runs only
+    // after the callback returns, so it cannot un-see something the
+    // callback already read inside its own body. What this DOES guarantee:
+    // the transaction the hijack ran in can never commit, and the caller
+    // gets a loud TenantViolationError instead of a silent, wrong answer
+    // that looks like a legitimate result.
+    await expect(
+      withTenant(pool, A, async (tx) => {
+        // Still smos_app, still inside withTenant's own transaction -- but
+        // the callback itself overrides the session variable RLS reads.
+        await tx.query("select set_config('app.workspace_id', $1, true)", [B]);
+        const seen = await tx.query(
+          "select count(*)::int as n from audit_log where event_type = $1",
+          [marker],
+        );
+        return seen.rows[0].n > 0;
+      }),
+    ).rejects.toThrow(TenantViolationError);
+  });
 
-    expect(sawOtherWorkspaceRowWhileScopedToA).toBe(true);
+  it("DEFEAT ATTEMPT (closed): re-scoping to another workspace and INSERTing rolls back the whole transaction, leaving neither workspace's data changed", async () => {
+    const markerA = `defeat.hijack-insert.a.${Date.now()}`;
+    const markerB = `defeat.hijack-insert.b.${Date.now()}`;
+
+    await expect(
+      withTenant(pool, A, async (tx) => {
+        // A legitimate write while still correctly scoped to A.
+        await tx.query(
+          `insert into audit_log (id, workspace_id, event_type, actor_kind, payload)
+           values (gen_random_uuid(), $1, $2, 'system', '{}'::jsonb)`,
+          [A, markerA],
+        );
+        // The hijack: re-scope mid-callback and write as if this were B.
+        await tx.query("select set_config('app.workspace_id', $1, true)", [B]);
+        await tx.query(
+          `insert into audit_log (id, workspace_id, event_type, actor_kind, payload)
+           values (gen_random_uuid(), $1, $2, 'system', '{}'::jsonb)`,
+          [B, markerB],
+        );
+      }),
+    ).rejects.toThrow(TenantViolationError);
+
+    // Neither the legitimate A write nor the hijacked B write survives --
+    // the whole transaction rolled back, not just the hijacked half.
+    const seenA = await withTenant(pool, A, (tx) =>
+      tx.query("select count(*)::int as n from audit_log where event_type = $1", [markerA]));
+    expect(seenA.rows[0].n).toBe(0);
+
+    const seenB = await withTenant(pool, B, (tx) =>
+      tx.query("select count(*)::int as n from audit_log where event_type = $1", [markerB]));
+    expect(seenB.rows[0].n).toBe(0);
+  });
+
+  it("DEFEAT ATTEMPT (closed): a callback that changes current_user also triggers the violation", async () => {
+    // smos_app has no membership in any other role today (that's exactly
+    // why "SET ROLE smos" fails outright above) -- so demonstrating that the
+    // current_user half of the boundary check actually fires requires a
+    // throwaway role granted to smos_app for the duration of this test only.
+    await adminPool.query("create role tmp_boundary_check_target nologin nobypassrls");
+    try {
+      await adminPool.query("grant tmp_boundary_check_target to smos_app");
+      try {
+        await expect(
+          withTenant(pool, A, async (tx) => {
+            await tx.query("set role tmp_boundary_check_target");
+            await tx.query("select 1");
+          }),
+        ).rejects.toThrow(TenantViolationError);
+      } finally {
+        await adminPool.query("revoke tmp_boundary_check_target from smos_app");
+      }
+    } finally {
+      await adminPool.query("drop role tmp_boundary_check_target");
+    }
   });
 
   it("DEFEAT ATTEMPT AFTERMATH: a plain (non-LOCAL) SET ROLE would poison the pool -- withTenant itself never issues one", async () => {
