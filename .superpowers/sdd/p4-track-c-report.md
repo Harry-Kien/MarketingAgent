@@ -203,7 +203,7 @@ Test Files  1 failed (1)
 
 This also incidentally fixed the "IPV4_LITERAL doesn't range-check octets" Minor (`999.999.999.999` now throws on the direct path too — it was already refused via `assertEgressAllowed`'s protocol/allowlist checks, but not by the address check itself), and closed a self-found gap during the rewrite: a trailing FQDN dot (`"127.0.0.1."`) previously produced an empty last label, which `endsInANumber` read as "not IPv4-shaped" and let straight through as an unrecognised domain. Added a test and the one-line strip that closes it.
 
-**Passing after the fix:** 85/85 in `packages/integrations` (up from 71 before this fix round; +13 new tests, +1 trailing-dot test = 85, one pre-existing test was strengthened rather than counted as new — see mutation section).
+**Passing after the fix:** 85/85 in `packages/integrations`. **Correction (fix round 2):** the baseline this grew from was **60**, not 71 — 60 is the count at commit `77b3bd4` (the initial report, before any fix-round-1 code change); 71 was a mid-flight number from partway through this round's own test-writing and was never the right comparison point. 60 → 85 is the real delta for fix round 1.
 
 ### Important #2 — `guardedFetch(url, allowedHosts, init?)` wrapper
 
@@ -253,6 +253,99 @@ Considered whether `assertResolvedAddressAllowed` should take a branded type (e.
 
 ### Existing tests modified
 
-One: the first `guardedFetch` redirect test (`refuses a 30x whose Location points at a forbidden host`) had its assertion strengthened from a bare `.rejects.toThrow()` to `.rejects.toThrow(/blocked|internal/i)`. Justification: mutation testing showed the bare assertion could not distinguish "the guard caught it" from "the fake fetch had no script entry and threw for an unrelated reason" — both produce *a* throw. This is a strengthening of an existing assertion, not a weakening; no expected behavior changed, and the test still passes against the correct implementation.
+None, corrected. **Original framing was wrong and is corrected here (fix round 2):** the previous version of this report said "one existing test strengthened," referring to the first `guardedFetch` redirect test. `guarded-fetch.ts` and `guarded-fetch.test.ts` were both *created* in this same commit (`73b765c`, fix round 1) — there was no earlier commit in which that test existed to be "modified." The strengthening itself is real and stands as described (a bare `.rejects.toThrow()` was tightened to `.rejects.toThrow(/blocked|internal/i)` because mutation testing showed the bare assertion couldn't distinguish "the guard caught it" from "the fake fetch had no script entry and threw for an unrelated reason"), but it happened before the test was ever committed, so it is authoring, not modifying — no pre-existing test, anywhere in this package, was ever changed.
 
-No other existing test was touched.
+---
+
+## Fix round 2 (independent re-review response)
+
+Re-review of fix round 1's `guardedFetch` ran 42 adversarial redirect/URL-confusion scenarios (protocol-relative, `\`-prefixed, `javascript:`/`data:`/`file:`, downgrade, userinfo-in-`Location`, 6-hop and self-loop chains, a block at hop 5) with zero forbidden addresses reached, confirmed the `init`-override-proof ordering by mutant, and probed `assertResolvedAddressAllowed` with 36 further hostile forms (`0X7F000001`, `127.0x1`, `fe80::1%eth0`, `012.0.0.1`, `0b1111.0.0.1`, `4294967295`, `::FFFF:A9FE:A9FE`) — all closed, 13/13 legitimate addresses still allowed. Both fix-round-1 design decisions (no branded type, no port constraint) were judged correct. **Approved, one short fix round.**
+
+### Important — the four fix-round-1 IPv6 ranges shipped with zero tests
+
+`fec0::/10`, `2001:db8::/32`, `100::/64`, `64:ff9b:1::/48` were all correct and had all been manually probed by the reviewer, but nothing in the committed test suite pinned them — exactly the failure mode that let the original `assertResolvedAddressAllowed` bug happen (a real fix, silently reopened later because nothing proved it). Added one test per range in `egress.test.ts`, under `describe("IPv6 ranges added in fix round 1, now pinned individually")`.
+
+**Fail-first proof** (mutation: delete each range's line from `SIMPLE_BLOCKED_IPV6_PREFIXES`, confirm only that range's test fails, restore):
+
+```
+--- delete fec0::/10 ---
+ × ... refuses deprecated site-local fec0::/10
+ Test Files  1 failed (1)   Tests  1 failed | 79 skipped (80)
+
+--- delete 2001:db8::/32 ---
+ × ... refuses the IPv6 documentation range 2001:db8::/32
+ Test Files  1 failed (1)   Tests  1 failed | 79 skipped (80)
+
+--- delete 100::/64 ---
+ × ... refuses the discard-only range 100::/64
+ Test Files  1 failed (1)   Tests  1 failed | 79 skipped (80)
+
+--- delete 64:ff9b:1::/48 ---
+ × ... refuses the NAT64 local-use range 64:ff9b:1::/48
+ Test Files  1 failed (1)   Tests  1 failed | 79 skipped (80)
+```
+
+Each mutation failed exactly the one test targeting it and nothing else — clean, precise pinning.
+
+### Minors, all addressed
+
+**`maxRedirects: Infinity` / `NaN` unbind the redirect loop.** `hop >= Infinity` and `hop >= NaN` are both always false, so an invalid value doesn't create an SSRF (every hop is still guard-checked) but does hang the loop. Added an up-front `Number.isFinite(maxRedirects) || maxRedirects < 0` rejection in `guardedFetch`, before the first `fetch` call — same shape as `@smos/model-gateway`'s existing `!Number.isFinite(result.costUsd) || result.costUsd < 0` guard on provider-supplied numeric input (`packages/model-gateway/src/gateway.ts`), matched for consistency as the reviewer asked.
+
+Real TDD here, not just a mutation-proof: the three new tests (`Infinity`, `-Infinity`, `NaN`) genuinely failed against the *unpatched* fix-round-1 code before this change existed:
+
+```
+× rejects maxRedirects: Infinity before ever calling fetch, instead of unbounding the loop
+  → promise resolved "Response { status: 200, ... }" instead of rejecting
+× rejects maxRedirects: -Infinity before ever calling fetch, instead of unbounding the loop
+  → promise resolved "Response { status: 200, ... }" instead of rejecting
+× rejects maxRedirects: NaN before ever calling fetch, instead of unbounding the loop
+  → promise resolved "Response { status: 200, ... }" instead of rejecting
+Tests  3 failed | 13 passed (16)
+```
+
+A fourth test (`maxRedirects: 0`) pins that 0 is still accepted as a legitimate "never follow redirects" value, so the fix isn't simply rejecting the boundary too.
+
+**Relative and protocol-relative `Location` had no test.** Added three: a path-relative `Location` (`/new`) resolves and is re-checked; a protocol-relative `Location` (`//cdn.example.com/asset`) resolves to an allowlisted host and succeeds; the same form to `//169.254.169.254/...` is refused. The underlying resolution (`new URL(location, currentUrl)`) already handled both correctly — these are pinning tests, not a code change. **Fail-first proof:** mutating the resolution to drop the base argument (`new URL(location).href`) failed all three:
+
+```
+× resolves a path-relative Location against the current URL and re-checks the resolved form
+× resolves a protocol-relative Location (//host/path) and allows it when the host is allowlisted
+× refuses a protocol-relative Location (//host/path) when the host is forbidden -- the commonest real-world redirect form
+Test Files  1 failed (1)   Tests  3 failed | 13 skipped (16)
+```
+
+**Over-large trailing octet (`127.99999999`) had no test.** This is a distinct code path from the already-tested `999.999.999.999` (that one fails the "any-but-last octet > 255" check; `127.99999999` only exercises the *last*-octet width check, `last >= maxLast`). Pinned because dropping that check turns a throw into a silently-computed address, which could be public-looking and therefore *allowed* — the worst direction a missing test can point. **Fail-first proof:** removing the `if (last >= maxLast) return null;` line:
+
+```
+× throws on an over-large trailing octet rather than silently wrapping it into some other address
+Test Files  1 failed (1)   Tests  1 failed | 79 skipped (80)
+```
+
+**`fbff::1` boundary test, for the fix-round-1 surviving `fc00::/6` mutant.** Added `does not over-block: fbff::1 sits just below fc00::/7 and must stay allowed`, asserting `assertEgressAllowed` does NOT throw for it. As both the reviewer and I noted, this does not kill the specific `/6` mutant (fbff's top 6 bits, `111110`, differ from fc00's, `111111`, so a `/6` widening doesn't catch it either) — its purpose is proving the range as shipped isn't over-broad at this boundary, in either direction, not pinning the exact prefix length. **Fail-first proof** (a mutation that *would* catch it, to show the test can fail): broadening to `fc00::/3`:
+
+```
+× does not over-block: fbff::1 sits just below fc00::/7 and must stay allowed
+Test Files  1 failed (1)   Tests  1 failed | 79 skipped (80)
+```
+
+**Duplicate `Location` headers had no test.** `Headers.get` joins repeated values with `", "` per the Fetch spec (verified empirically: two `Headers.append("location", ...)` calls produce `"https://a/x, https://b/y"` from `.get`). Confirmed this is not a bypass: `new URL(joined, currentUrl)` resolves the *whole* joined string as one URL, so its hostname is whichever value came first — the rest becomes an inert, percent-encoded path suffix (`https://graph.facebook.com/a,%20https://evil.test/b`, hostname `graph.facebook.com`). Added two tests recording this: first-value-allowed succeeds (against the real resolved URL, verified empirically before writing the test), first-value-forbidden is refused even if a later value would be allowed. Per the reviewer's instruction, the behavior itself was NOT changed — these tests exist so a future "helpful" rewrite (e.g. splitting on `,` and taking a different segment) has something to break. **Fail-first proof:** mutating the redirect-resolution to naively take the *last* comma-joined segment (`location.split(",").pop().trim()`) — a plausible-looking "fix" that is actually a real bypass direction, since it would let a blocked-first, allowed-second pair through:
+
+```
+× resolves to the FIRST duplicate value when it is allowed, treating the rest as an inert path suffix
+× refuses when the FIRST duplicate value is forbidden, even if a later value would be allowed
+Test Files  1 failed (1)   Tests  2 failed | 14 skipped (16)
+```
+
+### Mutation testing, final pass
+
+Same caveat as fix round 1: no mutation-testing tool exists in this repo and none was added (lockfile constraint). Re-verified by hand, not trusted from the earlier automated script (which fix round 1's report already flagged as having produced false positives from a shell mismatch). One genuine flake was caught and re-verified during this round too: an initial scripted run of the `maxRedirects` finiteness mutation reported "no tests" (a malformed-run artifact, not a real result); manually reproducing the identical mutation and running it directly through the same Bash-tool git-bash environment used throughout this task gave a clean, correct result (3 failed, 1 passed, 12 skipped) — trusted the manual run, discarded the scripted one, exactly as fix round 1's process required.
+
+**10 mutations targeted at every item in this round** (4 range deletions, the `/3` boundary broadening, the octet-width check, the `maxRedirects` finiteness check, the Location base-drop, the duplicate-Location last-segment take, and a re-check of fix round 1's redirect-bound off-by-one for regression): **10/10 killed**, each failing exactly the test(s) written for it and no others. Full suite green before and after every mutation was reverted (`packages/integrations`: 100/100 passing throughout).
+
+### Test count
+
+`packages/integrations`: 85 (end of fix round 1) → **100** (end of fix round 2): +6 pinning tests for the four IPv6 ranges and the `fbff::1`/octet boundaries in `egress.test.ts`, +9 in `guarded-fetch.test.ts` (3 `maxRedirects` non-finite + 1 `maxRedirects: 0` + 3 relative/protocol-relative `Location` + 2 duplicate-`Location`). All 100 pass; `typecheck`, `lint:secrets`, `lint:imports`, `lint:versions` all clean. No new dependency needed.
+
+### Existing tests modified (fix round 2)
+
+None. Every change this round either added a new test or added new, previously-missing validation code (`maxRedirects` finiteness) alongside its own new tests.
