@@ -95,6 +95,8 @@ describe("assertEgressAllowed", () => {
       ["IPv4-mapped metadata address", "::ffff:169.254.169.254"],
       ["NAT64 well-known prefix embedding loopback", "64:ff9b::7f00:1"],
       ["6to4 prefix embedding loopback", "2002:7f00:1::"],
+      ["deprecated IPv4-compatible form embedding loopback", "::127.0.0.1"],
+      ["deprecated IPv4-compatible form embedding metadata", "::169.254.169.254"],
     ])("refuses %s ([%s]) by extracting and checking the embedded IPv4", (_label, addr) => {
       expect(() => assertEgressAllowed(`https://[${addr}]/`, ALLOW)).toThrow(/blocked|internal/i);
     });

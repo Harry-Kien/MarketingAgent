@@ -219,6 +219,10 @@ const EMBEDDING_IPV6_PREFIXES: ReadonlyArray<readonly [string, number]> = [
   ["::ffff:0:0", 96], // IPv4-mapped
   ["64:ff9b::", 96], // NAT64 well-known prefix
   ["2002::", 16], // 6to4
+  ["::", 96], // deprecated IPv4-compatible (e.g. "::127.0.0.1" -> [::7f00:1]).
+  // Distinct from ::ffff:0:0/96 above: this matches only when bits 80-95
+  // are NOT 0xffff (an address can't satisfy both prefixes at once), so
+  // there is no double-handling of the same address.
 ];
 
 function extractEmbeddedIPv4(value: bigint, prefixLen: number): number | null {
