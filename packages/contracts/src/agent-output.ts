@@ -44,24 +44,54 @@ function strictObjectNoProto<Shape extends z.ZodRawShape>(shape: Shape) {
   return noProtoKey(z.strictObject(shape));
 }
 
-// Fix round 1, MINOR 4: U+200B (ZERO WIDTH SPACE) and its relatives are
-// Unicode category Cf ("format") -- invisible, but not part of the
-// WhiteSpace/LineTerminator productions ECMA-262's String#trim() strips.
-// A model (or a hostile page it read) could pad an otherwise-empty
-// publicationContent with only these and defeat the brief's
+// Fix round 1, MINOR 4 (and fix round 2's IMPORTANT finding, same bug class
+// in the opposite direction -- see requireNonBlank below): U+200B (ZERO
+// WIDTH SPACE) and its relatives are Unicode category Cf ("format") --
+// invisible, but not part of the WhiteSpace/LineTerminator productions
+// ECMA-262's String#trim() strips. A model (or a hostile page it read)
+// could pad an otherwise-empty string with only these and defeat a naive
 // `v.trim().length > 0` check. \p{Cf} in a Unicode-mode regex covers the
-// whole category, not just U+200B.
+// whole category, not just U+200B. Deliberately does NOT require the
+// string to be trimmed -- leading/trailing whitespace around real content
+// must still pass (see requireNonBlank's tests).
 //
-// Note on the database side: P1's content_version CHECK constraint uses
-// `~ '\S'` (PostgreSQL's ARE engine), whose `\s`/`\S` classes are ASCII
-// whitespace only -- Postgres does NOT treat U+200B as whitespace, so a
-// Cf-only string would pass that CHECK. This schema is therefore stricter
-// than the database for this one input class: it refuses something the
-// database alone would accept. That is the safe direction to diverge in
-// (fails closed, never lets through something the database would reject),
-// but T6 should not assume "passed the database CHECK" implies "passed this
-// schema" for content that never goes through parseAgentOutput.
+// Note on the database side: every P1 CHECK this pattern is compared
+// against (content_version.body, source_citation.excerpt -- see
+// requireNonBlank) uses `~ '\S'` (PostgreSQL's ARE engine), whose `\s`/`\S`
+// classes are ASCII whitespace only -- Postgres does NOT treat U+200B as
+// whitespace, so a Cf-only string would pass those CHECKs. This pattern is
+// therefore stricter than the database for that one input class: it
+// refuses something the database alone would accept. That is the safe
+// direction to diverge in (fails closed -- everything this pattern accepts
+// as non-blank, the database's `~ '\S'` also accepts as non-blank, since
+// ASCII whitespace is a subset of what \s+Cf both treat as blank; the
+// reverse is not required to hold and does not). See task-5-report.md,
+// "Fix round 2" for the audit of every string field against its column's
+// actual CHECK.
 const BLANK_PATTERN = /^[\s\p{Cf}]*$/u;
+
+/**
+ * Fix round 2, IMPORTANT: content_version.body and source_citation.excerpt
+ * both carry a `CHECK (x ~ '\S')` in P1's schema (infra/migrations/
+ * 0009_check_whitespace_hardening.sql, 0021_whitespace_hardening_gap.sql).
+ * `z.string().min(1)` (the brief's literal spec for these two fields) is a
+ * LENGTH check, not a blankness check -- a single space, or a tab+newline,
+ * both have length 1-2 and passed, but the database would refuse the
+ * insert. That is precisely the failure mode T5 exists to prevent: an
+ * invalid output should fail at this contract boundary, not later as a
+ * database error after the run has already done work.
+ *
+ * Reuses BLANK_PATTERN (whitespace + Cf) rather than a bare `~ '\S'`
+ * translation, which is at least as strict as the database's rule (see the
+ * note on BLANK_PATTERN above) -- "stricter is fine, never looser" per the
+ * rule applied uniformly across every field in this file that backs a
+ * checked column.
+ */
+function requireNonBlank(fieldName: string) {
+  return z.string().refine((v) => !BLANK_PATTERN.test(v), {
+    message: `${fieldName} must not be blank`,
+  });
+}
 
 // Fix round 1, IMPORTANT 2: citation urls are model-supplied text that a
 // founder may click directly from the UI. z.string().url() (the brief's
@@ -69,6 +99,13 @@ const BLANK_PATTERN = /^[\s\p{Cf}]*$/u;
 // not restrict the scheme, so "javascript:", "data:", and "file:" all
 // passed. Restricted to http/https at the schema level (not a .refine
 // bolted on afterwards) via z.url()'s own `protocol` option.
+//
+// Backs source_citation.url, which separately carries `CHECK (url ~ '\S')`
+// (infra/migrations/0021_whitespace_hardening_gap.sql). Already strictly
+// stronger: every string this schema accepts is a syntactically valid
+// http(s) URL, which by construction always contains at least one
+// non-whitespace character -- there is no valid http(s) URL made only of
+// whitespace/Cf characters. No separate blankness check needed here.
 const httpUrlSchema = z.url({ protocol: /^https?$/ });
 
 // Same shape as SourceCitation's public fields (packages/domain/src/
@@ -78,12 +115,18 @@ const httpUrlSchema = z.url({ protocol: /^https?$/ });
 const agentCitationSchema = strictObjectNoProto({
   url: httpUrlSchema,
   accessedAt: z.string().datetime(),
-  excerpt: z.string().min(1),
+  // Backs source_citation.excerpt, CHECK (excerpt ~ '\S'). See
+  // requireNonBlank's doc comment (fix round 2).
+  excerpt: requireNonBlank("excerpt"),
 });
 
 export const researchOutputSchema = strictObjectNoProto({
   findings: z.array(
     strictObjectNoProto({
+      // No column backs `claim` yet (T6 adds the finding table). Left as
+      // length-only per the brief -- min(1) is not "looser than a column"
+      // when there is no column to compare against. See task-5-report.md,
+      // "Fix round 2" audit table.
       claim: z.string().min(1),
       // Reuses domain's single source of truth for the allowed values
       // instead of redeclaring a second list that could drift from it.
@@ -94,20 +137,35 @@ export const researchOutputSchema = strictObjectNoProto({
 });
 
 export const contentOutputSchema = strictObjectNoProto({
-  body: z.string().min(1),
-  publicationContent: z.string().refine((v) => !BLANK_PATTERN.test(v), {
-    message: "publicationContent must not be blank",
-  }),
+  // Backs content_version.body, CHECK (body ~ '\S'). See requireNonBlank's
+  // doc comment (fix round 2).
+  body: requireNonBlank("body"),
+  // Backs content_version.publication_content, which is nullable and has NO
+  // CHECK constraint at all in P1's schema -- there is nothing to disagree
+  // with here, so this being stricter than "no constraint" is simply extra
+  // safety, not a database-divergence case like `body`/`excerpt` above.
+  publicationContent: requireNonBlank("publicationContent"),
+  // No column backs this yet (T6 adds the tables that would); left as a
+  // bare array of strings per the brief, with no per-item constraint. See
+  // task-5-report.md, "Fix round 2" audit table.
   claimsUsed: z.array(z.string()),
 });
 
 export const qaOutputSchema = strictObjectNoProto({
   verdict: z.enum(["pass", "block"]),
-  /** Display and veto signal only. Never a permission input (invariant 4). */
+  /**
+   * Display and veto signal only. Never a permission input (invariant 4).
+   * Backs content_version.quality_score, `CHECK (quality_score BETWEEN 0
+   * AND 100)` -- an exact match, not a string field, so it is outside fix
+   * round 2's blankness audit but included in task-5-report.md's table for
+   * completeness.
+   */
   qualityScore: z.number().int().min(0).max(100),
   findings: z.array(
     strictObjectNoProto({
       severity: z.enum(["info", "warn", "block"]),
+      // No column backs `message` yet (T6 adds the qa-finding table). Same
+      // reasoning as researchOutputSchema's `claim` above.
       message: z.string().min(1),
     }),
   ),

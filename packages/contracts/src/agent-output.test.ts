@@ -51,6 +51,31 @@ describe("researchOutputSchema", () => {
     });
     expect(parseAgentOutput(researchOutputSchema, good).findings).toHaveLength(1);
   });
+
+  // Fix round 2, IMPORTANT (new) -- citation excerpt backs source_citation.excerpt,
+  // which carries `CHECK (excerpt ~ '\S')` (infra/migrations/0021_whitespace_
+  // hardening_gap.sql). z.string().min(1) is a LENGTH check, not a blankness
+  // check -- a single space has length 1 and passed.
+  it("rejects a citation excerpt of a single space", () => {
+    const bad = JSON.stringify({
+      findings: [{ claim: "c", verificationStatus: "INFERRED", citations: [{ ...goodCitation, excerpt: " " }] }],
+    });
+    expect(() => parseAgentOutput(researchOutputSchema, bad)).toThrow(/excerpt/i);
+  });
+  it("rejects a citation excerpt of tab+newline only", () => {
+    const bad = JSON.stringify({
+      findings: [{ claim: "c", verificationStatus: "INFERRED", citations: [{ ...goodCitation, excerpt: "\t\n" }] }],
+    });
+    expect(() => parseAgentOutput(researchOutputSchema, bad)).toThrow(/excerpt/i);
+  });
+  it("accepts a citation excerpt with leading/trailing whitespace around real text", () => {
+    // `~ '\S'` requires one non-space character ANYWHERE, not a trimmed
+    // string -- must not over-tighten into rejecting valid padded content.
+    const good = JSON.stringify({
+      findings: [{ claim: "c", verificationStatus: "INFERRED", citations: [{ ...goodCitation, excerpt: "  real excerpt text  " }] }],
+    });
+    expect(parseAgentOutput(researchOutputSchema, good).findings).toHaveLength(1);
+  });
 });
 
 describe("contentOutputSchema", () => {
@@ -72,6 +97,29 @@ describe("contentOutputSchema", () => {
     const zeroWidthOnly = ZERO_WIDTH_SPACE.repeat(3); // no ASCII whitespace at all
     const bad = JSON.stringify({ body: "b", publicationContent: zeroWidthOnly, claimsUsed: [] });
     expect(() => parseAgentOutput(contentOutputSchema, bad)).toThrow(/publicationContent/i);
+  });
+
+  // Fix round 2, IMPORTANT (new) -- body backs content_version.body, which
+  // carries `CHECK (body ~ '\S')` (infra/migrations/0009_check_whitespace_
+  // hardening.sql). z.string().min(1) is a LENGTH check, not a blankness
+  // check -- a single space, or a tab+newline, both have length > 0 and
+  // passed, but the database would reject the insert. A blank body that
+  // passes this schema is exactly the case T5 exists to prevent: it should
+  // fail here, at the contract boundary, not later as a database error
+  // after the run has already done work.
+  it("rejects body of a single space", () => {
+    const bad = JSON.stringify({ body: " ", publicationContent: "p", claimsUsed: [] });
+    expect(() => parseAgentOutput(contentOutputSchema, bad)).toThrow(/body/i);
+  });
+  it("rejects body of tab+newline only", () => {
+    const bad = JSON.stringify({ body: "\t\n", publicationContent: "p", claimsUsed: [] });
+    expect(() => parseAgentOutput(contentOutputSchema, bad)).toThrow(/body/i);
+  });
+  it("accepts body with leading/trailing whitespace around real text", () => {
+    // `~ '\S'` requires one non-space character ANYWHERE, not a trimmed
+    // string -- must not over-tighten into rejecting valid padded content.
+    const good = JSON.stringify({ body: "  real content  ", publicationContent: "p", claimsUsed: [] });
+    expect(parseAgentOutput(contentOutputSchema, good).body).toBe("  real content  ");
   });
 });
 
