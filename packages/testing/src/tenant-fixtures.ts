@@ -2,13 +2,15 @@ import type pg from "pg";
 import { newId, type Id } from "@smos/domain";
 
 /**
- * One fully-populated workspace: one row in every workspace-owned table this
- * milestone has added (goal, campaign, content_item, content_version,
- * source_citation, approval_request, approval_decision, publication,
- * agent_definition, agent_version, outbox, audit_log), wired together with
- * real, valid foreign keys. Used by packages/db/src/cross-tenant.test.ts
- * (E8/E14) as the "known-good" row set for both workspace A and workspace B,
- * so isolation can be proven against real data rather than empty tables.
+ * One fully-populated workspace: one row in every workspace-owned table any
+ * P1 or P2 task has added so far (goal, campaign, content_item,
+ * content_version, source_citation, approval_request, approval_decision,
+ * publication, agent_definition, agent_version, outbox, audit_log, and --
+ * added by P2 task 6 -- agent_run, tool_call, run_checkpoint), wired
+ * together with real, valid foreign keys. Used by
+ * packages/db/src/cross-tenant.test.ts (E8/E14) as the "known-good" row set
+ * for both workspace A and workspace B, so isolation can be proven against
+ * real data rather than empty tables.
  */
 export interface TenantFixture {
   workspaceId: Id;
@@ -25,6 +27,9 @@ export interface TenantFixture {
   outboxId: Id;
   auditLogId: Id;
   publicationId: Id;
+  agentRunId: Id;
+  toolCallId: Id;
+  runCheckpointId: Id;
 }
 
 async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixture> {
@@ -42,6 +47,9 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
   const outboxId = newId();
   const auditLogId = newId();
   const publicationId = newId();
+  const agentRunId = newId();
+  const toolCallId = newId();
+  const runCheckpointId = newId();
 
   // Seeded directly as the connecting (superuser) role, which always bypasses
   // RLS -- these rows exist to be *subjects* of the isolation proof, not to
@@ -123,6 +131,23 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
     `insert into audit_log (id, workspace_id, event_type, actor_kind) values ($1, $2, 'e12.seed.audit', 'system')`,
     [auditLogId, workspaceId],
   );
+  // P2 task 6: agent_run.agent_version_id -> agent_version and
+  // agent_run.campaign_id -> campaign are both composite tenant FKs, so this
+  // run reuses the agentVersionId/campaignId already seeded above rather
+  // than a fresh, unrelated pair.
+  await client.query(
+    `insert into agent_run (id, workspace_id, agent_version_id, campaign_id, state, prompt_version, model_version)
+     values ($1, $2, $3, $4, 'pending', 'e12-seed-prompt', 'e12-seed-model')`,
+    [agentRunId, workspaceId, agentVersionId, campaignId],
+  );
+  await client.query(
+    `insert into tool_call (id, workspace_id, agent_run_id, tool_name, allowed) values ($1, $2, $3, 'e12_seed_tool', true)`,
+    [toolCallId, workspaceId, agentRunId],
+  );
+  await client.query(
+    `insert into run_checkpoint (id, workspace_id, agent_run_id, step_name) values ($1, $2, $3, 'e12_seed_step')`,
+    [runCheckpointId, workspaceId, agentRunId],
+  );
 
   return {
     workspaceId,
@@ -139,6 +164,9 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
     outboxId,
     auditLogId,
     publicationId,
+    agentRunId,
+    toolCallId,
+    runCheckpointId,
   };
 }
 

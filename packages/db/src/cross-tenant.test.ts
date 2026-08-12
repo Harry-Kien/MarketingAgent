@@ -155,13 +155,18 @@ const FK_PAIRS = await discoverTenantToTenantFks(TENANT_TABLES);
 // table or a composite tenant-to-tenant foreign key -- never as a side
 // effect of something else, and never "just to make the suite pass" without
 // first confirming the underlying schema change is intentional.
+// P2 task 6 adds agent_run, tool_call, run_checkpoint -- updated in the same
+// commit as infra/migrations/0024_agent_run.sql per this list's own rule
+// above.
 const EXPECTED_TENANT_TABLES = [
-  "agent_definition", "agent_version", "approval_decision", "approval_request",
+  "agent_definition", "agent_run", "agent_version", "approval_decision", "approval_request",
   "audit_log", "campaign", "content_item", "content_version", "goal",
-  "outbox", "publication", "source_citation",
+  "outbox", "publication", "run_checkpoint", "source_citation", "tool_call",
 ].toSorted();
 
 const EXPECTED_FK_PAIRS = [
+  "agent_run->agent_version",
+  "agent_run->campaign",
   "agent_version->agent_definition",
   "approval_decision->approval_request",
   "approval_request->campaign",
@@ -172,7 +177,9 @@ const EXPECTED_FK_PAIRS = [
   "publication->approval_decision",
   "publication->campaign",
   "publication->content_version",
+  "run_checkpoint->agent_run",
   "source_citation->content_version",
+  "tool_call->agent_run",
 ].toSorted();
 
 let a: TenantFixture;
@@ -198,6 +205,14 @@ afterAll(async () => {
   // removed here so this suite's own footprint is at least bounded to what
   // the schema actually allows.
   for (const ws of [a, b].filter((w): w is TenantFixture => w !== undefined)) {
+    // P2 task 6: tool_call and run_checkpoint reference agent_run, and
+    // agent_run itself references agent_version -- children must be deleted
+    // before their parents or the FK refuses the delete (silently, via the
+    // .catch below, which would otherwise leak agent_version/agent_definition
+    // rows across runs instead of actually cleaning them up).
+    await adminPool.query("delete from tool_call where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
+    await adminPool.query("delete from run_checkpoint where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
+    await adminPool.query("delete from agent_run where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
     await adminPool.query("delete from agent_version where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
     await adminPool.query("delete from agent_definition where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
     await adminPool.query("delete from outbox where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
@@ -320,6 +335,24 @@ function buildProbeRow(table: string, ws: TenantFixture, id: string): { columns:
         columns: ["id", "workspace_id", "event_type", "actor_kind"],
         cells: [{ value: id }, { value: ws.workspaceId }, { value: "e12.probe.audit" }, { value: "system" }],
       };
+    case "agent_run":
+      return {
+        columns: ["id", "workspace_id", "agent_version_id", "campaign_id", "state", "prompt_version", "model_version"],
+        cells: [
+          { value: id }, { value: ws.workspaceId }, { value: ws.agentVersionId }, { value: ws.campaignId },
+          { value: "pending" }, { value: "e12-probe-prompt" }, { value: "e12-probe-model" },
+        ],
+      };
+    case "tool_call":
+      return {
+        columns: ["id", "workspace_id", "agent_run_id", "tool_name", "allowed"],
+        cells: [{ value: id }, { value: ws.workspaceId }, { value: ws.agentRunId }, { value: "e12_probe_tool" }, { value: true }],
+      };
+    case "run_checkpoint":
+      return {
+        columns: ["id", "workspace_id", "agent_run_id", "step_name"],
+        cells: [{ value: id }, { value: ws.workspaceId }, { value: ws.agentRunId }, { value: `e12-probe-step-${id}` }],
+      };
     default:
       // Fails loudly rather than silently skipping: a table discovered from
       // the catalog with no probe-row builder here would otherwise pass this
@@ -350,6 +383,8 @@ function fixtureIdForColumn(ws: TenantFixture, column: string): string {
     approval_request_id: "approvalRequestId",
     approval_decision_id: "approvalDecisionId",
     agent_definition_id: "agentDefinitionId",
+    agent_version_id: "agentVersionId",
+    agent_run_id: "agentRunId",
   };
   const key = map[column];
   if (!key) {
