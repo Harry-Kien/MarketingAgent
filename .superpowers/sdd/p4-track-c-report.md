@@ -349,3 +349,104 @@ Same caveat as fix round 1: no mutation-testing tool exists in this repo and non
 ### Existing tests modified (fix round 2)
 
 None. Every change this round either added a new test or added new, previously-missing validation code (`maxRedirects` finiteness) alongside its own new tests.
+
+---
+
+## Task 4 — Fake Meta server and typed adapter (E5)
+
+Files: `packages/integrations/src/meta/fake-server.ts`, `src/meta/client.ts`, test `src/meta/contract.test.ts`. `src/index.ts` gained two export lines for the new public surface (`startFakeMetaServer`, `createMetaAdapter`).
+
+### A necessary deviation from the plan's literal design, disclosed up front
+
+The plan's own Task 4 example test used `allowedHosts: ["127.0.0.1"]` with a `baseUrl` implied to come from a real `node:http` listener ("fake-server.ts dùng node:http"). Both are incompatible with `assertEgressAllowed`/`assertResolvedAddressAllowed` as actually built and approved in Tasks 1-2: the guard requires `https:` unconditionally, and blocks the *entire* 127.0.0.0/8 loopback range unconditionally, **before it even consults `allowedHosts`**. A real server bound to `127.0.0.1`, reached through the (correctly) unweakened guard, cannot pass on any protocol -- the plan's own literal example would fail every single test, including the successful-publish one, if implemented as written.
+
+Given the hard constraints (no real outbound network request ever, adapter must route every call through `guardedFetch`, no new dependency, guard must not be weakened), I did not stand up a real socket at all. `startFakeMetaServer()` is genuinely in-process -- exactly what the task brief explicitly permits ("a local in-process or localhost fake"). It returns a synthetic, domain-name-shaped base URL (`https://sandbox.meta.test`, using the IANA-reserved `.test` TLD, RFC 2606) that is never dialed, plus an injectable `fetchImpl: FetchLike` -- the exact same extension point `guardedFetch` itself already exposed in Task 2 ("`fetchImpl`... exists so tests can drive this with a local fake instead of a real socket"), just threaded one level up. `createMetaAdapter(cfg, fetchImpl = fetch)` takes `fetchImpl` as an additive, optional second parameter; production use (a real `baseUrl: "https://graph.facebook.com"`) never has to touch it and gets the real global `fetch`, unchanged. Because `sandbox.meta.test` is a domain name, not an IP literal, it takes the same "plain domain name, not checked" pass-through through `assertResolvedAddressAllowed` that a real `graph.facebook.com` call would -- so the https-only check, the userinfo check, and the allowlist check are all still genuinely exercised end to end; only the (intentionally out-of-scope, already-disclosed) IP-resolution check is a no-op, exactly as it would be for any real domain.
+
+I considered standing up a real `node:https` listener with a self-signed certificate instead (empirically verified this works when `NODE_EXTRA_CA_CERTS` is set *before* the Node process starts -- confirmed with a throwaway script and `openssl`-generated cert/key) and rejected it: it only works if the test *launcher* sets that env var externally (setting it mid-process, after Node has already bootstrapped its TLS trust store, verifiably does **not** work -- I confirmed this fails with `self-signed certificate` before finding the working form), which is a fragile, undocumented precondition on however `vitest` gets invoked later. The in-process design has no such precondition and is structurally incapable of a real network call, which is a stronger guarantee for a "never touches the network" requirement than "we remembered to disable cert checking correctly."
+
+### TDD evidence
+
+**Failing run** (before `fake-server.ts`/`client.ts` existed):
+```
+Cannot find module './fake-server.ts' imported from D:/MA-p4/packages/integrations/src/meta/contract.test.ts
+Test Files  1 failed (1)
+     Tests  no tests
+```
+
+**Passing run after first implementation:** 18/18 (`npx vitest run packages/integrations/src/meta/contract.test.ts`).
+
+**Two more failing-first rounds during adversarial self-review** (see below), both fixed:
+1. A malformed `Retry-After` header (`"not-a-number"`) produced `retryAfterMs: NaN` on an `AdapterError`:
+   ```
+   AssertionError: expected NaN to be undefined
+     at contract.test.ts:225:48
+   ```
+   Fixed by requiring `Number.isFinite(retryAfterSeconds)` before setting `retryAfterMs` at all (`client.ts`), rather than ever emitting NaN as a "retry hint" a downstream scheduler (Task 5, out of scope here) could misread as "retry immediately, forever."
+2. A distinctly-*invalid* (not merely expired) token silently succeeded instead of failing:
+   ```
+   Error: promise resolved "{ externalId: 'page-1_1', ... }" instead of rejecting
+     at contract.test.ts:96:44
+   ```
+   Fixed by adding a `token === "invalid"` (and empty-token) branch in `fake-server.ts` alongside `"expired"`, both mapping to the same real-world OAuthException 190 / `auth_expired`, since Meta's wire format has no separate signal to distinguish "expired" from "never valid."
+
+**Final run:** `packages/integrations` full suite (`egress.test.ts`, `errors.test.ts`, `guarded-fetch.test.ts`, `meta/contract.test.ts`): **120/120 passing**, 25/25 test files, across 4 files. `npx tsc --noEmit -p packages/integrations/tsconfig.json`: **no errors** (two `exactOptionalPropertyTypes` errors found and fixed along the way -- `body: string | undefined` and `retryAfterMs: number | undefined` both needed to be *omitted* rather than explicitly set to `undefined`, since the target types don't accept the widened form under this repo's strict tsconfig).
+
+Non-DB static gates re-run against the final, staged state: `lint:imports` (109 files, ok), `lint:secrets` (150 files, ok), `lint:scope` (220 files, ok), `lint:versions` (12 manifests, ok), `lint:purity` (17 files, ok), `lint:migrations` (28 files, ok). `npm run verify` was **not** run (forbidden by this task's brief -- shared PostgreSQL on port 5433 across three concurrent worktrees).
+
+### Full error-response -> `ERROR_KINDS` mapping table
+
+| Scenario | HTTP status | Graph-shaped error | `ErrorKind` | `retryable` | Notes |
+|---|---|---|---|---|---|
+| Successful publish | 200 | `{ id, requestId }` | -- | -- | Idempotency-keyed replay returns the same `id`, never creates a second post |
+| Rate limited, with retry hint | 429 | `error.code 4`, `type OAuthException`, `Retry-After: 5` header | `rate_limited` | **true** | `retryAfterMs = 5000`, taken from the header |
+| Rate limited, malformed hint | 429 | same, `Retry-After: not-a-number` | `rate_limited` | **true** | `retryAfterMs` **omitted**, never `NaN` (fixed during self-review) |
+| Expired token | 401 | `error.code 190`, `type OAuthException`, token echoed into message | `auth_expired` | false | Message deliberately echoes the raw token (realistic Meta behaviour, see `errors.ts`) to exercise redaction for real |
+| Invalid (never-valid) token | 401 | same code 190 | `auth_expired` | false | No separate wire signal for "invalid" vs "expired" in real Meta; both map the same way |
+| Blank/whitespace-only content | 400 | `error.code 100`, `type GraphMethodException` | `invalid_input` | false | Checked after auth/account routing, before any post is created |
+| Quota/spend limit reached | 403 | `error.code 80004`, `type OAuthException` | `quota_exceeded` | false | |
+| Transient upstream outage | 503 | `error.code 2`, `type OAuthException` | `upstream_unavailable` | **true** | Any `>= 500` maps the same way |
+| Malformed / non-JSON body | 200 (misleading `content-type: application/json`, unparseable text) | -- | `upstream_unavailable` | **true** | Never read as a fake success; JSON-parse failure short-circuits before the `response.ok` check even runs |
+| Slow response / timeout | (never arrives within `timeoutMs`) | -- | `upstream_unavailable` | **true** | Adapter-side `AbortSignal.timeout`; fake server delays 200ms, test uses `timeoutMs: 20` and asserts total wall time `< 150ms`, proving the timeout -- not luck -- won the race |
+| Redirect to a blocked/internal address | 302, `Location: https://169.254.169.254/...` | -- | `permanent_rejection` | false | Never followed: `guardedFetch` re-runs the full guard on the `Location` header and throws before a second `fetchImpl` call is made (proved via a call-counter: exactly 1 call) |
+| Any other non-2xx (e.g. object not found) | 404 | `error.code 100`, `type GraphMethodException` | `permanent_rejection` | false | Catch-all: nothing about a 404 is "wait and retry" or "fix input and resubmit" |
+| Host not on `allowedHosts` | (never sent) | -- | `permanent_rejection` (wrapped from the guard's own `Error`) | false | Guard throws before any `fetchImpl` call (0 calls, proved) |
+| Downgraded `http://` baseUrl | (never sent) | -- | `permanent_rejection` (wrapped) | false | Guard's protocol check throws before any `fetchImpl` call (0 calls, proved) |
+
+### Adversarial self-review attempts and outcomes
+
+| Attempt | Outcome |
+|---|---|
+| Contact a host not on `allowedHosts` | **Blocked.** `assertEgressAllowed`'s allowlist check throws before `guardedFetch` ever calls `fetchImpl`; instrumented with a call-counting `fetchImpl` wrapper and asserted `calls === 0`. |
+| Follow a redirect (`page-redirect-trap`, `Location: https://169.254.169.254/...`) to a blocked, cloud-metadata-shaped address | **Blocked.** `guardedFetch` re-runs the full guard on the resolved `Location` before ever calling `fetchImpl` a second time; call-counter proves exactly 1 call was made (the initial request that returned the 302), never a second one to the forbidden address. |
+| Downgrade to `http://` on an otherwise-legitimate, allowlisted host | **Blocked.** Protocol check in `assertEgressAllowed` runs first and throws before any `fetchImpl` call; 0 calls proved. |
+| Make the adapter retry a retryable-kind failure (`rate_limited`) on its own | **Confirmed it never does.** `publish()` makes exactly one `callGraph` call, which makes exactly one `guardedFetch`/`fetchImpl` call; instrumented and asserted `calls === 1` even though the resulting error is `retryable: true`. `retryable` is a hint for a caller's retry policy (Task 5, out of scope here), never permission for the adapter itself to retry -- matches the plan's own global constraint ("Publish thất bại ⇒ failed, không auto-retry với side effect ra ngoài"). |
+| Surface a secret in an error path | **No leak, proven against a message that actually contained one.** Forced a deterministic error (`page-rate-limited`, always 429s regardless of token) with a secret-shaped token (`EAAsupersecretvalue...`) that the fake server echoes into its raw error message (realistic Meta behaviour). Asserted `err.message` **does** contain the secret (proving the redaction had real work to do, not that there was nothing to redact) and `err.safeMessage` does **not**. |
+| Surface a secret in a successful publish's evidence | **No leak.** Successful publish with a secret-shaped token; asserted `JSON.stringify(result.evidence)` never contains it -- `evidence` only ever carries `{ requestId, status }`, both server-generated, never echoing `cfg.token`. |
+| Surface a secret via a log line | **Not applicable / no leak by construction.** Neither `client.ts` nor `fake-server.ts` calls any logger; the only place `cfg.token` is ever placed is the `Authorization` request header (never read back into an error message by the client itself) and, in the fake server's deliberately-adversarial echo scenarios, the response body text -- which flows into `AdapterError`'s constructor exactly like any other provider message and is redacted the same way. |
+| Manufacture a `NaN` retry hint via a malformed `Retry-After` header | **Found by self-review, fixed with a failing test first** (see TDD evidence above). `retryAfterMs` is now omitted rather than set to `NaN` when the header doesn't parse to a finite number. |
+| Get a fake success out of a non-JSON 200 response | **Blocked.** `page-malformed` returns `200` with `content-type: application/json` but an unparseable body; `JSON.parse` failure throws `upstream_unavailable` before the `response.ok` short-circuit is ever reached, so a `200` status alone cannot produce a `PublishResult`. |
+| Get a fake success with no `id` in an otherwise-well-formed 200 response | **Blocked by construction, not separately tested.** `publish()` explicitly checks `typeof record?.id !== "string" || record.id === ""` and throws `upstream_unavailable` rather than returning `externalId: undefined`. Every scripted success path in the fake server always sets `id`, so this exact branch isn't exercised by the committed suite -- disclosed as untested-but-present defensive code, not a gap in the adapter's own guarantee. |
+
+### Boundaries intentionally left to Task 5 (out of scope here)
+
+- **Approval gating.** The plan's global constraint ("Adapter không được gọi nếu thiếu `ApprovalDecision` hoặc hash nội dung lệch bản đã duyệt") is a caller-side responsibility. `ChannelAdapter.publish` takes `contentHash` as an opaque string in `PublishInput` and never checks it against a stored approved hash -- it has no access to approval state at all. This must be enforced by Task 5's publish handler before it ever calls `adapter.publish(...)`, per the plan's own File Structure Map (`apps/worker/src/handlers/publish.ts` owns `handlePublish`).
+- **No auto-retry with side effects.** Confirmed above that the adapter itself never retries; a retry policy acting on `retryable`/`retryAfterMs` is Task 5's job.
+- **DNS rebinding and single-hop redirect scope.** Both are the same accepted, disclosed gaps from Tasks 1-2's egress guard (CARRY-FORWARD.md) -- this adapter does not attempt to close them, and doesn't need to for the in-process fake, since no real DNS resolution or real redirect ever happens here.
+
+### Existing tests modified
+
+None. No file outside `packages/integrations/src/meta/` and the two new export lines in `packages/integrations/src/index.ts` was touched. No existing test in the repository was weakened, deleted, or had its assertions loosened.
+
+### Task 3 (database)
+
+Not touched, and not needed. `createMetaAdapter`/`startFakeMetaServer` never import `@smos/db`, never reference `integration`/`credential_reference`/`event`/`metric`, and never open a PostgreSQL connection. Nothing in Task 4 required the tables Task 3 owns.
+
+### New dependencies
+
+None. Everything used (`fetch`, `Response`, `Headers`, `URL`, `DOMException`, `AbortSignal.timeout`) is a Node/web-platform global already relied on by Tasks 1-2's own code (`guarded-fetch.ts`, `guarded-fetch.test.ts`). `package.json`/`package-lock.json` are untouched (verified with `git diff --stat`).
+
+### Uncertain / worth a second look
+
+- The plan's literal Task 4 test fixture (`allowedHosts: ["127.0.0.1"]`, implied real `node:http` server) cannot work against the guard as actually built, for reasons explained above. Whoever wrote or reviews the plan against the delivered guard should confirm this deviation (in-process fake, domain-name-shaped synthetic host, injectable `fetchImpl`) is the intended resolution, not just a implementer's workaround.
+- `createMetaAdapter`'s `fetchImpl` parameter is a new, adapter-level injection point (distinct from `guardedFetch`'s own, which it wraps). If a later task wires this adapter into `apps/worker`, the production call site should simply omit the second argument (defaults to real `fetch`) -- flagging so nobody accidentally wires the fake in outside tests.
+- The "no `id` in an otherwise-200 response" defensive branch in `publish()` is untested (see adversarial table above) -- every fake-server success path always sets `id`, so nothing in the committed suite exercises that specific line. Low risk (fails closed to `upstream_unavailable` either way) but noted for completeness.
