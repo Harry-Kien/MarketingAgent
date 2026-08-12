@@ -241,3 +241,25 @@ describe("permanent false-positive regression suite (fix round 2)", () => {
     expect(findBannedVisuals(FALSE_POSITIVE_FIXTURE)).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Fix round 3: a `//` inside an ordinary string (not just after a URL
+// scheme's `:`) blanked the rest of its line via the shared stripComments,
+// and a TSX generic component tag (`<Select<string> ...>`) truncated the
+// shared scanTags tokenizer -- both affect C2 too, since findArchivoMiddot
+// uses both.
+// ---------------------------------------------------------------------------
+
+describe("C2 middot -- // inside an ordinary string is not a comment (fix round 3)", () => {
+  it("still flags a middot after a font-display element carrying a // in a plain string attribute", () => {
+    const src = `<span className="font-display" data-note="a // b">Đã đăng · Bị chặn</span>`;
+    expect(findArchivoMiddot(src)).toHaveLength(1);
+  });
+});
+
+describe("C2 middot -- TSX generic component tags are not truncated (fix round 3)", () => {
+  it("still flags a middot inside a generic component's font-display child", () => {
+    const src = `<Card<Props> className="font-display">Đã đăng · Bị chặn</Card>`;
+    expect(findArchivoMiddot(src)).toHaveLength(1);
+  });
+});

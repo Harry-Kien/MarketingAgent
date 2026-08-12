@@ -12,6 +12,24 @@
 // findArchivoMiddot's nesting (fix round 1) and the i18n guard's attribute
 // extraction (reported against it in fix round 2) using one implementation
 // instead of two independently-drifting ones.
+//
+// Fix round 3: a TSX generic component instantiation -- `<Select<string>
+// placeholder="..." />` -- was invisible too, for a related reason: the tag
+// NAME regex stops at the second `<` (not a name character), so the
+// closing-`>`search started scanning from inside the generic argument list
+// itself and stopped at the FIRST `>` it found there, treating
+// `<Select<string>` as a complete (and wrong) tag with every attribute
+// after it left as unmatched trailing text. `GENERIC_ARGS` greedily
+// consumes a leading `<...>` run right after the name -- including nested
+// levels and any extra immediately-trailing `>` characters -- as part of
+// the tag's prefix before the real attribute/closing-bracket search
+// begins. This is deliberately permissive, not a precise type-parameter
+// parser: matching `>>`/`>>>` against the right nesting level is a genuine
+// ambiguity even real TypeScript parsers special-case, and getting it
+// exactly right is out of proportion for a lint scanner whose job is just
+// to not lose the attribute list that follows.
+const GENERIC_ARGS = /^<[^<>]*(?:<[^<>]*>[^<>]*)*>+/;
+
 export function scanTags(source) {
   const tokens = [];
   const n = source.length;
@@ -30,6 +48,10 @@ export function scanTags(source) {
         if (nameMatch) {
           const tagStart = i;
           let j = i + nameMatch[0].length;
+          if (source[j] === "<") {
+            const genericMatch = GENERIC_ARGS.exec(source.slice(j));
+            if (genericMatch) j += genericMatch[0].length;
+          }
           let depth = 0;
           let closedAt = -1;
           while (j < n) {

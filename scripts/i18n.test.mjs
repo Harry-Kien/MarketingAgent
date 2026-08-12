@@ -127,3 +127,32 @@ describe("permanent false-positive regression suite (fix round 2)", () => {
     expect(findHardcodedVietnamese(FALSE_POSITIVE_FIXTURE)).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Fix round 3: a `//` inside an ordinary string value (not just after a URL
+// scheme's `:`) blanked the rest of the line -- swallowing every attribute
+// after it, not just the string itself -- and a TSX generic component
+// instantiation truncated the tag scan entirely, hiding every attribute.
+// ---------------------------------------------------------------------------
+
+describe("findHardcodedVietnamese -- // inside an ordinary string is not a comment (fix round 3)", () => {
+  it("flags aria-label on an element that also carries an https:// href", () => {
+    const src = `<a href="https://example.com" aria-label="Mở trang chiến dịch">x</a>`;
+    expect(findHardcodedVietnamese(src).length).toBeGreaterThan(0);
+  });
+  it("still ignores a genuine // comment containing Vietnamese", () => {
+    const src = "// bình luận chứa tiếng Việt\nexport function X() { return null; }";
+    expect(findHardcodedVietnamese(src)).toEqual([]);
+  });
+});
+
+describe("findHardcodedVietnamese -- TSX generic component tags are not truncated (fix round 3)", () => {
+  it("flags a hard-coded placeholder on a single-level generic component", () => {
+    const src = `<Select<string> placeholder="Nhập tên chiến dịch" />`;
+    expect(findHardcodedVietnamese(src).length).toBeGreaterThan(0);
+  });
+  it("flags a hard-coded placeholder on a nested generic component", () => {
+    const src = `<Foo<Bar<T>>> placeholder="Nhập tên chiến dịch" />`;
+    expect(findHardcodedVietnamese(src).length).toBeGreaterThan(0);
+  });
+});

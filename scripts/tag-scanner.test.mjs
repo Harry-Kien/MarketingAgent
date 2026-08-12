@@ -31,4 +31,31 @@ describe("scanTags", () => {
     expect(tokens).toHaveLength(1);
     expect(tokens[0].selfClosing).toBe(true);
   });
+
+  // ---------------------------------------------------------------------------
+  // Fix round 3: a TSX generic component instantiation -- `<Select<string> />`
+  // -- was not recognised at all. The name-match regex stops at the second
+  // `<` (it isn't a name character), so the depth-tracking loop that looks
+  // for the tag's real closing `>` started scanning from inside the generic
+  // argument list itself, found the FIRST `>` (closing the generic, not the
+  // tag), and treated `<Select<string>` as a complete tag with everything
+  // after it -- including every attribute -- left as unmatched trailing text.
+  // ---------------------------------------------------------------------------
+  it("carries a single-level generic argument list as part of the tag, not a truncation point", () => {
+    const src = `<Select<string> placeholder="Nhập tên chiến dịch" />`;
+    const tokens = scanTags(src);
+    const open = tokens.find((t) => t.kind === "open");
+    expect(open).toBeDefined();
+    expect(open.attrs).toContain(`placeholder="Nhập tên chiến dịch"`);
+    expect(open.selfClosing).toBe(true);
+  });
+
+  it("carries a nested generic argument list (<Foo<Bar<T>>>) as part of the tag", () => {
+    const src = `<Foo<Bar<T>>> placeholder="Nhập tên chiến dịch" />`;
+    const tokens = scanTags(src);
+    const open = tokens.find((t) => t.kind === "open");
+    expect(open).toBeDefined();
+    expect(open.attrs).toContain(`placeholder="Nhập tên chiến dịch"`);
+    expect(open.selfClosing).toBe(true);
+  });
 });

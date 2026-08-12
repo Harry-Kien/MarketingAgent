@@ -3,6 +3,11 @@
 // the permanent regression net fix round 2 was asked to build: every fix
 // round from here on must keep this fixture producing zero findings from
 // all four guard functions, or it has re-introduced a false positive.
+// Fix round 3 added a URL-bearing link (`href="https://..."` contains `//`,
+// which used to blank the rest of its line) and a TSX generic component
+// instantiation (`<Select<string> ...>`, which used to truncate the tag
+// scan) -- both ordinary code, both previously reachable false-negative
+// vectors, now permanently exercised here.
 export const FALSE_POSITIVE_FIXTURE = `
 import { t } from "../i18n/index.ts";
 
@@ -52,6 +57,10 @@ export function CampaignCard({ score, threshold, name }: Props) {
       <span className="font-display">{/* separator uses · like this, documentation only */}</span>
       <span className="font-display">{t("nav.today")} — {t("nav.campaigns")}</span>
       <span className="sr-only">{count} items</span>
+      <a href="https://smos.example.com/chien-dich?ref=share" aria-label={t("approval.approve")}>
+        {t("nav.campaigns")}
+      </a>
+      <Select<string> options={statusOptions} placeholder={t("campaign.title")} />
     </div>
   );
 }

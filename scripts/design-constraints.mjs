@@ -74,12 +74,30 @@ function enclosingBlock(source, index) {
 
 // Fix round 2: recognises the standard single-line vertical-centering idiom
 // -- an absolute line-height exactly equal to an explicit `height` in the
-// same rule/style block. This sits outside C1's measured risk: the evidence
-// (font-render-verification V6 S3.3) is about MULTI-line text where one
-// line's line-box collides with the next line's diacritics; a block whose
-// line-height equals its own height has exactly one line by construction,
-// so there is no second line box to collide with. Recognised, not just
-// suppressed, so this specific common pattern needs no developer action.
+// same rule/style block (badges, pills, icon buttons: short, fixed-width
+// labels where authors reach for this pattern specifically to center text
+// in a box of known height).
+//
+// CORRECTED reasoning (fix round 3 -- the original comment here was wrong,
+// and a wrong justification left in the code is how the next person builds
+// something worse on top of it): `height == line-height` does NOT, on its
+// own, prove the block renders exactly one line. CSS `height` does not
+// constrain how many lines the content wraps into -- a block whose
+// `line-height` matches its `height` can still contain enough text to wrap
+// to a second line; that second line's line-box still exists (and can
+// still collide, per the C1 evidence) even though the overflow makes it
+// invisible or clipped rather than absent. `.p { height: 5px; line-height:
+// 5px }` around a paragraph of real text is exactly this: recognised as
+// "safe" by this heuristic, not actually guaranteed safe. What this
+// recognises is a common, low-risk AUTHORING PATTERN (badges/pills/icon
+// buttons are short by convention, not by any check this function
+// performs), not a proven-safe CASE. It is deliberately kept anyway,
+// because the false-positive cost of refusing every ordinary badge is real
+// and immediate, while the false-negative cost is a developer choosing to
+// put wrapping-length content in a component that idiomatically never
+// holds any -- see the report's "known gaps" for this round for the
+// tracked follow-up.
+//
 // `(?<!line-)` keeps this from matching the "height" substring inside
 // "line-height" itself. Unitless numeric height values (React's own
 // convention, e.g. `height: 32`) are normalised to px before comparing,
