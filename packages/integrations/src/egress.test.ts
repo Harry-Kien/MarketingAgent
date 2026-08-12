@@ -1,7 +1,55 @@
 import { describe, expect, it } from "vitest";
-import { assertEgressAllowed } from "./egress.ts";
+import { assertEgressAllowed, assertResolvedAddressAllowed } from "./egress.ts";
 
 const ALLOW = ["graph.facebook.com"];
+
+// --- Fix round 1: assertResolvedAddressAllowed must fail closed --------
+// Reviewer measurement: called directly (as a future DNS-rebinding-closing
+// caller would, with what dns.lookup/dns.resolve6 actually return -- always
+// unbracketed), it silently let every one of these through. dns.resolve6
+// never returns brackets, and dns.lookup never returns decimal/octal/hex
+// IPv4, so this is exactly the input shape the function exists to handle.
+describe("assertResolvedAddressAllowed (direct calls, not via assertEgressAllowed)", () => {
+  describe("unbracketed IPv6 -- what dns.resolve6 actually returns", () => {
+    it.each(["::1", "fd00:ec2::254", "fe80::1", "::ffff:127.0.0.1"])("throws for unbracketed %s", (addr) => {
+      expect(() => assertResolvedAddressAllowed(addr)).toThrow();
+    });
+  });
+
+  describe("non-canonical IPv4 encodings, called directly without going through URL", () => {
+    it.each(["2130706433", "0x7f000001", "127.1", "0177.0.0.1"])("throws for %s", (addr) => {
+      expect(() => assertResolvedAddressAllowed(addr)).toThrow();
+    });
+  });
+
+  describe("fails closed on malformed IP-shaped input instead of silently treating it as a domain", () => {
+    it.each([
+      "999.999.999.999", // ends in a number -> IPv4 parse attempt -> out-of-range octet
+      "300.1.2.3", // same: first octet > 255
+      "1.2.3.4.5", // too many parts to be IPv4, but the last part is numeric
+      "::1::2", // two "::" compressions -- not valid IPv6
+      "fe80::zzzz", // contains a colon -- must be treated as an IPv6 attempt, and "zzzz" isn't hex
+    ])("throws for %s rather than returning silently", (addr) => {
+      expect(() => assertResolvedAddressAllowed(addr)).toThrow();
+    });
+  });
+
+  it("still passes through a genuine domain name unchecked (not simply refusing everything)", () => {
+    expect(() => assertResolvedAddressAllowed("graph.facebook.com")).not.toThrow();
+  });
+
+  it("still allows a public IPv4 the same way it always did (no regression)", () => {
+    expect(() => assertResolvedAddressAllowed("8.8.8.8")).not.toThrow();
+  });
+
+  it("blocks a loopback IPv4 written with a trailing FQDN dot, not just the bare form", () => {
+    // Without stripping the trailing dot first, splitting "127.0.0.1." on
+    // "." yields a final empty label, "ends in a number" sees an empty
+    // last part and returns false, and the whole address would silently
+    // fall through as an unrecognised "domain name".
+    expect(() => assertResolvedAddressAllowed("127.0.0.1.")).toThrow();
+  });
+});
 
 describe("assertEgressAllowed", () => {
   // --- Plan's base cases, verbatim -------------------------------------
@@ -28,6 +76,15 @@ describe("assertEgressAllowed", () => {
 
   it("refuses a lookalike subdomain", () => {
     expect(() => assertEgressAllowed("https://graph.facebook.com.evil.test/", ALLOW)).toThrow(/allowlist/i);
+  });
+
+  // Fix round 1, mutation-testing finding: every existing "refuses http://"
+  // case above also has a private/internal host, so disabling the protocol
+  // check entirely still left them blocked by the address check -- the
+  // mutation survived. This isolates the protocol check on its own by
+  // using a host that is otherwise completely legitimate and allowlisted.
+  it("refuses a plain http:// request to an otherwise-legitimate, allowlisted host", () => {
+    expect(() => assertEgressAllowed("http://graph.facebook.com/v23.0/me", ALLOW)).toThrow(/https/i);
   });
 
   // --- Beyond the plan: the base cases above are all http:// and would --
@@ -120,6 +177,19 @@ describe("assertEgressAllowed", () => {
 
     it("is not fooled by a bare '@' host trick into hitting a metadata IP", () => {
       expect(() => assertEgressAllowed("http://allowed@169.254.169.254/", ALLOW)).toThrow();
+    });
+
+    // Fix round 1, mutation-testing finding: every existing userinfo case
+    // above sets a non-empty username, so a mutant that dropped the
+    // `|| url.password !== ""` half of the check still passed all of
+    // them -- the mutation survived. WHATWG URL parses
+    // "https://:secretpw@host/" as username="" (empty), password
+    // ="secretpw" (verified empirically), so a password-only userinfo is
+    // exactly the input the dropped half of the check exists for.
+    it("refuses password-only userinfo (empty username) on an otherwise-legitimate host", () => {
+      expect(() => assertEgressAllowed("https://:secretpw@graph.facebook.com/", ALLOW)).toThrow(
+        /userinfo|credential/i,
+      );
     });
   });
 

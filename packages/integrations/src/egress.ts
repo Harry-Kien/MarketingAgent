@@ -70,48 +70,143 @@ export function assertEgressAllowed(rawUrl: string, allowedHosts: readonly strin
  * the resolved address and re-validate it with the exact same rules this
  * module applies to URL hostnames.
  *
- * A plain domain name (anything that is not "localhost", an IPv4 literal,
- * or a bracketed IPv6 literal) is not resolved and not checked here -- see
- * the DNS-rebinding note on `assertEgressAllowed`.
+ * FIX ROUND 1: this used to require IPv6 to be bracketed and IPv4 to
+ * already be canonical dotted-decimal, silently falling through to "must
+ * be a domain name, not checked" for anything else -- which meant every
+ * unbracketed IPv6 address (exactly what `dns.resolve6` returns) and every
+ * non-canonical IPv4 encoding, called directly rather than through
+ * `assertEgressAllowed`'s `URL` parse, passed through unchecked. Fixed by
+ * classifying input the same way a real host parser does, independent of
+ * bracket/canonical-form assumptions, and failing closed (throwing) on
+ * anything that looks like an address attempt but doesn't parse -- instead
+ * of assuming "not a form I recognise" means "safe to treat as a domain".
  *
- * Expects an already-canonical address: plain dotted-decimal IPv4 (what
- * Node's `dns`/`net` modules and WHATWG `URL` both produce) or a bracketed
- * IPv6 literal. It does NOT itself re-interpret decimal/octal/hex IPv4
- * encodings ("2130706433", "0x7f000001", ...) -- that canonicalization is
- * done for `assertEgressAllowed` by the `URL` constructor before this
- * function ever sees the hostname. A caller feeding this function a raw,
- * un-canonicalized numeric string bypasses that protection.
+ * Classification, in order:
+ *   1. "localhost" / "*.localhost" -- blocked by name.
+ *   2. Contains a ":" -- an IPv6 attempt (bracketed or not; a domain name
+ *      or IPv4 address never contains a colon). Parsed and range-checked;
+ *      throws if it doesn't parse.
+ *   3. "Ends in a number" (mirrors the WHATWG URL host parser's own rule:
+ *      the last "."-separated label is decimal/octal/hex-number-shaped)
+ *      -- an IPv4 attempt, all or nothing. Parsed with the same
+ *      decimal/octal/hex/mixed-shorthand algorithm the URL spec uses, so
+ *      "2130706433", "0x7f000001", "127.1" and "0177.0.0.1" are all
+ *      recognised without ever going through `URL`. Throws if the parse
+ *      fails (e.g. an out-of-range octet like "999.999.999.999") rather
+ *      than falling through.
+ *   4. Anything else is a plain domain name -- not resolved, not checked
+ *      here; see the DNS-rebinding note on `assertEgressAllowed`. This is
+ *      the one intentional pass-through, and it is a domain name, never
+ *      something IP-shaped that failed to parse.
  */
 export function assertResolvedAddressAllowed(hostname: string): void {
-  const lower = hostname.toLowerCase();
+  // A trailing dot denotes the same FQDN either way; strip it once up
+  // front so IPv6/IPv4/domain classification below doesn't have to special
+  // case it three times.
+  const lower = hostname.toLowerCase().replace(/\.$/, "");
 
   if (lower === "localhost" || lower.endsWith(".localhost")) {
     throw new Error("Egress to localhost is blocked");
   }
 
-  if (lower.startsWith("[") && lower.endsWith("]")) {
-    assertIPv6AddressAllowed(lower.slice(1, -1));
+  if (lower.includes(":")) {
+    const stripped = lower.startsWith("[") && lower.endsWith("]") ? lower.slice(1, -1) : lower;
+    assertIPv6AddressAllowed(stripped);
     return;
   }
 
-  if (IPV4_LITERAL.test(lower)) {
+  if (endsInANumber(lower)) {
     assertIPv4AddressAllowed(lower);
     return;
   }
 
-  // Not a recognizable IP literal: a plain domain name. Its resolved
-  // address is out of scope for this synchronous check.
+  // Not IPv6-shaped (no colon) and does not end in a number: a plain
+  // domain name. Its resolved address is out of scope for this
+  // synchronous check.
 }
 
-const IPV4_LITERAL = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+/**
+ * Mirrors the WHATWG URL Standard's "ends in a number" host-classification
+ * rule: split on ".", and if the last non-empty label is itself a valid
+ * IPv4-number token (decimal, "0x"/"0X" hex, or leading-zero octal), the
+ * *whole* host is an IPv4-parse attempt -- never reinterpreted as a domain
+ * name even if that attempt then fails. This is what makes "999.999.999.999"
+ * throw instead of silently passing as an unrecognised domain: its last
+ * label "999" is decimal-shaped, so the full parse runs and fails on the
+ * out-of-range earlier octet.
+ */
+function endsInANumber(host: string): boolean {
+  const parts = host.split(".");
+  const last = parts[parts.length - 1] ?? "";
+  if (last === "") return false;
+  return parseIPv4Part(last) !== null;
+}
+
+/**
+ * Parses one "."-separated IPv4 label per the WHATWG URL IPv4-number
+ * grammar: "0x"/"0X" prefix -> hex, leading "0" (length >= 2) -> octal,
+ * otherwise decimal. Requires the ENTIRE remaining string to be valid
+ * digits for that base (no partial parse a la `parseInt`) -- "12abc" is a
+ * failure, not 12.
+ */
+function parseIPv4Part(part: string): number | null {
+  if (part === "") return null;
+  let radix = 10;
+  let digits = part;
+  if (part.length >= 2 && (part[0] === "0") && (part[1] === "x" || part[1] === "X")) {
+    radix = 16;
+    digits = part.slice(2);
+  } else if (part.length >= 2 && part[0] === "0") {
+    radix = 8;
+    digits = part.slice(1);
+  }
+  if (digits === "") return 0;
+  const valid = radix === 16 ? /^[0-9a-fA-F]+$/ : radix === 8 ? /^[0-7]+$/ : /^[0-9]+$/;
+  if (!valid.test(digits)) return null;
+  const value = parseInt(digits, radix);
+  return Number.isFinite(value) ? value : null;
+}
+
+/**
+ * Full WHATWG URL IPv4-parsing algorithm: up to four "."-separated parts,
+ * each parsed per `parseIPv4Part`, with the mixed-shorthand rule where a
+ * host with fewer than four parts packs the last part into the remaining
+ * low-order bits (so "127.1" -> 127.0.0.1, "2130706433" alone -> the same
+ * address as a raw 32-bit value). Returns null -- fail closed -- for
+ * anything that doesn't fit: too many parts, an empty part (e.g. a
+ * doubled or trailing "."), a non-last part over 255, or a last part that
+ * doesn't fit in the bits the earlier parts left it.
+ */
+function parseIPv4Address(host: string): number | null {
+  const parts = host.split(".");
+  if (parts.length > 4) return null;
+  if (parts.some((p) => p === "")) return null;
+
+  const numbers: number[] = [];
+  for (const part of parts) {
+    const n = parseIPv4Part(part);
+    if (n === null) return null;
+    numbers.push(n);
+  }
+
+  for (let i = 0; i < numbers.length - 1; i++) {
+    if ((numbers[i] ?? 0) > 255) return null;
+  }
+
+  const last = numbers[numbers.length - 1] ?? 0;
+  const maxLast = 256 ** (5 - numbers.length);
+  if (last >= maxLast) return null;
+
+  let ipv4 = last;
+  numbers.pop();
+  for (let i = 0; i < numbers.length; i++) {
+    ipv4 += (numbers[i] ?? 0) * 256 ** (3 - i);
+  }
+  return ipv4;
+}
 
 function v4(a: number, b: number, c: number, d: number): number {
   return a * 2 ** 24 + b * 2 ** 16 + c * 2 ** 8 + d;
-}
-
-function ipv4ToInt(dotted: string): number {
-  const [a, b, c, d] = dotted.split(".").map(Number);
-  return v4(a ?? 0, b ?? 0, c ?? 0, d ?? 0);
 }
 
 function intToDotted(n: number): string {
@@ -147,10 +242,16 @@ function isBlockedIPv4Int(n: number): boolean {
   return IPV4_BLOCKED_RANGES.some(([start, end]) => n >= start && n <= end);
 }
 
-function assertIPv4AddressAllowed(dotted: string): void {
-  const n = ipv4ToInt(dotted);
+function assertIPv4AddressAllowed(raw: string): void {
+  const n = parseIPv4Address(raw);
+  if (n === null) {
+    // Fail closed: this was classified as an IPv4-parse attempt (it "ends
+    // in a number"), so a failed parse is a malformed address, not a
+    // reason to fall back to treating it as a domain name.
+    throw new Error(`Malformed IPv4 address: ${raw}`);
+  }
   if (isBlockedIPv4Int(n)) {
-    throw new Error(`Egress to internal address ${dotted} is blocked`);
+    throw new Error(`Egress to internal address ${raw} (${intToDotted(n)}) is blocked`);
   }
 }
 
@@ -210,12 +311,25 @@ function ipv6HasPrefix(value: bigint, prefixText: string, prefixLen: number): bo
 }
 
 // Ranges that are blocked outright, regardless of what they embed.
+// fec0::/10, 2001:db8::/32 and 100::/64 below were flagged as under-blocked
+// in review round 1: not currently exploitable (an IP literal never equals
+// a domain name in `allowedHosts`, so `assertEgressAllowed` already refuses
+// them via the allowlist check), but `assertResolvedAddressAllowed` is
+// public and used standalone, where that backstop doesn't apply -- cheap to
+// close outright rather than rely on a second layer.
 const SIMPLE_BLOCKED_IPV6_PREFIXES: ReadonlyArray<readonly [string, number]> = [
   ["::", 128], // unspecified
   ["::1", 128], // loopback
   ["fc00::", 7], // unique local (fc00::/7 covers fd00::/8, incl. AWS's fd00:ec2::254)
   ["fe80::", 10], // link-local
   ["ff00::", 8], // multicast
+  ["fec0::", 10], // deprecated site-local (RFC 3879) -- superseded by fc00::/7 but still seen
+  ["2001:db8::", 32], // IPv6 documentation range (the v6 analogue of TEST-NET)
+  ["100::", 64], // discard-only address block (RFC 6666)
+  ["64:ff9b:1::", 48], // NAT64 *local-use* prefix (RFC 8215) -- distinct from the global
+  // well-known 64:ff9b::/96 already handled below; the embedded-address
+  // position within this /48 is operator-defined, not fixed, so the whole
+  // block is refused outright rather than attempting extraction.
 ];
 
 // Transition mechanisms that embed a literal IPv4 address in the low bits
