@@ -34,14 +34,20 @@ export interface PublicationRecord {
 
 /**
  * What handlePublish needs to know about the recorded approval decision.
- * `contentVersionId` is not a real column on `approval_decision` -- a real
- * loader obtains it by joining through the approval_request the decision
- * belongs to (`approval_decision.approval_request_id ->
- * approval_request.content_version_id`, infra/migrations/0007_approval.sql).
- * It is included here so this handler can independently confirm the
- * decision was actually for the SAME content this publication is about to
- * send, not merely that *some* approval decision exists at
- * `publication.approval_decision_id`.
+ *
+ * Late-review CRITICAL 1: `contentVersionId` used to have no column of its
+ * own -- a loader obtained it by JOINING through to
+ * `approval_request.content_version_id`, i.e. by reading the exact column an
+ * attacker holding plain `UPDATE ON approval_request` (0007_approval.sql:66)
+ * could rewrite AFTER the decision. The gate below then compared the
+ * retargeted value against itself and passed, publishing never-approved text
+ * under a genuine human approval. `contentVersionId` and `targetChannel` are
+ * now real, NOT NULL columns on `approval_decision` itself -- a whole-row
+ * immutable table (0007) whose snapshot is tied to the request it answers by
+ * a composite foreign key
+ * (infra/migrations/0031_approval_request_frozen_after_decision.sql). Any
+ * loader for this interface MUST read both from `approval_decision`; a loader
+ * that re-derives either from `approval_request` reintroduces the defect.
  */
 export interface LoadedApprovalDecision {
   id: Id;
@@ -50,6 +56,7 @@ export interface LoadedApprovalDecision {
   actorUserId: Id;
   decision: "approve" | "reject" | "request_changes";
   contentVersionId: Id;
+  targetChannel: string;
 }
 
 export interface PublishDeps {
@@ -125,8 +132,18 @@ export async function handlePublish(
   if (decision.decision !== "approve") {
     throw new Error(`Approval decision is "${decision.decision}", not approved; refusing to publish`);
   }
+  // Both comparisons read the DECISION's own immutable snapshot of what was
+  // approved, never the approval_request columns it was raised from (see
+  // LoadedApprovalDecision's header). Without the channel check, an approval
+  // granted for `meta_page` could be spent publishing to `tiktok_account`:
+  // "what was approved" is text AND destination, not text alone.
   if (decision.contentVersionId !== pub.contentVersionId) {
     throw new Error("Approval decision was recorded for a different content version; refusing to publish");
+  }
+  if (decision.targetChannel !== pub.targetChannel) {
+    throw new Error(
+      `Approval decision was recorded for target channel "${decision.targetChannel}", not "${pub.targetChannel}"; refusing to publish`,
+    );
   }
   // Content could have drifted between approval and execution. Redundant
   // with the database's own immutability trigger and CHECK

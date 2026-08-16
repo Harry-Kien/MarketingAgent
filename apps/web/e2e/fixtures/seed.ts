@@ -447,9 +447,9 @@ export async function recordHumanDecision(
 
   await withTenant(pool, ws.workspaceId, (tx) =>
     tx.query(
-      `insert into approval_decision (id, workspace_id, approval_request_id, actor_user_id, decision, reason, decided_at)
-       values ($1, $2, $3, $4, $5, $6, $7)`,
-      [decision.id, ws.workspaceId, decision.approvalRequestId, decision.actorUserId, decision.decision, decision.reason, decision.decidedAt],
+      `insert into approval_decision (id, workspace_id, approval_request_id, actor_user_id, decision, reason, decided_at, content_version_id, target_channel)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [decision.id, ws.workspaceId, decision.approvalRequestId, decision.actorUserId, decision.decision, decision.reason, decision.decidedAt, decision.contentVersionId, decision.targetChannel],
     ),
   );
 
@@ -540,6 +540,7 @@ interface DecisionRow {
   actor_user_id: string;
   decision: string;
   content_version_id: string;
+  target_channel: string;
 }
 
 /** Real, Postgres-backed `PublishDeps` (apps/worker/src/handlers/publish.ts)
@@ -579,9 +580,14 @@ export function makePublishDeps(pool: pg.Pool, ws: GoldenWorkspace, adapter: Cha
     async loadApprovalDecision(id): Promise<LoadedApprovalDecision | null> {
       const r = await withTenant(pool, ws.workspaceId, (tx) =>
         tx.query(
-          `select ad.id, ad.workspace_id, ad.approval_request_id, ad.actor_user_id, ad.decision, ar.content_version_id
+          // Late-review CRITICAL 1: read the decision's OWN content_version_id
+          // and target_channel. This query used to join through
+          // approval_request for content_version_id -- the mutable column the
+          // reviewer's retarget attack rewrote, which made the publish gate
+          // compare the tampered value against itself.
+          `select ad.id, ad.workspace_id, ad.approval_request_id, ad.actor_user_id, ad.decision,
+                  ad.content_version_id, ad.target_channel
            from approval_decision ad
-           join approval_request ar on ar.id = ad.approval_request_id and ar.workspace_id = ad.workspace_id
            where ad.id = $1 and ad.workspace_id = $2`,
           [id, ws.workspaceId],
         ),
@@ -595,6 +601,7 @@ export function makePublishDeps(pool: pg.Pool, ws: GoldenWorkspace, adapter: Cha
         actorUserId: row.actor_user_id as Id,
         decision: row.decision as LoadedApprovalDecision["decision"],
         contentVersionId: row.content_version_id as Id,
+        targetChannel: row.target_channel,
       };
     },
 

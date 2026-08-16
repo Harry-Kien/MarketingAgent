@@ -54,8 +54,14 @@ async function loadApprovalRequestTx(tx: TenantTx, workspaceId: Id, approvalRequ
 
 async function saveDecisionTx(tx: TenantTx, decision: ApprovalDecision): Promise<void> {
   await tx.query(
-    `insert into approval_decision (id, workspace_id, approval_request_id, actor_user_id, actor_kind, decision, reason, decided_at)
-     values ($1, $2, $3, $4, 'user', $5, $6, $7)`,
+    // content_version_id / target_channel are the decision's own snapshot of
+    // WHAT was approved (late-review CRITICAL 1). A composite foreign key
+    // (0031_approval_request_frozen_after_decision.sql) refuses this INSERT
+    // outright if the snapshot disagrees with the request being answered, so
+    // there is no way for this statement to record a decision "for" content
+    // the founder was not actually shown.
+    `insert into approval_decision (id, workspace_id, approval_request_id, actor_user_id, actor_kind, decision, reason, decided_at, content_version_id, target_channel)
+     values ($1, $2, $3, $4, 'user', $5, $6, $7, $8, $9)`,
     [
       decision.id,
       decision.workspaceId,
@@ -64,6 +70,8 @@ async function saveDecisionTx(tx: TenantTx, decision: ApprovalDecision): Promise
       decision.decision,
       decision.reason,
       decision.decidedAt,
+      decision.contentVersionId,
+      decision.targetChannel,
     ],
   );
 }
