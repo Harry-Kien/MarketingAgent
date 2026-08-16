@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
 import { isId, newId, type Id } from "@smos/domain";
-import { createDbPool, withTenant, type TenantTx } from "@smos/db";
+import { withTenant, type TenantTx } from "@smos/db";
 import { handleIngestEvent, type IngestEventDeps, type IngestEventPayload } from "@smos/worker";
 import { logger } from "@smos/telemetry";
-import { verifySignature } from "../../../../../server/webhook-signature.ts";
+import { getPool } from "../../../../../server/db.ts";
+import { deriveWorkspaceSecret, verifySignature } from "../../../../../server/webhook-signature.ts";
+import { MAX_EVENTS_PER_DELIVERY } from "../../../../../server/webhook-limits.ts";
 import { BodyTooLargeError, MAX_WEBHOOK_BODY_BYTES, readBoundedBody } from "../../../../../server/read-bounded-body.ts";
 
 // Every request does real I/O (DB); nothing about this route can be
@@ -19,23 +21,24 @@ const PROVIDER = "meta";
  * see each comment for exactly which hostile-input requirement it closes.
  *
  * The callback URL is workspace-scoped (`/api/webhooks/meta/<workspaceId>`)
- * rather than one single global endpoint. This is a deliberate, disclosed
- * simplification: Meta's real webhook architecture signs every delivery
- * with one app-level secret and expects the receiver to fan a single
- * callback URL out to the right tenant by looking up the page/account id
- * inside the (now-trusted, post-verification) payload -- which requires a
- * lookup table that can answer "which workspace owns this external account
- * id" WITHOUT already knowing the workspace, i.e. a query that cannot be
- * scoped through `withTenant`/RLS the way every other read in this
- * application is (RLS-scoped tables return zero rows when
- * `app.workspace_id` is unset, by design). Building that lookup table is
- * real M2 OAuth-lifecycle infrastructure (Non-Goals) and no vault/secret
- * resolution exists yet to obtain a real per-tenant secret from
- * `credential_reference.vault_key` (which is deliberately only an opaque
- * pointer, never a real value -- Task 3). A workspace-scoped URL sidesteps
- * that unsolved problem entirely while still proving every real invariant
- * this task cares about: signature verification, replay defense, bounded
- * memory, and RLS-forced tenant isolation on every write.
+ * rather than one single global endpoint. Late-review CRITICAL 2 found that
+ * this scoping was, until now, PURELY ROUTING: one global
+ * `META_WEBHOOK_SECRET` signed every delivery and the workspace id in the
+ * path was not covered by that signature at all, so workspace A's captured
+ * `(body, sha256=...)` replayed at workspace B's URL verified, returned 200,
+ * and wrote A's payload and A's Meta post id into B's `webhook_delivery` --
+ * permanently burning that delivery id for B, because `deliveryId` is the
+ * replay nonce and the row can never be deleted. The signature is now
+ * derived per workspace (`deriveWorkspaceSecret`, whose header records why a
+ * per-workspace secret was chosen over signing `wsId + body`), so the
+ * workspace a request claims to be for is bound into what was signed and a
+ * cross-tenant replay cannot verify at all.
+ *
+ * The other half of that fix lives at the database: the replay nonce is now
+ * a PARTIAL unique index restricted to `signature_ok` rows
+ * (0032_webhook_delivery_nonce_and_audit.sql), so a rejected delivery --
+ * including the audit receipt this route now writes for one -- can never
+ * consume an id a genuine delivery will later need.
  */
 export async function POST(
   request: Request,
@@ -60,32 +63,30 @@ export async function POST(
     throw error;
   }
 
-  // 2) Verify the signature over the exact raw bytes received, before
-  // anything else looks at the body's content or the caller-supplied
-  // workspace id is trusted for anything beyond routing. A missing secret
-  // (misconfigured server) fails exactly like a bad signature -- never
-  // treated as "skip verification".
+  // 2) Verify the signature over the exact raw bytes received, under the
+  // secret for the workspace this request CLAIMS to be for -- so that claim
+  // is itself part of what was signed. A missing root secret (misconfigured
+  // server) fails exactly like a bad signature, never "skip verification".
   const signatureHeader = request.headers.get(SIGNATURE_HEADER) ?? "";
-  const secret = getWebhookSecret();
-  if (secret === null || !verifySignature(rawBody, signatureHeader, secret)) {
-    // Never the raw body, never the signature value, never a database row
-    // -- only a fixed-size digest, so a forged giant or secret-shaped
-    // payload never leaves a trace bigger than one fingerprint (T7: "never
-    // logged in full", "never creates a row").
+  const rootSecret = getWebhookRootSecret();
+  const workspaceSecret = rootSecret === null ? null : deriveWorkspaceSecret(rootSecret, rawWorkspaceId);
+  if (workspaceSecret === null || !verifySignature(rawBody, signatureHeader, workspaceSecret)) {
+    // Never the raw body, never the signature value -- only a fixed-size
+    // digest, so a forged giant or secret-shaped payload never leaves a
+    // trace bigger than one fingerprint (T7: "never logged in full").
+    const bodyDigest = createHash("sha256").update(rawBody).digest("hex");
     logger.warn("webhook signature verification failed", {
       workspaceId: rawWorkspaceId,
-      bodyDigest: createHash("sha256").update(rawBody).digest("hex").slice(0, 16),
+      bodyDigest: bodyDigest.slice(0, 16),
       hadSignatureHeader: signatureHeader.length > 0,
     });
+    await recordRejectedDelivery(rawWorkspaceId, bodyDigest);
     return new Response(null, { status: 401 });
   }
 
   // 3) Only a signature-verified request's workspace id is trusted enough
   // to route with. isId is a pure shape check (well-formed UUIDv7), not an
-  // existence check -- an id that merely LOOKS valid but names no real
-  // workspace fails later at the FK on webhook_delivery.workspace_id, and
-  // at RLS (which returns zero rows for a workspace_id nothing was ever
-  // scoped to), never silently.
+  // existence check -- step 5 is the existence check.
   if (!isId(rawWorkspaceId)) {
     return new Response(null, { status: 404 });
   }
@@ -101,37 +102,109 @@ export async function POST(
   if (!isValidWebhookBody(parsedBody)) {
     return new Response(null, { status: 400 });
   }
-
-  const pool = createDbPool(process.env["DATABASE_URL"] ?? "");
-  try {
-    // 5) Every write happens inside one withTenant scope for this
-    // workspace -- RLS ENABLED and FORCED on integration, credential_
-    // reference, webhook_delivery, event and metric (infra/migrations/
-    // 0028_integration.sql) means a session scoped to any other workspace
-    // literally cannot see or write these rows; this is not "the query
-    // happens to filter by workspace_id", it is enforced by PostgreSQL
-    // itself even against a bug in the SQL below (T7: "the ingested event
-    // lands in the right workspace with RLS forced").
-    await withTenant(pool, workspaceId, async (tx) => {
-      for (const event of parsedBody.events) {
-        await handleIngestEvent(event, buildDeps(tx, workspaceId, event));
-      }
+  // MINOR (a): a 690 KB body carrying 4000 events fits well inside the byte
+  // cap but held ONE transaction open for 24.3 seconds. Bytes are the wrong
+  // unit for that cost; round trips are. Refused before a pool connection is
+  // even checked out.
+  if (parsedBody.events.length > MAX_EVENTS_PER_DELIVERY) {
+    logger.warn("webhook batch exceeded the per-delivery event cap; refused before any write", {
+      workspaceId,
+      eventCount: parsedBody.events.length,
     });
-  } finally {
-    await pool.end();
+    return new Response(null, { status: 400 });
   }
+
+  // MINOR (a), second half: one process-wide pool (apps/web/src/server/db.ts),
+  // not a fresh `pg.Pool` per request. The old code built and tore down a
+  // pool on every single delivery, so a burst of webhooks opened a burst of
+  // brand-new connections against a database whose connection count is the
+  // scarcest thing it has.
+  const pool = getPool();
+
+  // 5) MINOR (b): this route's own comment used to promise that an id which
+  // merely LOOKS valid but names no real workspace would "fail at the FK,
+  // never silently". It did fail -- as an unhandled throw carrying the raw
+  // constraint name out to the caller. A well-formed id naming no workspace
+  // is a 404, decided here, explicitly. `workspace` is the tenant root: it
+  // carries no workspace_id and no RLS policy (0001_core_tenancy.sql), so
+  // this read is correct outside a tenant scope and is the only such read in
+  // this file.
+  const exists = await pool.query(`select 1 from workspace where id = $1`, [workspaceId]);
+  if (exists.rowCount === 0) {
+    return new Response(null, { status: 404 });
+  }
+
+  // 6) Every write happens inside one withTenant scope for this
+  // workspace -- RLS ENABLED and FORCED on integration, credential_
+  // reference, webhook_delivery, event and metric (infra/migrations/
+  // 0028_integration.sql) means a session scoped to any other workspace
+  // literally cannot see or write these rows; this is not "the query
+  // happens to filter by workspace_id", it is enforced by PostgreSQL
+  // itself even against a bug in the SQL below (T7: "the ingested event
+  // lands in the right workspace with RLS forced").
+  await withTenant(pool, workspaceId, async (tx) => {
+    for (const event of parsedBody.events) {
+      await handleIngestEvent(event, buildDeps(tx, workspaceId, event));
+    }
+  });
 
   return new Response(null, { status: 200 });
 }
 
-function getWebhookSecret(): string | null {
+function getWebhookRootSecret(): string | null {
   // M0/M1 has exactly one sandbox Meta app (invariant #11: "Meta chỉ
-  // sandbox/dry-run") -- one shared HMAC secret for the whole sandbox is
-  // how Meta's real X-Hub-Signature-256 scheme actually works too (one
-  // secret per Meta App, not one per Page/workspace); this is not a
-  // shortcut relative to production, it is the real architecture.
+  // sandbox/dry-run"), so there is one configured secret. It is the ROOT of
+  // a per-workspace derivation, never the signing key itself -- see
+  // deriveWorkspaceSecret for why that distinction is the whole fix.
   const value = process.env["META_WEBHOOK_SECRET"];
   return value !== undefined && value.length > 0 ? value : null;
+}
+
+/**
+ * MINOR (c): `webhook_delivery.signature_ok` was never written `false`, so
+ * the audit trail 0028_integration.sql's own header describes ("one row per
+ * inbound webhook, whether or not its signature verified ... a rejected
+ * signature is exactly the kind of event an audit trail must not omit")
+ * simply did not exist.
+ *
+ * Three properties this receipt must have, all load-bearing:
+ *
+ *  - It must NOT consume the delivery id the forgery claimed. It cannot:
+ *    the body is never parsed on this path (parsing unverified bytes is the
+ *    thing the route's ordering exists to prevent), so the claimed id is not
+ *    even known here -- the receipt is keyed on the body digest instead --
+ *    and even on a collision the nonce index is partial on `signature_ok`
+ *    (0032), so rejected and verified rows occupy disjoint key spaces.
+ *  - It must never store the rejected body. `payload` stays `{}`; only the
+ *    digest is kept, which is what the log line already carries.
+ *  - It must never turn a 401 into a 500. Everything here is best effort: a
+ *    malformed workspace id, a workspace that does not exist, an RLS refusal
+ *    or a duplicate are all swallowed and the caller still gets 401.
+ *
+ * Known limit, stated rather than hidden: an attacker who can reach this
+ * endpoint with a valid-looking workspace id can add one row per DISTINCT
+ * forged body. Identical replays collapse (the partial unique index), but
+ * distinct bodies do not. Rate limiting is the real answer and there is none
+ * in this milestone; the same is true of every other route here.
+ */
+async function recordRejectedDelivery(rawWorkspaceId: string, bodyDigest: string): Promise<void> {
+  if (!isId(rawWorkspaceId)) return;
+  const workspaceId = rawWorkspaceId as Id;
+  try {
+    await withTenant(getPool(), workspaceId, (tx) =>
+      tx.query(
+        `insert into webhook_delivery (id, workspace_id, provider, external_id, signature_ok, payload)
+         values ($1, $2, $3, $4, false, '{}'::jsonb)
+         on conflict (workspace_id, provider, external_id) where not signature_ok do nothing`,
+        [newId(), workspaceId, PROVIDER, `rejected:${bodyDigest.slice(0, 32)}`],
+      ),
+    );
+  } catch (error) {
+    logger.warn("could not record a rejected webhook delivery receipt", {
+      workspaceId: rawWorkspaceId,
+      reason: error instanceof Error ? error.name : "unknown",
+    });
+  }
 }
 
 interface WebhookBody {
@@ -154,7 +227,12 @@ function isValidEventPayload(value: unknown): value is IngestEventPayload {
     v["eventType"].length > 0 &&
     typeof v["value"] === "number" &&
     Number.isFinite(v["value"]) &&
+    // MINOR (b): `occurredAt` was validated only as `typeof === "string"`, so
+    // "not-a-date" passed, became an Invalid Date, and escaped as an
+    // unhandled throw out of the INSERT. A timestamp that does not parse is
+    // malformed input -- a 400, decided here, like every other shape error.
     typeof v["occurredAt"] === "string" &&
+    Number.isFinite(Date.parse(v["occurredAt"])) &&
     typeof v["deliveryId"] === "string" &&
     v["deliveryId"].length > 0
   );
@@ -172,10 +250,15 @@ function buildDeps(tx: TenantTx, workspaceId: Id, event: IngestEventPayload): In
       return { id: row.id as Id, workspaceId: row.workspace_id as Id, campaignId: row.campaign_id as Id };
     },
     async recordDelivery(deliveryId) {
+      // ON CONFLICT names the partial index's predicate (`where
+      // signature_ok`), so this claims the nonce only against OTHER VERIFIED
+      // deliveries -- a rejected receipt sitting on the same key can never
+      // make this return false. That is the burn fix, expressed in the one
+      // query that decides whether a delivery is new.
       const r = await tx.query(
         `insert into webhook_delivery (id, workspace_id, provider, external_id, signature_ok, payload)
          values ($1, $2, $3, $4, true, $5::jsonb)
-         on conflict (workspace_id, provider, external_id) do nothing
+         on conflict (workspace_id, provider, external_id) where signature_ok do nothing
          returning id`,
         [newId(), workspaceId, PROVIDER, deliveryId, JSON.stringify(event)],
       );

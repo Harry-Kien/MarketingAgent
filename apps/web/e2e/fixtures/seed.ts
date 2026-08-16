@@ -686,7 +686,7 @@ export function makeIngestDeps(pool: pg.Pool, ws: GoldenWorkspace): IngestEventD
         tx.query(
           `insert into webhook_delivery (id, workspace_id, provider, external_id, signature_ok, payload)
            values ($1, $2, 'meta', $3, true, '{}'::jsonb)
-           on conflict (workspace_id, provider, external_id) do nothing
+           on conflict (workspace_id, provider, external_id) where signature_ok do nothing
            returning id`,
           [newId(), ws.workspaceId, deliveryId],
         ),

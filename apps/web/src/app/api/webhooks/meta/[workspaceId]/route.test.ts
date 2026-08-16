@@ -10,8 +10,10 @@
 import { createHmac } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createDbPool } from "@smos/db";
+import { newId } from "@smos/domain";
 import { seedTwoWorkspaces, type TenantFixture } from "@smos/testing";
 import { MAX_WEBHOOK_BODY_BYTES } from "../../../../../server/read-bounded-body.ts";
+import { MAX_EVENTS_PER_DELIVERY } from "../../../../../server/webhook-limits.ts";
 
 const SECRET = "route-test-sandbox-secret";
 const PREVIOUS_SECRET = process.env["META_WEBHOOK_SECRET"];
@@ -29,6 +31,21 @@ let POST: typeof import("./route.ts").POST;
 
 function sign(body: string, secret = SECRET): string {
   return "sha256=" + createHmac("sha256", secret).update(body).digest("hex");
+}
+
+/**
+ * Late-review CRITICAL 2: the signature now binds the workspace the request
+ * claims to be for. This helper reproduces, independently of the module under
+ * test, the derivation a real sender performs -- so a signature made for
+ * workspace A is by construction not a valid signature for workspace B, and
+ * a captured (body, signature) pair cannot be replayed at another tenant's
+ * callback URL.
+ */
+function signFor(workspaceId: string, body: string, rootSecret = SECRET): string {
+  const workspaceSecret = createHmac("sha256", rootSecret)
+    .update(`smos:meta-webhook:v1:${workspaceId}`)
+    .digest("hex");
+  return sign(body, workspaceSecret);
 }
 
 function req(workspaceId: string, body: string, signatureHeader: string): {
@@ -113,7 +130,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
     const body = JSON.stringify({
       events: [{ externalId, eventType: "post.impression", value: 42, occurredAt: new Date().toISOString(), deliveryId: "d-ok-1" }],
     });
-    const { request, context } = req(a.workspaceId, body, sign(body));
+    const { request, context } = req(a.workspaceId, body, signFor(a.workspaceId, body));
     const res = await POST(request, context);
     expect(res.status).toBe(200);
     expect(await eventCount(a.workspaceId, a.publicationId)).toBe(baselineEventsA + 1);
@@ -126,7 +143,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
       events: [{ externalId, eventType: "post.impression", value: 7, occurredAt: new Date().toISOString(), deliveryId: "d-replay-1" }],
     });
     const before = await eventCount(a.workspaceId, a.publicationId);
-    const sig = sign(body);
+    const sig = signFor(a.workspaceId, body);
     const call1 = req(a.workspaceId, body, sig);
     const call2 = req(a.workspaceId, body, sig);
     const first = await POST(call1.request, call1.context);
@@ -137,7 +154,13 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
     expect(await webhookDeliveryCount(a.workspaceId, "d-replay-1")).toBe(1);
   });
 
-  it("rejects a forged signature with 401 and creates no row anywhere", async () => {
+  // Title corrected (late-review CRITICAL 2 / minor c): a forged signature
+  // now DOES leave one trace -- a signature_ok = false receipt, which
+  // 0028_integration.sql always said this table would carry and which
+  // nothing had ever written. What must still be true, and is asserted here,
+  // is that it never creates a row under the delivery id it claimed, i.e. it
+  // cannot consume that id.
+  it("rejects a forged signature with 401 and never a receipt under the delivery id it claimed", async () => {
     const body = JSON.stringify({
       events: [
         {
@@ -167,7 +190,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
         },
       ],
     });
-    const validSignatureForOriginal = sign(originalBody);
+    const validSignatureForOriginal = signFor(a.workspaceId, originalBody);
     const tamperedBody = originalBody.replace('"value":1', '"value":99999');
     const { request, context } = req(a.workspaceId, tamperedBody, validSignatureForOriginal);
     const res = await POST(request, context);
@@ -191,33 +214,155 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
 
   it("rejects malformed JSON that arrives with a genuinely valid signature, and creates no row", async () => {
     const body = "{not-valid-json";
-    const { request, context } = req(a.workspaceId, body, sign(body));
+    const { request, context } = req(a.workspaceId, body, signFor(a.workspaceId, body));
     const res = await POST(request, context);
     expect(res.status).toBe(400);
   });
 
   it("rejects a malformed workspace id in the URL even with a valid signature", async () => {
     const body = JSON.stringify({ events: [] });
-    const { request, context } = req("not-a-real-workspace-id", body, sign(body));
+    const { request, context } = req("not-a-real-workspace-id", body, signFor("not-a-real-workspace-id", body));
     const res = await POST(request, context);
     expect(res.status).toBe(404);
   });
 
-  it("never lets one workspace's webhook resolve another workspace's publication (RLS-forced isolation)", async () => {
-    // A real, correctly-signed delivery arrives on workspace B's callback
-    // URL but names workspace A's own external post id. Even though the
-    // shared sandbox secret verifies it, workspace B's tenant scope must
-    // not be able to see -- let alone attach an event to -- workspace A's
-    // publication.
+  // --- Late-review CRITICAL 2 -------------------------------------------
+  //
+  // The version of this test that shipped asserted ONLY eventCount, and
+  // never looked at `webhook_delivery` at all. That is exactly why the
+  // defect survived: it accepted a 200 as correct ("the delivery itself is
+  // accepted -- it just resolves nothing"), so it stayed green while
+  // workspace A's captured (body, signature) pair, replayed at workspace B's
+  // callback URL, wrote A's full payload and A's Meta post id into B's
+  // webhook_delivery table AND permanently burned that delivery id for B.
+  // It is corrected here rather than deleted: the isolation property it
+  // meant to prove is real and still asserted, but the acceptance bar was
+  // wrong -- a delivery signed for another tenant must be REFUSED, not
+  // accepted-then-ignored, and every assertion below now inspects the
+  // delivery table the original never touched.
+  it("refuses workspace A's captured signature replayed at workspace B's callback URL", async () => {
     const crossExternalId = `route-test-post-${a.publicationId}`;
+    const deliveryId = `d-cross-${a.workspaceId}`;
     const body = JSON.stringify({
-      events: [{ externalId: crossExternalId, eventType: "post.impression", value: 3, occurredAt: new Date().toISOString(), deliveryId: "d-cross-1" }],
+      events: [{ externalId: crossExternalId, eventType: "post.impression", value: 3, occurredAt: new Date().toISOString(), deliveryId }],
     });
     const beforeA = await eventCount(a.workspaceId, a.publicationId);
-    const { request, context } = req(b.workspaceId, body, sign(body));
+    // The exact bytes and the exact signature workspace A would have sent.
+    const { request, context } = req(b.workspaceId, body, signFor(a.workspaceId, body));
     const res = await POST(request, context);
-    expect(res.status).toBe(200); // the delivery itself is accepted (valid signature) -- it just resolves nothing
-    expect(await eventCount(a.workspaceId, a.publicationId)).toBe(beforeA); // unchanged
-    expect(await eventCount(b.workspaceId, b.publicationId)).toBe(baselineEventsB); // unchanged from baseline -- workspace B never had this publication either
+
+    expect(res.status).toBe(401);
+    expect(await eventCount(a.workspaceId, a.publicationId)).toBe(beforeA);
+    expect(await eventCount(b.workspaceId, b.publicationId)).toBe(baselineEventsB);
+    // A's payload and A's Meta post id must not have landed in B's table.
+    expect(await webhookDeliveryCount(b.workspaceId, deliveryId)).toBe(0);
+    const leaked = await adminPool.query(
+      "select count(*)::int as n from webhook_delivery where workspace_id = $1 and payload::text like $2",
+      [b.workspaceId, `%${crossExternalId}%`],
+    );
+    expect(leaked.rows[0].n).toBe(0);
+  });
+
+  it("a foreign delivery cannot permanently burn a genuine delivery id", async () => {
+    // The reviewer's exact denial-of-service: pre-send `deliveryId` to
+    // workspace B using workspace A's secret, then watch B's own genuine
+    // delivery with that id get dropped forever -- 200, "events before 1,
+    // after 1", no error and no trace.
+    const deliveryId = `d-burn-${b.workspaceId}`;
+    const externalId = `route-test-post-${b.publicationId}`;
+    const burnBody = JSON.stringify({
+      events: [{ externalId, eventType: "post.impression", value: 1, occurredAt: new Date().toISOString(), deliveryId }],
+    });
+    const burn = req(b.workspaceId, burnBody, signFor(a.workspaceId, burnBody));
+    expect((await POST(burn.request, burn.context)).status).toBe(401);
+
+    // B's genuine delivery, with the same delivery id, must still be
+    // processed in full.
+    const before = await eventCount(b.workspaceId, b.publicationId);
+    const realBody = JSON.stringify({
+      events: [{ externalId, eventType: "post.impression", value: 77, occurredAt: new Date().toISOString(), deliveryId }],
+    });
+    const real = req(b.workspaceId, realBody, signFor(b.workspaceId, realBody));
+    expect((await POST(real.request, real.context)).status).toBe(200);
+    expect(await eventCount(b.workspaceId, b.publicationId)).toBe(before + 1);
+  });
+
+  it("records a rejected delivery with signature_ok = false without consuming any delivery id", async () => {
+    // 0028_integration.sql's own header promised "one row per inbound
+    // webhook, whether or not its signature verified (signature_ok records
+    // that instead of silently dropping the delivery)". Nothing had ever
+    // written `false`, so that audit trail did not exist.
+    const deliveryId = `d-audit-${a.workspaceId}`;
+    const externalId = `route-test-post-${a.publicationId}`;
+    const body = JSON.stringify({
+      events: [{ externalId, eventType: "post.impression", value: 5, occurredAt: new Date().toISOString(), deliveryId }],
+    });
+    const forged = req(a.workspaceId, body, sign(body, "wrong-secret"));
+    expect((await POST(forged.request, forged.context)).status).toBe(401);
+
+    const rejected = await adminPool.query(
+      "select count(*)::int as n from webhook_delivery where workspace_id = $1 and signature_ok = false",
+      [a.workspaceId],
+    );
+    expect(rejected.rows[0].n).toBeGreaterThanOrEqual(1);
+    // The rejected receipt is not keyed on the delivery id it claimed, and
+    // could not burn it even if it were: the nonce index is partial on
+    // signature_ok (0032_webhook_delivery_nonce_and_audit.sql).
+    expect(await webhookDeliveryCount(a.workspaceId, deliveryId)).toBe(0);
+
+    const before = await eventCount(a.workspaceId, a.publicationId);
+    const real = req(a.workspaceId, body, signFor(a.workspaceId, body));
+    expect((await POST(real.request, real.context)).status).toBe(200);
+    expect(await eventCount(a.workspaceId, a.publicationId)).toBe(before + 1);
+  });
+
+  it("refuses a batch with more events than the per-delivery cap, before opening a transaction", async () => {
+    const events = Array.from({ length: MAX_EVENTS_PER_DELIVERY + 1 }, (_, i) => ({
+      externalId: `route-test-post-${a.publicationId}`,
+      eventType: "post.impression",
+      value: i,
+      occurredAt: new Date().toISOString(),
+      deliveryId: `d-flood-${i}`,
+    }));
+    const body = JSON.stringify({ events });
+    const { request, context } = req(a.workspaceId, body, signFor(a.workspaceId, body));
+    expect((await POST(request, context)).status).toBe(400);
+    expect(await webhookDeliveryCount(a.workspaceId, "d-flood-0")).toBe(0);
+  });
+
+  it("refuses an unparseable occurredAt instead of throwing out of the handler", async () => {
+    const body = JSON.stringify({
+      events: [
+        {
+          externalId: `route-test-post-${a.publicationId}`,
+          eventType: "post.impression",
+          value: 1,
+          occurredAt: "not-a-date",
+          deliveryId: `d-baddate-${a.workspaceId}`,
+        },
+      ],
+    });
+    const { request, context } = req(a.workspaceId, body, signFor(a.workspaceId, body));
+    expect((await POST(request, context)).status).toBe(400);
+    expect(await webhookDeliveryCount(a.workspaceId, `d-baddate-${a.workspaceId}`)).toBe(0);
+  });
+
+  it("answers 404 for a well-formed workspace id that names no workspace, leaking no constraint name", async () => {
+    const ghost = newId();
+    const body = JSON.stringify({
+      events: [
+        {
+          externalId: "route-test-ghost",
+          eventType: "post.impression",
+          value: 1,
+          occurredAt: new Date().toISOString(),
+          deliveryId: `d-ghost-${ghost}`,
+        },
+      ],
+    });
+    const { request, context } = req(ghost, body, signFor(ghost, body));
+    const res = await POST(request, context);
+    expect(res.status).toBe(404);
+    expect(await res.text()).toBe("");
   });
 });
