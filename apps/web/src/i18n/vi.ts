@@ -53,6 +53,13 @@ export const messages = {
     connect: "Kết nối",
     noProviders: "Chưa có kênh nào để hiển thị",
   },
+  auth: {
+    title: "Đăng nhập",
+    email: "Email",
+    password: "Mật khẩu",
+    submit: "Đăng nhập",
+    invalidCredentials: "Email hoặc mật khẩu không đúng",
+  },
   lifecycle: {
     DRAFT: "Nháp", RESEARCHING: "Đang nghiên cứu", PLANNED: "Đã lên kế hoạch",
     IN_PROGRESS: "Đang thực hiện", INTERNAL_REVIEW: "Đang rà soát nội bộ",

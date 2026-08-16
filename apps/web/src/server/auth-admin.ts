@@ -1,11 +1,16 @@
 import { createDbPool } from "@smos/db";
-import { createSmosAuth } from "./auth.ts";
+import { createSmosAuth } from "./auth-core.ts";
 
 /**
  * TEST/SEED ONLY. Never imported by any route or by `apps/web/src/server/
  * auth.ts`'s own `auth` export -- grep this repo for the only two legitimate
  * importers (`apps/web/src/server/auth.test.ts`,
  * `apps/web/e2e/fixtures/auth-seed.ts`) before adding a third.
+ *
+ * Imports `createSmosAuth` from `auth-core.ts`, NOT from `auth.ts`: `auth.ts`
+ * also imports `next/headers`, which cannot resolve outside a live Next.js
+ * process (this module is loaded by Playwright's plain Node runtime via the
+ * e2e fixture) -- see auth-core.ts's own header for the reproduction.
  *
  * Connects with DATABASE_MIGRATION_URL (the `smos` superuser) instead of
  * the shared smos_app pool, and enables sign-up (`disableSignUp: false`),
