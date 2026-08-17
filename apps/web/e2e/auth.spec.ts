@@ -87,6 +87,13 @@ test.describe("E7: a real browser reaches the authenticated console", () => {
       await page.setViewportSize(size);
       for (const path of ["/", "/approvals", "/analytics", `/campaigns/${a.campaignId}`]) {
         await page.goto(path);
+        // Wait for the streamed content to replace the loading fallback before
+        // capturing. Without this the screenshot catches "Đang tải" and the
+        // evidence proves only that a spinner renders -- which is exactly what
+        // it did until this assertion was added. Waiting here is also an
+        // assertion in its own right: if a page never leaves its loading
+        // state, this fails rather than quietly producing a useless image.
+        await expect(page.getByText("Đang tải")).toHaveCount(0, { timeout: 15_000 });
         await page.screenshot({
           path: resolve(ASSETS_DIR, `e2e-auth-${name}-${path.replace(/\W+/g, "_")}.png`),
           fullPage: true,
