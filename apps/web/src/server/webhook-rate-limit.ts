@@ -52,8 +52,21 @@ export interface WebhookRateLimitConfig {
  *    scope a legitimate sender's traffic can ever touch, and can ONLY be
  *    incremented by a request that already passed HMAC verification under
  *    that workspace's own derived secret -- an attacker forging signatures
- *    can never write into it, for any workspace, so no amount of forged
+ *    can never write into it, for any workspace, so no amount of FORGED
  *    traffic can ever exhaust a real sender's own budget here.
+ *
+ *    That is a statement about forgery, not about isolation, and the two
+ *    are not the same guarantee: bucket_index is hash(key) % 1021, so this
+ *    scope shares one counter across every workspace id that happens to
+ *    collide into the same bucket. Two DIFFERENT, entirely legitimate
+ *    workspaces -- neither one ever forging anything -- can and do share a
+ *    bucket whenever their ids collide under that hash, and one's real
+ *    traffic can throttle the other's, down to a request it never sent.
+ *    webhook-rate-limit.test.ts proves this live. 1021 buckets makes it
+ *    rare at this milestone's real traffic volumes, not impossible; this
+ *    is a known, accepted trade-off (a fixed-cardinality bucket count is
+ *    what keeps row count bounded regardless of workspace count), not a
+ *    claim that valid_workspace budgets are per-workspace-isolated.
  *  - invalid_ip / invalid_workspace / invalid_global are all tight: nothing
  *    with a correct secret should ever land here more than a handful of
  *    times (a genuine misconfiguration, not sustained traffic), so a low

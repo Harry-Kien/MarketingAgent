@@ -114,8 +114,14 @@ export async function POST(
   // tenant), and one single global bucket (catches a flood distributed
   // across many IPs AND many fabricated workspace ids, so no per-key
   // budget alone ever trips). None of the three invalid scopes can ever
-  // touch `valid_workspace`, so no volume of forged traffic can exhaust a
-  // genuine sender's own budget for their own workspace.
+  // touch `valid_workspace`, so no volume of FORGED traffic can exhaust
+  // it -- but that is disjointness of scopes, not per-workspace
+  // isolation within `valid_workspace` itself: it still buckets by
+  // hash(workspaceId) % 1021 (webhook-rate-limit.ts's own header, and
+  // webhook-rate-limit.test.ts's live proof), so two different,
+  // genuinely legitimate workspaces that happen to collide into the same
+  // bucket do share one counter, and one's real traffic can throttle the
+  // other's.
   let throttledRetryAfterSeconds: number | null = null;
   if (signatureOk) {
     const decision = await checkWebhookRateLimit(pool, "valid_workspace", rawWorkspaceId);
