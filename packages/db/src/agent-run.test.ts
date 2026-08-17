@@ -85,7 +85,7 @@ describe("agent_run", () => {
            values (gen_random_uuid(),$1,$2,$3,'NONSENSE','p','m')`,
           [a.workspaceId, a.agentVersionId, a.campaignId],
         )),
-    ).rejects.toThrow(/check|violates/i);
+    ).rejects.toThrow(/agent_run_state_check/);
   });
 
   it("refuses a blank prompt_version / model_version (whitespace-only)", async () => {
@@ -96,7 +96,7 @@ describe("agent_run", () => {
            values (gen_random_uuid(),$1,$2,$3,'pending',$4,'m')`,
           [a.workspaceId, a.agentVersionId, a.campaignId, "\t\n"],
         )),
-    ).rejects.toThrow(/check|violates/i);
+    ).rejects.toThrow(/agent_run_prompt_version_check/);
   });
 
   it("accepts a valid run and applies the documented defaults", async () => {
@@ -157,7 +157,7 @@ describe("agent_run, tool_call, run_checkpoint -- row level security", () => {
            values (gen_random_uuid(),$1,$2,$3,'pending',$4,'m1')`,
           [b.workspaceId, a.agentVersionId, a.campaignId, marker],
         )),
-    ).rejects.toThrow(/permission denied|row-level security|violates/i);
+    ).rejects.toThrow(/new row violates row-level security policy for table "agent_run"/);
   });
 
   it("a tool_call insert tagged with workspace B is refused while scoped to workspace A", async () => {
@@ -177,7 +177,7 @@ describe("agent_run, tool_call, run_checkpoint -- row level security", () => {
            values (gen_random_uuid(),$1,$2,'read_campaign',true)`,
           [b.workspaceId, runId],
         )),
-    ).rejects.toThrow(/permission denied|row-level security|violates/i);
+    ).rejects.toThrow(/new row violates row-level security policy for table "tool_call"/);
   });
 
   it("a run_checkpoint insert tagged with workspace B is refused while scoped to workspace A", async () => {
@@ -197,7 +197,7 @@ describe("agent_run, tool_call, run_checkpoint -- row level security", () => {
            values (gen_random_uuid(),$1,$2,'prompt_built')`,
           [b.workspaceId, runId],
         )),
-    ).rejects.toThrow(/permission denied|row-level security|violates/i);
+    ).rejects.toThrow(/new row violates row-level security policy for table "run_checkpoint"/);
   });
 });
 
@@ -210,7 +210,7 @@ describe("agent_run.agent_version_id -> agent_version composite FK", () => {
            values (gen_random_uuid(),$1,$2,$3,'pending','p1','m1')`,
           [b.workspaceId, a.agentVersionId, b.campaignId],
         )),
-    ).rejects.toThrow(/foreign key|violates/i);
+    ).rejects.toThrow(/agent_run_agent_version_id_workspace_id_fkey/);
   });
 
   it("still allows an agent_run in workspace B pointing at workspace B's own agent_version", async () => {
@@ -234,7 +234,7 @@ describe("agent_run.campaign_id -> campaign composite FK", () => {
            values (gen_random_uuid(),$1,$2,$3,'pending','p1','m1')`,
           [b.workspaceId, b.agentVersionId, a.campaignId],
         )),
-    ).rejects.toThrow(/foreign key|violates/i);
+    ).rejects.toThrow(/agent_run_campaign_id_workspace_id_fkey/);
   });
 });
 
@@ -247,7 +247,7 @@ describe("tool_call.agent_run_id -> agent_run composite FK", () => {
            values (gen_random_uuid(),$1,$2,'read_campaign',true)`,
           [b.workspaceId, a.agentRunId],
         )),
-    ).rejects.toThrow(/foreign key|violates/i);
+    ).rejects.toThrow(/tool_call_agent_run_id_workspace_id_fkey/);
   });
 
   it("still allows a tool_call in workspace B pointing at workspace B's own agent_run", async () => {
@@ -269,7 +269,7 @@ describe("run_checkpoint.agent_run_id -> agent_run composite FK", () => {
            values (gen_random_uuid(),$1,$2,'hijack_step')`,
           [b.workspaceId, a.agentRunId],
         )),
-    ).rejects.toThrow(/foreign key|violates/i);
+    ).rejects.toThrow(/run_checkpoint_agent_run_id_workspace_id_fkey/);
   });
 
   it("still allows a run_checkpoint in workspace B pointing at workspace B's own agent_run", async () => {
@@ -303,7 +303,7 @@ describe("run_checkpoint.agent_run_id -> agent_run composite FK", () => {
           `insert into run_checkpoint (id,workspace_id,agent_run_id,step_name) values (gen_random_uuid(),$1,$2,'prompt_built')`,
           [a.workspaceId, runId],
         )),
-    ).rejects.toThrow(/duplicate key|unique constraint|violates/i);
+    ).rejects.toThrow(/run_checkpoint_agent_run_id_step_name_key/);
   });
 });
 
