@@ -118,6 +118,27 @@ async function main() {
       `ALTER ROLE smos_worker PASSWORD ${client.escapeLiteral(smosWorkerPassword)}`,
     );
     console.log("smos_worker password set from SMOS_WORKER_PASSWORD");
+
+    // Same pattern again, for the vault's own login role
+    // (0036_vault_secret.sql): smos_vault is a separate credential from both
+    // smos_app and smos_worker -- neither is a member of the other -- so a
+    // leaked DATABASE_URL or DATABASE_WORKER_URL cannot reach vault_secret by
+    // any SQL whatsoever, and a leaked DATABASE_VAULT_URL cannot reach
+    // anything else this application owns.
+    const smosVaultPassword = process.env["SMOS_VAULT_PASSWORD"];
+    if (!smosVaultPassword) {
+      console.error(
+        "SMOS_VAULT_PASSWORD is not set. Refusing to leave smos_vault without a " +
+          "password: set SMOS_VAULT_PASSWORD (see .env.example) and re-run " +
+          "npm run db:migrate.",
+      );
+      process.exitCode = 1;
+      return;
+    }
+    await client.query(
+      `ALTER ROLE smos_vault PASSWORD ${client.escapeLiteral(smosVaultPassword)}`,
+    );
+    console.log("smos_vault password set from SMOS_VAULT_PASSWORD");
   } finally {
     client.release();
     await pool.end();

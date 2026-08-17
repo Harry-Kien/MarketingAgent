@@ -7,17 +7,21 @@
 // one pure function in isolation. webhook-signature.test.ts and
 // ingest-event.test.ts already cover those pure pieces on their own; this
 // file is the seam between them and the database.
+//
+// Credential vault task: signFor no longer derives a workspace secret from
+// a fleet-wide root -- there is no root secret anymore. It resolves (and,
+// on first use, provisions) the SAME real per-workspace secret the route
+// itself reads via getWorkspaceWebhookSecret (server/webhook-secret.ts),
+// through the identical vault. Every call site below is now `await`ed.
 import { createHmac } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createDbPool } from "@smos/db";
-import { newId } from "@smos/domain";
+import { newId, type Id } from "@smos/domain";
 import { seedTwoWorkspaces, type TenantFixture } from "@smos/testing";
+import { getWorkspaceWebhookSecret } from "../../../../../server/webhook-secret.ts";
 import { MAX_WEBHOOK_BODY_BYTES } from "../../../../../server/read-bounded-body.ts";
 import { MAX_EVENTS_PER_DELIVERY } from "../../../../../server/webhook-limits.ts";
 import { WEBHOOK_RATE_LIMITS } from "../../../../../server/webhook-rate-limit.ts";
-
-const SECRET = "route-test-sandbox-secret";
-const PREVIOUS_SECRET = process.env["META_WEBHOOK_SECRET"];
 
 const url = process.env["DATABASE_URL"] ?? "postgres://smos_app:smos_app_local_dev@127.0.0.1:5433/smos";
 const adminUrl = process.env["DATABASE_MIGRATION_URL"] ?? "postgres://smos:smos_local_dev@127.0.0.1:5433/smos";
@@ -30,23 +34,23 @@ let baselineEventsA: number;
 let baselineEventsB: number;
 let POST: typeof import("./route.ts").POST;
 
-function sign(body: string, secret = SECRET): string {
+function sign(body: string, secret: string): string {
   return "sha256=" + createHmac("sha256", secret).update(body).digest("hex");
 }
 
 /**
- * Late-review CRITICAL 2: the signature now binds the workspace the request
- * claims to be for. This helper reproduces, independently of the module under
- * test, the derivation a real sender performs -- so a signature made for
- * workspace A is by construction not a valid signature for workspace B, and
- * a captured (body, signature) pair cannot be replayed at another tenant's
- * callback URL.
+ * Late-review CRITICAL 2: the signature binds the workspace the request
+ * claims to be for. Resolves the REAL secret for `workspaceId` from the
+ * credential vault -- the same call the route itself makes -- so a
+ * signature made "for workspace A" is, by construction, signed under A's
+ * own stored secret and cannot be a valid signature for B's.
  */
-function signFor(workspaceId: string, body: string, rootSecret = SECRET): string {
-  const workspaceSecret = createHmac("sha256", rootSecret)
-    .update(`smos:meta-webhook:v1:${workspaceId}`)
-    .digest("hex");
-  return sign(body, workspaceSecret);
+async function signFor(workspaceId: Id, body: string): Promise<string> {
+  const secret = await getWorkspaceWebhookSecret(workspaceId);
+  if (secret === null) {
+    throw new Error(`route.test.ts: could not resolve/provision a webhook secret for workspace ${workspaceId}`);
+  }
+  return sign(body, secret);
 }
 
 function req(workspaceId: string, body: string, signatureHeader: string, forwardedFor?: string): {
@@ -97,17 +101,63 @@ async function rejectedDeliveryCount(workspaceId: string): Promise<number> {
  * recordRejectedDelivery's INSERT fails (silently swallowed, per its own
  * doc) for a `newId()` that names no row at all -- exactly the ghost-
  * workspace case elsewhere in this file, which deliberately never reaches
- * that INSERT (it 404s on the workspace-exists check first, only for a
- * VALID signature). The rate-limit tests below need a workspace id that IS
- * real (so the rejected-receipt assertions are meaningful) but is used by
- * NOTHING else in this file, so its buckets start genuinely empty and an
- * exact "first N calls succeed, the next one is throttled" assertion is
- * safe against cross-test interference.
+ * that INSERT (it 401s at the signature-resolution step, before any row is
+ * even considered, since a nonexistent workspace can never have a real
+ * vault-stored secret to sign against -- see this file's own "answers 401
+ * for a well-formed workspace id that names no workspace" test for why that
+ * is 401 rather than the pre-vault 404). The rate-limit tests below need a
+ * workspace id that IS real (so the rejected-receipt assertions are
+ * meaningful) but is used by NOTHING else in this file, so its buckets
+ * start genuinely empty and an exact "first N calls succeed, the next one
+ * is throttled" assertion is safe against cross-test interference.
  */
 async function createBareWorkspace(): Promise<string> {
   const id = newId();
   await adminPool.query(`insert into workspace (id, name) values ($1, $2)`, [id, `rate-limit-test-${id}`]);
   return id;
+}
+
+/**
+ * `count` distinct keys that are guaranteed to hash to DIFFERENT
+ * `invalid_ip` bucket indices (webhook-rate-limit.ts: 1021 buckets).
+ *
+ * Generating N plain random keys and assuming none collide is exactly what
+ * webhook-rate-limit.test.ts's own `findCollidingKeys` helper proves is
+ * UNSAFE ("a birthday-style collision among random candidates is expected
+ * within a few dozen tries") -- for the ~25 keys the distributed-flood test
+ * below needs against only 1021 buckets, the birthday-paradox probability
+ * of at least one collision is roughly 1 in 4 per run. A collision there
+ * means two "different source IPs" silently share ONE bucket, so
+ * `invalid_ip`'s own limit (10) can trip before the test's real target,
+ * `invalid_workspace`'s limit (20), ever does -- an intermittent, spurious
+ * 429 in the middle of an expected run of 401s, with nothing wrong in the
+ * route or the rate limiter itself. This asks Postgres for the exact same
+ * hash the real UPSERT uses (never a JS reimplementation) and discards any
+ * candidate that would land on a bucket already claimed, so the generated
+ * set is collision-free by construction rather than by luck.
+ */
+async function distinctNonCollidingBucketKeys(count: number, label: string): Promise<string[]> {
+  // Also avoid any bucket_index that already has traffic recorded for this
+  // scope RIGHT NOW, from whatever else has run in this same process --
+  // colliding with an already-warm bucket is the same failure mode as
+  // colliding within this function's own batch, just sourced externally.
+  const occupied = await pool.query<{ idx: number }>(
+    "select bucket_index as idx from webhook_rate_limit_bucket where scope = 'invalid_ip'",
+  );
+  const seenIndexes = new Set<number>(occupied.rows.map((row) => row.idx));
+  const keys: string[] = [];
+  let attempt = 0;
+  while (keys.length < count) {
+    const candidate = `${label}-${newId()}-${attempt++}`;
+    const r = await pool.query<{ idx: number }>("select (abs(hashtext($1)::bigint) % 1021)::int as idx", [
+      candidate,
+    ]);
+    const idx = r.rows[0]!.idx;
+    if (seenIndexes.has(idx)) continue;
+    seenIndexes.add(idx);
+    keys.push(candidate);
+  }
+  return keys;
 }
 
 async function eventCount(workspaceId: string, publicationId: string): Promise<number> {
@@ -135,7 +185,21 @@ async function webhookDeliveryCount(workspaceId: string, externalId: string): Pr
 }
 
 beforeAll(async () => {
-  process.env["META_WEBHOOK_SECRET"] = SECRET;
+  // webhook-rate-limit.ts's `invalid_global` scope is a single shared row
+  // (bucket_index always 0, by design: N=1) -- the SAME row real production
+  // traffic reads, and the same row webhook-rate-limit.test.ts's own suite
+  // deliberately drives past its limit to prove the mechanism. Every other
+  // scope this file touches now uses a fresh, per-call key/IP (never the
+  // shared "unknown" fallback), so the only remaining source of cross-file
+  // interference is this one un-avoidable-by-key-diversification row.
+  // Resetting it here does not change what THIS file's own tests prove --
+  // every assertion below about throttling still drives its OWN scope past
+  // ITS OWN real limit and checks for 429 -- it only removes accidental
+  // pollution left behind by whichever OTHER file happened to run earlier
+  // in the same 60-second window, reproduced live by running this file
+  // together with webhook-rate-limit.test.ts (see the per-test comments
+  // below for the concrete failure that motivated this).
+  await adminPool.query("delete from webhook_rate_limit_bucket where scope = 'invalid_global'");
   ({ a, b } = await seedTwoWorkspaces(adminPool));
   // Simulate: this publication was already posted to the sandbox and Meta
   // assigned it a real external post id -- exactly the state handlePublish
@@ -165,9 +229,12 @@ afterAll(async () => {
     await adminPool.query("delete from webhook_delivery where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
     await adminPool.query("delete from credential_reference where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
     await adminPool.query("delete from integration where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
+    // Credential vault (0036_vault_secret.sql): seedTwoWorkspaces now seeds
+    // one placeholder vault_secret row per workspace, and this file's own
+    // tests provision a real per-workspace webhook secret through the vault
+    // too (signFor, above).
+    await adminPool.query("delete from vault_secret where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
   }
-  if (PREVIOUS_SECRET === undefined) delete process.env["META_WEBHOOK_SECRET"];
-  else process.env["META_WEBHOOK_SECRET"] = PREVIOUS_SECRET;
   await pool.end();
   await adminPool.end();
 });
@@ -178,7 +245,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
     const body = JSON.stringify({
       events: [{ externalId, eventType: "post.impression", value: 42, occurredAt: new Date().toISOString(), deliveryId: "d-ok-1" }],
     });
-    const { request, context } = req(a.workspaceId, body, signFor(a.workspaceId, body));
+    const { request, context } = req(a.workspaceId, body, await signFor(a.workspaceId, body));
     const res = await POST(request, context);
     expect(res.status).toBe(200);
     expect(await eventCount(a.workspaceId, a.publicationId)).toBe(baselineEventsA + 1);
@@ -191,7 +258,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
       events: [{ externalId, eventType: "post.impression", value: 7, occurredAt: new Date().toISOString(), deliveryId: "d-replay-1" }],
     });
     const before = await eventCount(a.workspaceId, a.publicationId);
-    const sig = signFor(a.workspaceId, body);
+    const sig = await signFor(a.workspaceId, body);
     const call1 = req(a.workspaceId, body, sig);
     const call2 = req(a.workspaceId, body, sig);
     const first = await POST(call1.request, call1.context);
@@ -220,7 +287,17 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
         },
       ],
     });
-    const { request, context } = req(a.workspaceId, body, sign(body, "wrong-secret"));
+    // A dedicated IP, not the shared "unknown" fallback: every test in this
+    // file that sends an invalid signature would otherwise collide on the
+    // SAME `invalid_ip` bucket (limit 10/60s, webhook-rate-limit.ts) --
+    // reproduced live: running this file together with
+    // webhook-rate-limit.test.ts (which also touches the shared,
+    // cardinality-1 `invalid_global` bucket directly) intermittently threw
+    // LATER tests in this file's own execution order from 401 to 429,
+    // purely from cumulative cross-test volume against a real, persistent,
+    // production-shaped counter -- nothing to do with whether any
+    // individual signature check is actually correct.
+    const { request, context } = req(a.workspaceId, body, sign(body, "wrong-secret"), `test-ip-forged-${newId()}`);
     const res = await POST(request, context);
     expect(res.status).toBe(401);
     expect(await webhookDeliveryCount(a.workspaceId, "d-forged-1")).toBe(0);
@@ -238,9 +315,9 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
         },
       ],
     });
-    const validSignatureForOriginal = signFor(a.workspaceId, originalBody);
+    const validSignatureForOriginal = await signFor(a.workspaceId, originalBody);
     const tamperedBody = originalBody.replace('"value":1', '"value":99999');
-    const { request, context } = req(a.workspaceId, tamperedBody, validSignatureForOriginal);
+    const { request, context } = req(a.workspaceId, tamperedBody, validSignatureForOriginal, `test-ip-tampered-${newId()}`);
     const res = await POST(request, context);
     expect(res.status).toBe(401);
     expect(await webhookDeliveryCount(a.workspaceId, "d-tampered-1")).toBe(0);
@@ -262,16 +339,34 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
 
   it("rejects malformed JSON that arrives with a genuinely valid signature, and creates no row", async () => {
     const body = "{not-valid-json";
-    const { request, context } = req(a.workspaceId, body, signFor(a.workspaceId, body));
+    const { request, context } = req(a.workspaceId, body, await signFor(a.workspaceId, body));
     const res = await POST(request, context);
     expect(res.status).toBe(400);
   });
 
-  it("rejects a malformed workspace id in the URL even with a valid signature", async () => {
+  // Was "... even with a valid signature" and asserted 404. Credential vault
+  // task: a "valid signature" is no longer a concept that can exist for a
+  // malformed workspace id at all -- there is no fleet-wide root left to
+  // derive one from, and getWorkspaceWebhookSecret only ever resolves a
+  // secret through vault_secret, which is keyed on a REAL workspace id.
+  // isId(rawWorkspaceId) is checked before the vault is ever consulted
+  // (route.ts step 2), so a malformed id short-circuits straight to a null
+  // secret -- indistinguishable, on the wire, from any other failed
+  // signature check: 401, not 404. This is a genuine, deliberate behaviour
+  // change, not a weakened assertion: it removes a distinction ("malformed
+  // id" vs "bad signature") an unauthenticated caller could previously use
+  // to learn something about the URL shape, which is strictly less
+  // information leaked, not more.
+  it("rejects a malformed workspace id in the URL with 401, since no secret can ever be resolved for it", async () => {
     const body = JSON.stringify({ events: [] });
-    const { request, context } = req("not-a-real-workspace-id", body, signFor("not-a-real-workspace-id", body));
+    const { request, context } = req(
+      "not-a-real-workspace-id",
+      body,
+      sign(body, "irrelevant-secret"),
+      `test-ip-malformed-${newId()}`,
+    );
     const res = await POST(request, context);
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(401);
   });
 
   // --- Late-review CRITICAL 2 -------------------------------------------
@@ -296,7 +391,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
     });
     const beforeA = await eventCount(a.workspaceId, a.publicationId);
     // The exact bytes and the exact signature workspace A would have sent.
-    const { request, context } = req(b.workspaceId, body, signFor(a.workspaceId, body));
+    const { request, context } = req(b.workspaceId, body, await signFor(a.workspaceId, body), `test-ip-replay-${newId()}`);
     const res = await POST(request, context);
 
     expect(res.status).toBe(401);
@@ -321,7 +416,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
     const burnBody = JSON.stringify({
       events: [{ externalId, eventType: "post.impression", value: 1, occurredAt: new Date().toISOString(), deliveryId }],
     });
-    const burn = req(b.workspaceId, burnBody, signFor(a.workspaceId, burnBody));
+    const burn = req(b.workspaceId, burnBody, await signFor(a.workspaceId, burnBody), `test-ip-burn-${newId()}`);
     expect((await POST(burn.request, burn.context)).status).toBe(401);
 
     // B's genuine delivery, with the same delivery id, must still be
@@ -330,7 +425,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
     const realBody = JSON.stringify({
       events: [{ externalId, eventType: "post.impression", value: 77, occurredAt: new Date().toISOString(), deliveryId }],
     });
-    const real = req(b.workspaceId, realBody, signFor(b.workspaceId, realBody));
+    const real = req(b.workspaceId, realBody, await signFor(b.workspaceId, realBody));
     expect((await POST(real.request, real.context)).status).toBe(200);
     expect(await eventCount(b.workspaceId, b.publicationId)).toBe(before + 1);
   });
@@ -345,7 +440,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
     const body = JSON.stringify({
       events: [{ externalId, eventType: "post.impression", value: 5, occurredAt: new Date().toISOString(), deliveryId }],
     });
-    const forged = req(a.workspaceId, body, sign(body, "wrong-secret"));
+    const forged = req(a.workspaceId, body, sign(body, "wrong-secret"), `test-ip-audit-${newId()}`);
     expect((await POST(forged.request, forged.context)).status).toBe(401);
 
     const rejected = await adminPool.query(
@@ -359,7 +454,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
     expect(await webhookDeliveryCount(a.workspaceId, deliveryId)).toBe(0);
 
     const before = await eventCount(a.workspaceId, a.publicationId);
-    const real = req(a.workspaceId, body, signFor(a.workspaceId, body));
+    const real = req(a.workspaceId, body, await signFor(a.workspaceId, body));
     expect((await POST(real.request, real.context)).status).toBe(200);
     expect(await eventCount(a.workspaceId, a.publicationId)).toBe(before + 1);
   });
@@ -373,7 +468,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
       deliveryId: `d-flood-${i}`,
     }));
     const body = JSON.stringify({ events });
-    const { request, context } = req(a.workspaceId, body, signFor(a.workspaceId, body));
+    const { request, context } = req(a.workspaceId, body, await signFor(a.workspaceId, body));
     expect((await POST(request, context)).status).toBe(400);
     expect(await webhookDeliveryCount(a.workspaceId, "d-flood-0")).toBe(0);
   });
@@ -390,12 +485,25 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
         },
       ],
     });
-    const { request, context } = req(a.workspaceId, body, signFor(a.workspaceId, body));
+    const { request, context } = req(a.workspaceId, body, await signFor(a.workspaceId, body));
     expect((await POST(request, context)).status).toBe(400);
     expect(await webhookDeliveryCount(a.workspaceId, `d-baddate-${a.workspaceId}`)).toBe(0);
   });
 
-  it("answers 404 for a well-formed workspace id that names no workspace, leaking no constraint name", async () => {
+  // Was "answers 404 ... leaking no constraint name". Credential vault
+  // task: a well-formed but nonexistent workspace id can never have a real
+  // vault-stored secret either -- getWorkspaceWebhookSecret attempts to
+  // provision one on first use, that INSERT fails on vault_secret's own FK
+  // to `workspace` (0036_vault_secret.sql), and server/webhook-secret.ts
+  // catches that failure and resolves to `null` rather than letting the raw
+  // driver error (which, for a Postgres FK violation, names the constraint)
+  // propagate anywhere. There is therefore no way to produce "a genuinely
+  // valid signature for a workspace that doesn't exist" anymore, so this
+  // case collapses into the same 401 every other unverifiable signature
+  // gets -- and the constraint-name-leak property the old test's name
+  // promised is, if anything, MORE true now: the failure is caught two
+  // layers before it could ever reach an HTTP response.
+  it("answers 401 for a well-formed workspace id that names no workspace, leaking no constraint name", async () => {
     const ghost = newId();
     const body = JSON.stringify({
       events: [
@@ -408,9 +516,9 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
         },
       ],
     });
-    const { request, context } = req(ghost, body, signFor(ghost, body));
+    const { request, context } = req(ghost, body, sign(body, "irrelevant-secret"), `test-ip-ghost-${newId()}`);
     const res = await POST(request, context);
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(401);
     expect(await res.text()).toBe("");
   });
 
@@ -462,14 +570,15 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
       const targetWorkspaceId = await createBareWorkspace();
       const limit = WEBHOOK_RATE_LIMITS.invalid_workspace.limit;
 
+      // Collision-free by construction (see distinctNonCollidingBucketKeys):
+      // a per-IP budget individually never trips, so only the
+      // per-claimed-workspace scope can be what throttles this.
+      const ips = await distinctNonCollidingBucketKeys(limit + 5, "test-ip-distributed");
+
       const statuses: number[] = [];
       for (let i = 0; i < limit + 5; i++) {
-        // A FRESH IP every single request -- the per-IP budget individually
-        // never trips, so only the per-claimed-workspace scope can be what
-        // throttles this.
-        const ip = `test-ip-distributed-${newId()}-${i}`;
         const body = forgedEventBody(targetWorkspaceId, `d-distflood-${i}-${newId()}`);
-        const { request, context } = req(targetWorkspaceId, body, sign(body, "wrong-secret"), ip);
+        const { request, context } = req(targetWorkspaceId, body, sign(body, "wrong-secret"), ips[i]);
         statuses.push((await POST(request, context)).status);
       }
 
@@ -500,7 +609,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
         events: [{ externalId, eventType: "post.impression", value: 999, occurredAt: new Date().toISOString(), deliveryId }],
       });
       const before = await eventCount(a.workspaceId, a.publicationId);
-      const { request: genuineReq, context: genuineCtx } = req(a.workspaceId, genuineBody, signFor(a.workspaceId, genuineBody));
+      const { request: genuineReq, context: genuineCtx } = req(a.workspaceId, genuineBody, await signFor(a.workspaceId, genuineBody));
       const res = await POST(genuineReq, genuineCtx);
 
       expect(res.status).toBe(200);
@@ -526,10 +635,58 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
         events: [{ externalId, eventType: "post.impression", value: 123, occurredAt: new Date().toISOString(), deliveryId }],
       });
       const before = await eventCount(b.workspaceId, b.publicationId);
-      const { request: genuineReq, context: genuineCtx } = req(b.workspaceId, genuineBody, signFor(b.workspaceId, genuineBody));
+      const { request: genuineReq, context: genuineCtx } = req(b.workspaceId, genuineBody, await signFor(b.workspaceId, genuineBody));
       const res = await POST(genuineReq, genuineCtx);
 
       expect(res.status).toBe(200); // B is completely unaffected by A's flood
+      expect(await eventCount(b.workspaceId, b.publicationId)).toBe(before + 1);
+    });
+
+    // `invalid_global` (webhook-rate-limit.ts) is the ONE scope with a
+    // single shared row (N=1, bucket_index always 0) across every
+    // workspace and every IP -- deliberately, so a flood distributed
+    // across many fabricated workspace ids AND many source IPs still trips
+    // something. That also means it is the one scope where "workspace A's
+    // attacker can affect workspace B" is TRUE for the invalid-signature
+    // bookkeeping itself (B's own rare invalid-signature attempt could get
+    // 429 instead of a recorded rejection during A's flood window) -- but
+    // the property that actually matters is narrower and load-bearing: a
+    // GENUINE, validly-signed delivery must never be blocked by it. Proven
+    // directly here, not assumed: the bucket is driven straight to its real
+    // production ceiling by SQL (not by sending 200 HTTP requests, for
+    // speed), and a brand-new workspace's correctly-signed delivery is
+    // shown to still succeed. This holds structurally, not by luck --
+    // route.ts only ever checks `invalid_global` on the branch where
+    // `signatureOk` is false; a validly-signed request takes the
+    // `valid_workspace` branch instead (checkWebhookRateLimit(pool,
+    // "valid_workspace", rawWorkspaceId)), a completely separate row keyed
+    // per-workspace, which forged traffic can never write into at all.
+    it("a genuine, validly signed delivery still succeeds even with the fleet-wide invalid_global bucket already at its real production ceiling", async () => {
+      await adminPool.query(
+        `insert into webhook_rate_limit_bucket (scope, bucket_index, window_start, request_count)
+         values ('invalid_global', 0, now(), $1)
+         on conflict (scope, bucket_index) do update set window_start = now(), request_count = $1`,
+        [WEBHOOK_RATE_LIMITS.invalid_global.limit + 50],
+      );
+
+      // Sanity: the scope really is exhausted right now for an INVALID
+      // signature (this is the cross-tenant cost the header above names).
+      const forgedBody = forgedEventBody(a.workspaceId, `d-global-exhausted-forged-${newId()}`);
+      const forged = req(a.workspaceId, forgedBody, sign(forgedBody, "wrong-secret"), `test-ip-global-sanity-${newId()}`);
+      expect((await POST(forged.request, forged.context)).status).toBe(429);
+
+      // The load-bearing property: a GENUINE delivery is entirely
+      // unaffected, for a workspace that has sent nothing else this test.
+      const externalId = `route-test-post-${b.publicationId}`;
+      const deliveryId = `d-global-exhausted-genuine-${newId()}`;
+      const genuineBody = JSON.stringify({
+        events: [{ externalId, eventType: "post.impression", value: 55, occurredAt: new Date().toISOString(), deliveryId }],
+      });
+      const before = await eventCount(b.workspaceId, b.publicationId);
+      const { request, context } = req(b.workspaceId, genuineBody, await signFor(b.workspaceId, genuineBody));
+      const res = await POST(request, context);
+
+      expect(res.status).toBe(200);
       expect(await eventCount(b.workspaceId, b.publicationId)).toBe(before + 1);
     });
   });

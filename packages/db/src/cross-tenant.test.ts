@@ -170,9 +170,24 @@ const EXPECTED_TENANT_TABLES = [
   "agent_definition", "agent_run", "agent_version", "approval_decision", "approval_request",
   "audit_log", "campaign", "content_item", "content_version", "credential_reference",
   "event", "goal", "integration", "metric", "outbox",
-  "publication", "run_checkpoint", "source_citation", "tool_call", "webhook_delivery",
-  "workspace_member",
+  "publication", "run_checkpoint", "source_citation", "tool_call", "vault_secret",
+  "webhook_delivery", "workspace_member",
 ].toSorted();
+
+/**
+ * Credential vault (0036_vault_secret.sql): the ONE table in this catalog
+ * that smos_app has literally no grant on at all -- not filtered by RLS to
+ * an empty result, but refused outright with a permission error. This is a
+ * STRONGER isolation guarantee than every other table's ("your own
+ * workspace's rows are visible, another workspace's are RLS-filtered to
+ * zero"), so the two generic it.each bodies below cannot apply their usual
+ * shape to it: there is no "sees its own rows" case to assert when the role
+ * driving the assertion (smos_app) cannot see ANY row in this table,
+ * including its own. Both bodies special-case this list instead of
+ * silently skipping it, per this file's own rule that every discovered
+ * table must be accounted for explicitly.
+ */
+const NO_APP_ACCESS_TABLES = ["vault_secret"];
 
 const EXPECTED_FK_PAIRS = [
   "agent_run->agent_version",
@@ -251,6 +266,9 @@ afterAll(async () => {
     await adminPool.query("delete from metric where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
     await adminPool.query("delete from webhook_delivery where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
     await adminPool.query("delete from integration where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
+    // Credential vault (0036_vault_secret.sql): seedTwoWorkspaces now seeds
+    // one placeholder vault_secret row per workspace too.
+    await adminPool.query("delete from vault_secret where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
     // Auth schema (0029_auth_schema.sql): workspace_member has no children,
     // so it is always safely deletable here, unlike the plain-FK chain above.
     await adminPool.query("delete from workspace_member where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
@@ -439,6 +457,20 @@ function buildProbeRow(table: string, ws: TenantFixture, id: string): { columns:
           { value: new Date() }, { value: "last_touch" }, { value: "7d" }, { value: "low" },
         ],
       };
+    // Credential vault (infra/migrations/0036_vault_secret.sql): smos_app
+    // has no grant on this table at all, so the INSERT built from this row
+    // is expected to be refused with "permission denied", never reaching
+    // RLS's WITH CHECK -- see NO_APP_ACCESS_TABLES above.
+    case "vault_secret":
+      return {
+        columns: ["id", "workspace_id", "slug", "ciphertext", "iv", "auth_tag", "wrapped_data_key", "wrap_iv", "wrap_auth_tag", "kek_id"],
+        cells: [
+          { value: id }, { value: ws.workspaceId }, { value: `e12-probe-vault-${id}` },
+          { value: Buffer.from([0]) }, { value: Buffer.from([0]) }, { value: Buffer.from([0]) },
+          { value: Buffer.from([0]) }, { value: Buffer.from([0]) }, { value: Buffer.from([0]) },
+          { value: "e12-probe-kek" },
+        ],
+      };
     // Auth schema (infra/migrations/0029_auth_schema.sql):
     case "workspace_member":
       return {
@@ -522,6 +554,23 @@ describe("E8/E14: every discovered workspace-owned table is isolated", () => {
     expect(bRow.rowCount, `fixture seeded a ${table} row for workspace B`).toBe(1);
     const bRowId: string = bRow.rows[0].id;
 
+    if (NO_APP_ACCESS_TABLES.includes(table)) {
+      // No "sees its own rows" case applies here: smos_app cannot see ANY
+      // row in this table, full stop -- a stronger guarantee than RLS
+      // filtering, proved directly (not mocked) as a real permission
+      // error, in its own transaction so one failed statement's aborted-
+      // transaction state can't shadow a second assertion in the same one.
+      await expect(
+        withTenant(pool, a.workspaceId, (tx) => tx.query(`select id from ${table} where id = $1`, [bRowId])),
+      ).rejects.toThrow(/permission denied/i);
+      await expect(
+        withTenant(pool, a.workspaceId, (tx) =>
+          tx.query(`select count(*)::int as n from ${table} where workspace_id = $1`, [a.workspaceId]),
+        ),
+      ).rejects.toThrow(/permission denied/i);
+      return;
+    }
+
     await withTenant(pool, a.workspaceId, async (tx) => {
       // A can see its own rows in this table (sanity: RLS isn't hiding
       // everything, only what's out of scope).
@@ -551,6 +600,14 @@ describe("E8/E14: every discovered workspace-owned table is isolated", () => {
   it.each(TENANT_TABLES)("%s: an INSERT tagged with workspace B from workspace A's scope is refused", async (table) => {
     const row = buildProbeRow(table, b, newId());
     const { text, values } = toInsertSql(table, row);
+    if (NO_APP_ACCESS_TABLES.includes(table)) {
+      // smos_app has no INSERT grant on this table at all -- refused before
+      // RLS's WITH CHECK is ever reached.
+      await expect(withTenant(pool, a.workspaceId, (tx) => tx.query(text, values))).rejects.toThrow(
+        /permission denied/i,
+      );
+      return;
+    }
     await expect(withTenant(pool, a.workspaceId, (tx) => tx.query(text, values))).rejects.toThrow(
       /row-level security|violates/i,
     );

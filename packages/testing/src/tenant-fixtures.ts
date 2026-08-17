@@ -42,6 +42,14 @@ export interface TenantFixture {
   // cross-tenant.test.ts's exhaustive, catalog-driven suite needs one real
   // row per workspace here too.
   workspaceMemberId: Id;
+  // Credential vault (0036_vault_secret.sql): seeded directly with
+  // placeholder bytea values via the migration-owner connection (which
+  // bypasses RLS and grants alike, being a superuser) -- never through
+  // packages/vault's own sealSecret/putSecret, since this fixture exists
+  // only to give cross-tenant.test.ts's exhaustive, catalog-driven suite a
+  // real row to probe, not to prove the crypto (that's
+  // packages/vault/src/vault-store.test.ts's job).
+  vaultSecretId: Id;
 }
 
 async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixture> {
@@ -64,6 +72,7 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
   const runCheckpointId = newId();
   const integrationId = newId();
   const workspaceMemberId = newId();
+  const vaultSecretId = newId();
 
   // Seeded directly as the connecting (superuser) role, which always bypasses
   // RLS -- these rows exist to be *subjects* of the isolation proof, not to
@@ -199,6 +208,16 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
     `insert into workspace_member (id, workspace_id, user_id, role) values ($1, $2, $3, 'owner')`,
     [workspaceMemberId, workspaceId, userId],
   );
+  // Credential vault (0036_vault_secret.sql): placeholder ciphertext/wrap
+  // bytes, never real crypto output -- this row exists only so
+  // cross-tenant.test.ts's catalog-driven discovery has a real row to find
+  // for this table, exactly like every other table seeded above.
+  await client.query(
+    `insert into vault_secret
+       (id, workspace_id, slug, ciphertext, iv, auth_tag, wrapped_data_key, wrap_iv, wrap_auth_tag, kek_id)
+     values ($1, $2, $3, '\\x00'::bytea, '\\x00'::bytea, '\\x00'::bytea, '\\x00'::bytea, '\\x00'::bytea, '\\x00'::bytea, 'e12-seed-kek')`,
+    [vaultSecretId, workspaceId, `e12-${label}-vault-secret-${vaultSecretId}`],
+  );
 
   return {
     workspaceId,
@@ -220,6 +239,7 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
     runCheckpointId,
     integrationId,
     workspaceMemberId,
+    vaultSecretId,
   };
 }
 

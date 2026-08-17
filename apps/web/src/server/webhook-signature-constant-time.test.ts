@@ -49,7 +49,7 @@ vi.mock("node:crypto", async (importOriginal) => {
   };
 });
 
-const { verifySignature, deriveWorkspaceSecret } = await import("./webhook-signature.ts");
+const { verifySignature } = await import("./webhook-signature.ts");
 
 const secret = "sandbox-secret";
 const body = JSON.stringify({ object: "page", entry: [] });
@@ -96,9 +96,17 @@ describe("verifySignature performs the comparison in constant time", () => {
     expect(timingSafeEqualSpy).not.toHaveBeenCalled();
   });
 
-  it("compares under the workspace-derived secret, so the timing-safe path is the one the route uses", () => {
-    const workspaceId = "019ff775-f7f6-7e31-9114-45c0fb0e8fd2";
-    const workspaceSecret = deriveWorkspaceSecret(secret, workspaceId);
+  // Was "compares under the workspace-derived secret". Since the credential
+  // vault replaced HMAC-from-a-root derivation (server/webhook-secret.ts),
+  // there is no `deriveWorkspaceSecret` left to exercise here -- but the
+  // property this test actually pins ("the timing-safe path is the one the
+  // route's own secret shape uses") only ever depended on the secret being
+  // an opaque hex string, which is exactly what @smos/vault's
+  // getOrCreateSecret generates (randomBytes(32).toString("hex")). A
+  // same-shaped literal proves the identical thing without resurrecting the
+  // derivation function.
+  it("compares under a workspace-secret-shaped value, so the timing-safe path is the one the route uses", () => {
+    const workspaceSecret = "0123456789abcdef".repeat(4); // 64 hex chars, same shape as a vault-generated secret
     const hex = createHmac("sha256", workspaceSecret).update(body).digest("hex");
     expect(verifySignature(body, `sha256=${hex}`, workspaceSecret)).toBe(true);
     expect(timingSafeEqualSpy).toHaveBeenCalledTimes(1);

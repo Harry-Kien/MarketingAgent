@@ -1,0 +1,11 @@
+export type { KmsProvider, WrappedKey } from "./kms-provider.ts";
+export { createEnvKmsProvider } from "./providers/env-kms-provider.ts";
+export type { SealedSecret } from "./envelope.ts";
+export { sealSecret, openSecret } from "./envelope.ts";
+export type { VaultKey } from "./vault-key.ts";
+export { buildVaultKey, parseVaultKey } from "./vault-key.ts";
+export type { VaultTx } from "./vault-pool.ts";
+export { createVaultPool, withVaultTenant } from "./vault-pool.ts";
+export { putSecret, resolveSecret, rotateSecretKek } from "./vault-store.ts";
+export { getOrCreateSecret } from "./workspace-secret.ts";
+export { VaultTamperError, VaultNotFoundError, VaultKeyMismatchError } from "./errors.ts";

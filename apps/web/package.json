@@ -13,6 +13,7 @@
     "@smos/db": "*",
     "@smos/domain": "*",
     "@smos/telemetry": "*",
+    "@smos/vault": "*",
     "@smos/worker": "*",
     "better-auth": "1.6.26",
     "next": "16.3.0",

@@ -43,31 +43,21 @@ const HEX_RE = /^[0-9a-f]+$/i;
  *       radius: a leaked workspace secret forges deliveries for that one
  *       tenant, never the fleet.
  *
- * (2) is chosen. The per-workspace secret is DERIVED from the root secret
- * rather than stored, because no vault exists in this milestone --
- * `credential_reference.vault_key` is deliberately only an opaque pointer
- * this database never resolves (0028_integration.sql), so there is nowhere
- * to put a genuinely independent per-tenant secret today. Derivation buys
- * the isolation immediately with no new storage and no new dependency:
- * HMAC-SHA256 is a PRF, so `HMAC(root, "smos:meta-webhook:v1:" +
- * workspaceId)` is computationally independent per workspace, and holding
- * one derived secret reveals nothing about the root or about any other
- * workspace's secret.
- *
- * What derivation does NOT buy, stated plainly: leaking the ROOT secret
- * still compromises every workspace. That is strictly no worse than the
- * global scheme it replaces, and when a real vault lands only this one
- * function changes -- the wire format, the route and every test already
- * speak in terms of "the secret for THIS workspace".
- *
- * The version tag in the label is load-bearing: rotating the derivation
- * scheme later means bumping `v1`, which invalidates every previously issued
- * workspace secret at once instead of silently honouring both.
+ * (2) is chosen. Originally the per-workspace secret was DERIVED from one
+ * fleet-wide root secret (`HMAC(root, "smos:meta-webhook:v1:" +
+ * workspaceId)`), because no vault existed yet -- `credential_reference.
+ * vault_key` was deliberately only an opaque pointer this database never
+ * resolved (0028_integration.sql). That derivation is now gone: the
+ * credential vault (0036_vault_secret.sql, @smos/vault) exists, so each
+ * workspace's secret is generated independently at random on first use and
+ * stored sealed (envelope encryption) rather than computed from a shared
+ * root -- see server/webhook-secret.ts's `getWorkspaceWebhookSecret`, which
+ * this route now calls instead of a derivation function. Leaking one
+ * workspace's secret now reveals nothing about the root (there is no root
+ * anymore) or about any other workspace's secret -- the exact "one leaked
+ * secret compromises every tenant" concern the derivation scheme's own
+ * header used to disclose as unclosed is now closed.
  */
-export function deriveWorkspaceSecret(rootSecret: string, workspaceId: string): string {
-  return createHmac("sha256", rootSecret).update(`smos:meta-webhook:v1:${workspaceId}`).digest("hex");
-}
-
 export function verifySignature(body: string, header: string, secret: string): boolean {
   if (!header || !header.startsWith(SIG_PREFIX)) return false;
   const provided = header.slice(SIG_PREFIX.length);
