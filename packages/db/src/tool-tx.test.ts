@@ -70,7 +70,36 @@ describe("ToolTx surface", () => {
     });
   });
 
-  it("compile-time: ToolTx has no query method at all (would fail typecheck if one existed)", async () => {
+  // NOT A TEST -- type-level documentation only, verified by nothing in the
+  // verify chain. `it.skip` (not `it`) so the runner reports it as skipped
+  // rather than a misleadingly green pass.
+  //
+  // The `@ts-expect-error` below is inert under both commands that could
+  // conceivably check it:
+  //   - `npm test` (vitest): transforms this file with esbuild, which
+  //     strips types without type-checking them. `@ts-expect-error` is
+  //     never evaluated; `tools.query` is just a harmless property access
+  //     on `undefined` at runtime, so this "test" could never go red even
+  //     before that.
+  //   - `npm run typecheck` (`tsc --build`): packages/db/tsconfig.json has
+  //     `"exclude": ["src/**/*.test.ts"]` (true of every package in this
+  //     repo except apps/web), so this file is never a compilation root.
+  // Confirmed empirically: pointing a scratch tsconfig at this file alone
+  // (include: ["src/tool-tx.test.ts"], no test exclusion) does make
+  // `@ts-expect-error` real -- but it also surfaces ~28 pre-existing,
+  // unrelated type errors elsewhere in this file (untyped `Id` literals,
+  // `unknown`-typed query results, etc.) that predate this task and are
+  // out of scope to fix here. Wiring this file into `tsc --build` for real
+  // is a separate, larger cleanup, not a one-line change.
+  //
+  // The runtime half of this guarantee -- that a live `ToolTx` instance
+  // has no `query`/`execute`/`raw`/`sql` property -- IS actually checked,
+  // above, in "exposes exactly the narrow, named operations..." (bracket
+  // access, so it needs no type assertion to run). What is undocumented
+  // here is only the static claim that the *type* itself has no such
+  // member. Until this file is added to a tsc project, that claim rests on
+  // code review, not CI.
+  it.skip("compile-time only: ToolTx's type has no query method (not checked by npm test or npm run typecheck -- see comment above)", async () => {
     await withTenantTools(pool, A, async (tools: ToolTx) => {
       // @ts-expect-error -- ToolTx must never expose a way to run raw SQL text;
       // if this ever stops being a type error, the narrow interface has been
