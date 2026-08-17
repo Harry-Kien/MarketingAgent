@@ -25,6 +25,7 @@
 // agent_version) -- exactly the split every other integration test in this
 // repository already uses (packages/agents/src/runtime-db.test.ts,
 // packages/db/src/cross-tenant.test.ts).
+import { createHmac } from "node:crypto";
 import type pg from "pg";
 import {
   newId,
@@ -63,6 +64,10 @@ import {
   type IngestEventPayload,
 } from "@smos/worker";
 import type { ChannelAdapter } from "@smos/integrations";
+import { performApproval, type PerformApprovalDeps } from "../../src/server/actions/approve.ts";
+import { isChannelConnected, providerForChannel } from "../../src/server/channel-status.ts";
+import { recordSandboxVerification } from "../../src/server/integration-verification.ts";
+import { deriveWorkspaceSecret } from "../../src/server/webhook-signature.ts";
 
 export const TARGET_CHANNEL = "meta_page";
 export const SANDBOX_PAGE_ID = "page-1";
@@ -405,6 +410,42 @@ export async function createApprovalRequest(
   return approvalRequestId;
 }
 
+/**
+ * Late-review IMPORTANT 6. The founder configures the Meta channel before
+ * anything can be approved for it -- `performApproval`'s T17 gate refuses an
+ * approval whose target channel is not backed by a real `integration` row
+ * (apps/web/src/server/channel-status.ts), and that gate was never exercised
+ * by this sequence because the sequence bypassed the web layer entirely.
+ *
+ * `'connected'` is the honest status here and the only one available at this
+ * point in the story: it claims the workspace CONFIGURED the channel, never
+ * that it works. `'sandbox'` -- the "đã xác minh" claim -- cannot be written
+ * yet even by a fixture, because since
+ * 0033_integration_sandbox_must_be_earned.sql it requires naming a
+ * publication that has actually succeeded, and no publish has happened yet.
+ * That is the point: the sequence has to earn it, in order, later.
+ */
+export async function configureChannel(pool: pg.Pool, ws: GoldenWorkspace): Promise<void> {
+  await withTenant(pool, ws.workspaceId, (tx) =>
+    tx.query(`insert into integration (id, workspace_id, provider, status) values ($1, $2, $3, 'connected')`, [
+      newId(),
+      ws.workspaceId,
+      providerForChannel(TARGET_CHANNEL),
+    ]),
+  );
+}
+
+export async function readIntegrationStatus(pool: pg.Pool, ws: GoldenWorkspace): Promise<string | null> {
+  const r = await withTenant(pool, ws.workspaceId, (tx) =>
+    tx.query(`select status from integration where workspace_id = $1 and provider = $2`, [
+      ws.workspaceId,
+      providerForChannel(TARGET_CHANNEL),
+    ]),
+  );
+  const row = r.rows[0] as { status: string } | undefined;
+  return row?.status ?? null;
+}
+
 export interface RecordDecisionInput {
   approvalRequestId: Id;
   contentVersionId: Id;
@@ -470,6 +511,165 @@ export async function recordHumanDecision(
   }
 
   return decision.id;
+}
+
+/**
+ * Late-review IMPORTANT 6: the same decision, driven through the WEB LAYER
+ * the founder actually uses, not around it.
+ *
+ * `recordHumanDecision` above calls `decideApproval` directly, which skips
+ * everything `performApproval` (apps/web/src/server/actions/approve.ts) adds
+ * on top of it: the tenant cross-check, `assertRenderable`, and the T17
+ * channel gate -- none of which this sequence ever exercised despite the
+ * sequence's own claim to prove the golden path end to end. These deps are
+ * the same ones `submitApproval` wires in production, read for read and
+ * write for write; the only thing not exercised is `submitApproval`'s own
+ * FormData parsing and `requireWorkspace()` session resolution, because on
+ * this branch `requireWorkspace()` is still the documented stub that always
+ * throws (apps/web/src/server/auth.ts) -- see this file's header.
+ */
+export async function recordHumanDecisionViaWebLayer(
+  pool: pg.Pool,
+  ws: GoldenWorkspace,
+  input: { approvalRequestId: Id; decision: ApprovalDecisionKind; reason: string },
+): Promise<Id> {
+  return withTenant(pool, ws.workspaceId, async (tx) => {
+    const deps: PerformApprovalDeps = {
+      async loadRequest(id) {
+        const r = await tx.query(
+          `select id, workspace_id, campaign_id, content_version_id, target_channel, policy_flags, estimated_impact, created_at
+           from approval_request where id = $1 and workspace_id = $2`,
+          [id, ws.workspaceId],
+        );
+        const row = r.rows[0] as
+          | {
+              id: string;
+              workspace_id: string;
+              campaign_id: string;
+              content_version_id: string;
+              target_channel: string;
+              policy_flags: ApprovalRequest["policyFlags"] | null;
+              estimated_impact: string | null;
+              created_at: Date;
+            }
+          | undefined;
+        if (!row) throw new Error("Approval request not found");
+        const citations = await tx.query(
+          `select id from source_citation where content_version_id = $1 and workspace_id = $2`,
+          [row.content_version_id, ws.workspaceId],
+        );
+        return {
+          id: row.id as Id,
+          workspaceId: row.workspace_id as Id,
+          campaignId: row.campaign_id as Id,
+          contentVersionId: row.content_version_id as Id,
+          targetChannel: row.target_channel,
+          policyFlags: row.policy_flags ?? [],
+          evidenceCitationIds: (citations.rows as Array<{ id: string }>).map((c) => c.id as Id),
+          estimatedImpact: row.estimated_impact,
+          createdAt: row.created_at,
+        };
+      },
+      isChannelConnected: (channel) => isChannelConnected(pool, ws.workspaceId, channel),
+      async saveDecision(decision) {
+        await tx.query(
+          `insert into approval_decision (id, workspace_id, approval_request_id, actor_user_id, actor_kind, decision, reason, decided_at, content_version_id, target_channel)
+           values ($1, $2, $3, $4, 'user', $5, $6, $7, $8, $9)`,
+          [
+            decision.id,
+            decision.workspaceId,
+            decision.approvalRequestId,
+            decision.actorUserId,
+            decision.decision,
+            decision.reason,
+            decision.decidedAt,
+            decision.contentVersionId,
+            decision.targetChannel,
+          ],
+        );
+      },
+      async writeAudit(event) {
+        await tx.query(
+          `insert into audit_log (id, workspace_id, event_type, actor_kind, actor_user_id, subject_type, subject_id, payload)
+           values ($1, $2, $3, 'user', $4, 'approval_request', $5, $6::jsonb)`,
+          [newId(), event.workspaceId, event.eventType, event.actorUserId, event.subjectId, JSON.stringify(event.payload)],
+        );
+      },
+    };
+
+    const decision = await performApproval(
+      {
+        approvalRequestId: input.approvalRequestId,
+        decision: input.decision,
+        reason: input.reason,
+        session: { userId: ws.userId, workspaceId: ws.workspaceId },
+      },
+      deps,
+    );
+    return decision.id;
+  });
+}
+
+/** The recorded decision as the database actually holds it -- including the
+ * content_version_id / target_channel snapshot columns 0031 added, which are
+ * what handlePublish's gate now reads (late-review CRITICAL 1). */
+export async function readApprovalDecision(
+  pool: pg.Pool,
+  ws: GoldenWorkspace,
+  approvalDecisionId: Id,
+): Promise<{ decision: string; actorUserId: string; contentVersionId: string; targetChannel: string }> {
+  const r = await withTenant(pool, ws.workspaceId, (tx) =>
+    tx.query(
+      `select decision, actor_user_id, content_version_id, target_channel
+       from approval_decision where id = $1 and workspace_id = $2`,
+      [approvalDecisionId, ws.workspaceId],
+    ),
+  );
+  const row = r.rows[0] as
+    | { decision: string; actor_user_id: string; content_version_id: string; target_channel: string }
+    | undefined;
+  if (!row) throw new Error(`Approval decision ${approvalDecisionId} not found`);
+  return {
+    decision: row.decision,
+    actorUserId: row.actor_user_id,
+    contentVersionId: row.content_version_id,
+    targetChannel: row.target_channel,
+  };
+}
+
+/** The persisted content the agents actually produced, and how much evidence
+ * it carries -- proof steps 1-4 wrote something real (IMPORTANT 6). */
+export async function readContentVersion(
+  pool: pg.Pool,
+  ws: GoldenWorkspace,
+  contentVersionId: Id,
+): Promise<{ publicationContent: string; citationCount: number }> {
+  return withTenant(pool, ws.workspaceId, async (tx) => {
+    const version = await tx.query(
+      `select publication_content from content_version where id = $1 and workspace_id = $2`,
+      [contentVersionId, ws.workspaceId],
+    );
+    const row = version.rows[0] as { publication_content: string } | undefined;
+    if (!row) throw new Error(`Content version ${contentVersionId} not found`);
+    const citations = await tx.query(
+      `select count(*)::int as n from source_citation where content_version_id = $1 and workspace_id = $2`,
+      [contentVersionId, ws.workspaceId],
+    );
+    return {
+      publicationContent: row.publication_content,
+      citationCount: (citations.rows[0] as { n: number }).n,
+    };
+  });
+}
+
+/** Late-review IMPORTANT 3 + 6: the sandbox verification the publish just
+ * earned, recorded through the one function allowed to make that claim. */
+export async function markChannelSandboxVerified(
+  pool: pg.Pool,
+  ws: GoldenWorkspace,
+  publicationId: Id,
+): Promise<void> {
+  await recordSandboxVerification(pool, ws.workspaceId, { targetChannel: TARGET_CHANNEL, publicationId });
 }
 
 /** Builds a Publication via the REAL `buildPublication`
@@ -726,6 +926,141 @@ export function makeIngestDeps(pool: pg.Pool, ws: GoldenWorkspace): IngestEventD
 
 export async function ingestSandboxEvent(pool: pg.Pool, ws: GoldenWorkspace, payload: IngestEventPayload): Promise<void> {
   await handleIngestEvent(payload, makeIngestDeps(pool, ws));
+}
+
+/**
+ * Late-review IMPORTANT 6. The sequence used to call `handleIngestEvent`
+ * directly, which meant it proved nothing about the layer an actual Meta
+ * delivery arrives through: no signature verification, no workspace binding,
+ * no body bounds, no JSON validation, no RLS-scoped route wiring. It also
+ * meant the reviewer could put `return;` at the top of `handleIngestEvent`
+ * and the whole sequence stayed green.
+ *
+ * This drives the REAL route handler (apps/web/src/app/api/webhooks/meta/
+ * [workspaceId]/route.ts) with a real `Request`, a real streamed body and a
+ * real `x-hub-signature-256` header signed under the workspace-derived
+ * secret -- exactly what a sandbox delivery looks like on the wire. It
+ * returns the HTTP status so the caller can assert on it.
+ */
+export async function ingestSandboxEventViaWebhook(
+  ws: GoldenWorkspace,
+  payload: IngestEventPayload,
+): Promise<number> {
+  const rootSecret = process.env["META_WEBHOOK_SECRET"];
+  if (rootSecret === undefined || rootSecret.length === 0) {
+    throw new Error("META_WEBHOOK_SECRET must be set before driving the webhook route");
+  }
+  const body = JSON.stringify({ events: [payload] });
+  const signature =
+    "sha256=" + createHmac("sha256", deriveWorkspaceSecret(rootSecret, ws.workspaceId)).update(body).digest("hex");
+
+  const { POST } = await import("../../src/app/api/webhooks/meta/[workspaceId]/route.ts");
+  const response = await POST(
+    new Request(`http://sandbox.test/api/webhooks/meta/${ws.workspaceId}`, {
+      method: "POST",
+      body,
+      headers: { "x-hub-signature-256": signature },
+    }),
+    { params: Promise.resolve({ workspaceId: ws.workspaceId }) },
+  );
+  return response.status;
+}
+
+/**
+ * The same delivery, signed under the ROOT secret instead of this
+ * workspace's derived one -- i.e. a signature that would have been accepted
+ * before late-review CRITICAL 2 and must now be refused. Used by the
+ * sequence's BREAK 7 to prove the measurement step genuinely depends on the
+ * workspace-bound signature rather than merely coexisting with it.
+ */
+export async function ingestSandboxEventWithForeignSignature(
+  ws: GoldenWorkspace,
+  payload: IngestEventPayload,
+): Promise<number> {
+  const rootSecret = process.env["META_WEBHOOK_SECRET"] ?? "";
+  const body = JSON.stringify({ events: [payload] });
+  const signature = "sha256=" + createHmac("sha256", rootSecret).update(body).digest("hex");
+
+  const { POST } = await import("../../src/app/api/webhooks/meta/[workspaceId]/route.ts");
+  const response = await POST(
+    new Request(`http://sandbox.test/api/webhooks/meta/${ws.workspaceId}`, {
+      method: "POST",
+      body,
+      headers: { "x-hub-signature-256": signature },
+    }),
+    { params: Promise.resolve({ workspaceId: ws.workspaceId }) },
+  );
+  return response.status;
+}
+
+export interface IngestedEvidence {
+  events: Array<{ eventType: string; publicationId: string | null; value: unknown }>;
+  metrics: Array<{ name: string; value: string; confidence: string; attributionModel: string; attributionWindow: string }>;
+  deliveries: Array<{ externalId: string; signatureOk: boolean }>;
+}
+
+/**
+ * Late-review IMPORTANT 6: what step 7 actually produced. The happy path
+ * used to call the ingest and then assert nothing at all about `event` or
+ * `metric`, so an ingest that did nothing was indistinguishable from one
+ * that worked.
+ */
+export async function readIngestedEvidence(pool: pg.Pool, ws: GoldenWorkspace): Promise<IngestedEvidence> {
+  return withTenant(pool, ws.workspaceId, async (tx) => {
+    const events = await tx.query(
+      `select event_type, publication_id, payload from event where workspace_id = $1 order by occurred_at`,
+      [ws.workspaceId],
+    );
+    const metrics = await tx.query(
+      `select name, value, confidence, attribution_model, attribution_window
+       from metric where workspace_id = $1 order by created_at`,
+      [ws.workspaceId],
+    );
+    const deliveries = await tx.query(
+      `select external_id, signature_ok from webhook_delivery where workspace_id = $1`,
+      [ws.workspaceId],
+    );
+    return {
+      events: (events.rows as Array<{ event_type: string; publication_id: string | null; payload: { value?: unknown } }>).map(
+        (r) => ({ eventType: r.event_type, publicationId: r.publication_id, value: r.payload.value }),
+      ),
+      metrics: (
+        metrics.rows as Array<{
+          name: string;
+          value: string;
+          confidence: string;
+          attribution_model: string;
+          attribution_window: string;
+        }>
+      ).map((r) => ({
+        name: r.name,
+        value: r.value,
+        confidence: r.confidence,
+        attributionModel: r.attribution_model,
+        attributionWindow: r.attribution_window,
+      })),
+      deliveries: (deliveries.rows as Array<{ external_id: string; signature_ok: boolean }>).map((r) => ({
+        externalId: r.external_id,
+        signatureOk: r.signature_ok,
+      })),
+    };
+  });
+}
+
+/** The four M1 agent runs the pipeline actually spent budget on -- proof
+ * steps 1-4 executed rather than being skipped (IMPORTANT 6). */
+export async function readAgentRunRoles(pool: pg.Pool, ws: GoldenWorkspace): Promise<string[]> {
+  const r = await withTenant(pool, ws.workspaceId, (tx) =>
+    tx.query(
+      `select ad.role, ar.state
+         from agent_run ar
+         join agent_version av on av.id = ar.agent_version_id
+         join agent_definition ad on ad.id = av.agent_definition_id
+        where ar.workspace_id = $1 and ar.state = 'succeeded'`,
+      [ws.workspaceId],
+    ),
+  );
+  return (r.rows as Array<{ role: string }>).map((row) => row.role).sort();
 }
 
 /** Best-effort partial cleanup, matching packages/db/src/cross-tenant.test.ts's

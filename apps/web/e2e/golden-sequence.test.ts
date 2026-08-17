@@ -19,12 +19,21 @@ import {
   seedAgentRegistry,
   runContentPipeline,
   createApprovalRequest,
+  configureChannel,
+  readIntegrationStatus,
+  markChannelSandboxVerified,
   recordHumanDecision,
+  recordHumanDecisionViaWebLayer,
+  readApprovalDecision,
+  readAgentRunRoles,
+  readContentVersion,
   insertPreparedPublication,
   insertRevisedContentVersion,
   publishToSandbox,
   readPublicationState,
-  ingestSandboxEvent,
+  ingestSandboxEventViaWebhook,
+  ingestSandboxEventWithForeignSignature,
+  readIngestedEvidence,
   cleanupWorkspace,
   TARGET_CHANNEL,
   SANDBOX_PAGE_ID,
@@ -39,7 +48,16 @@ const adminPool = createDbPool(adminUrl);
 
 const workspacesToClean: Array<GoldenWorkspace["workspaceId"]> = [];
 
+// Step 7 now goes through the real webhook route, which refuses everything
+// without a configured root secret (a missing secret fails exactly like a
+// bad signature -- never "skip verification"). This is a sandbox value used
+// only to sign the fixture's own deliveries; nothing real is ever contacted.
+const PREVIOUS_WEBHOOK_SECRET = process.env["META_WEBHOOK_SECRET"];
+process.env["META_WEBHOOK_SECRET"] = "golden-sequence-sandbox-secret";
+
 afterAll(async () => {
+  if (PREVIOUS_WEBHOOK_SECRET === undefined) delete process.env["META_WEBHOOK_SECRET"];
+  else process.env["META_WEBHOOK_SECRET"] = PREVIOUS_WEBHOOK_SECRET;
   for (const workspaceId of workspacesToClean) {
     await cleanupWorkspace(adminPool, workspaceId).catch(() => undefined);
   }
@@ -85,19 +103,41 @@ describe("Golden Sequence", () => {
       // through the real runAgent runtime and the real fake provider.
       const pipeline = await runContentPipeline(pool, ws, registry);
       expect(pipeline.qaVerdict).toBe("pass");
+      // ...and each of those four agent runs really executed and really
+      // succeeded, rather than the pipeline merely returning a shaped object.
+      expect(await readAgentRunRoles(pool, ws)).toEqual([
+        "content",
+        "orchestrator",
+        "qa_brand_safety",
+        "research",
+      ]);
+      // ...and the content it produced is really persisted, with evidence.
+      const contentVersion = await readContentVersion(pool, ws, pipeline.contentVersionId);
+      expect(contentVersion.publicationContent).toBe(PUBLICATION_CONTENT);
+      expect(contentVersion.citationCount).toBe(pipeline.citationIds.length);
+      expect(contentVersion.citationCount).toBeGreaterThan(0);
 
-      // 5: the founder's Approval Center would show this request. A real
-      // human approval decision, through the real domain gate.
+      // 5: the founder configures the Meta channel, then decides. The
+      // decision now goes through the WEB LAYER (performApproval), so the
+      // tenant cross-check, assertRenderable and the T17 channel gate all
+      // run -- none of which this sequence exercised while it called
+      // decideApproval directly (late-review IMPORTANT 6).
       const approvalRequestId = await createApprovalRequest(pool, ws, {
         contentVersionId: pipeline.contentVersionId,
       });
-      const approvalDecisionId = await recordHumanDecision(pool, ws, {
+      await configureChannel(pool, ws);
+      const approvalDecisionId = await recordHumanDecisionViaWebLayer(pool, ws, {
         approvalRequestId,
-        contentVersionId: pipeline.contentVersionId,
-        citationIds: pipeline.citationIds,
         decision: "approve",
         reason: "Nội dung đã có bằng chứng xác thực và đúng giọng thương hiệu.",
       });
+      const decisionRow = await readApprovalDecision(pool, ws, approvalDecisionId);
+      expect(decisionRow.decision).toBe("approve");
+      expect(decisionRow.actorUserId).toBe(ws.userId);
+      // CRITICAL 1: the decision records WHAT it approved on its own
+      // immutable row, not by pointing at a request that can be retargeted.
+      expect(decisionRow.contentVersionId).toBe(pipeline.contentVersionId);
+      expect(decisionRow.targetChannel).toBe(TARGET_CHANNEL);
 
       // 6: sandbox publish -- never the real Meta, never a real credential.
       const publicationId = await insertPreparedPublication(pool, ws, {
@@ -112,16 +152,45 @@ describe("Golden Sequence", () => {
         const afterPublish = await readPublicationState(pool, ws, publicationId);
         expect(afterPublish.state).toBe("succeeded");
         expect(afterPublish.externalId).toMatch(new RegExp(`^${SANDBOX_PAGE_ID}_`));
+        // The post really exists on the sandbox, carrying the approved text.
+        expect(server.posts.size).toBe(1);
 
-        // 7: a sandbox engagement event arrives and updates analytics.
-        await ingestSandboxEvent(pool, ws, {
+        // Only NOW can the channel claim to be sandbox-verified, and only by
+        // naming the publication that earned it (late-review IMPORTANT 3).
+        await markChannelSandboxVerified(pool, ws, publicationId);
+        expect(await readIntegrationStatus(pool, ws)).toBe("sandbox");
+
+        // 7: a sandbox engagement event arrives -- through the REAL webhook
+        // route, with a real workspace-bound signature over a real streamed
+        // body, not by calling the handler directly.
+        const status = await ingestSandboxEventViaWebhook(ws, {
           externalId: afterPublish.externalId!,
           eventType: "post.impression",
           value: 512,
           occurredAt: new Date().toISOString(),
           deliveryId: `delivery-${newId()}`,
         });
+        expect(status).toBe(200);
       });
+
+      // ...and step 7 actually produced something. Asserting this is what
+      // makes the sequence able to fail at all: with `return;` at the top of
+      // handleIngestEvent -- the reviewer's mutation, which left this test
+      // fully green -- all three collections below are empty.
+      const evidence = await readIngestedEvidence(pool, ws);
+      expect(evidence.deliveries).toEqual([
+        { externalId: expect.stringMatching(/^delivery-/), signatureOk: true },
+      ]);
+      expect(evidence.events).toEqual([{ eventType: "post.impression", publicationId, value: 512 }]);
+      expect(evidence.metrics).toEqual([
+        {
+          name: "reach",
+          value: "512",
+          confidence: "medium",
+          attributionModel: "last_touch",
+          attributionWindow: "7d",
+        },
+      ]);
 
       // 8 (E12): the audit chain walks all the way back to the goal, and
       // carries both the approval and the publish success as real events.
@@ -253,6 +322,70 @@ describe("Golden Sequence", () => {
       ws.workspaceId,
     ]);
     expect((publications.rows[0] as { n: number }).n).toBe(0);
+  });
+
+  // Late-review IMPORTANT 6: two more breaks, both of them CODE-path
+  // failures rather than the data variations BREAKs 1-5 are. BREAK 6 breaks
+  // the web layer's own gate (which the sequence never touched before);
+  // BREAK 7 breaks the wire the measurement arrives on.
+  it("BREAK 6/7 (channel gate): approving for a channel that is not connected must be refused at the web layer", async () => {
+    const { ws, registry } = await newWorkspace();
+    const pipeline = await runContentPipeline(pool, ws, registry);
+    const approvalRequestId = await createApprovalRequest(pool, ws, { contentVersionId: pipeline.contentVersionId });
+    // configureChannel is deliberately NOT called: no integration row exists.
+    await expect(
+      recordHumanDecisionViaWebLayer(pool, ws, {
+        approvalRequestId,
+        decision: "approve",
+        reason: "Duyệt dù kênh chưa kết nối.",
+      }),
+    ).rejects.toThrow();
+
+    const decisions = await adminPool.query(
+      `select count(*)::int as n from approval_decision where workspace_id = $1`,
+      [ws.workspaceId],
+    );
+    expect((decisions.rows[0] as { n: number }).n).toBe(0);
+  });
+
+  it("BREAK 7/7 (measurement wire): a delivery whose signature is not bound to this workspace must measure nothing", async () => {
+    const { ws, registry } = await newWorkspace();
+    const pipeline = await runContentPipeline(pool, ws, registry);
+    const approvalRequestId = await createApprovalRequest(pool, ws, { contentVersionId: pipeline.contentVersionId });
+    await configureChannel(pool, ws);
+    const approvalDecisionId = await recordHumanDecisionViaWebLayer(pool, ws, {
+      approvalRequestId,
+      decision: "approve",
+      reason: "Nội dung đạt yêu cầu.",
+    });
+    const publicationId = await insertPreparedPublication(pool, ws, {
+      contentVersionId: pipeline.contentVersionId,
+      publicationContent: pipeline.publicationContent,
+      approvalDecisionId,
+    });
+
+    await withSandboxServer(async (server) => {
+      await publishToSandbox(pool, ws, publicationId, sandboxAdapter(server));
+      const afterPublish = await readPublicationState(pool, ws, publicationId);
+
+      // Signed under the ROOT secret rather than this workspace's derived
+      // one -- precisely the cross-tenant replay CRITICAL 2 closed.
+      const status = await ingestSandboxEventWithForeignSignature(ws, {
+        externalId: afterPublish.externalId!,
+        eventType: "post.impression",
+        value: 512,
+        occurredAt: new Date().toISOString(),
+        deliveryId: `delivery-${newId()}`,
+      });
+      expect(status).toBe(401);
+    });
+
+    const evidence = await readIngestedEvidence(pool, ws);
+    expect(evidence.events).toEqual([]);
+    expect(evidence.metrics).toEqual([]);
+    // ...and the rejected delivery left an honest receipt without consuming
+    // the delivery id it claimed.
+    expect(evidence.deliveries.every((d) => !d.signatureOk)).toBe(true);
   });
 
   it("BREAK 5/5 (audit chain): a decision that is never audited must leave the trace visibly incomplete, not silently patched over", async () => {
