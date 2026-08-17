@@ -65,9 +65,12 @@ import {
 } from "@smos/worker";
 import type { ChannelAdapter } from "@smos/integrations";
 import { performApproval, type PerformApprovalDeps } from "../../src/server/actions/approve.ts";
+import { parseApprovalFormData, recordApprovalDecision } from "../../src/server/actions/submit-approval.ts";
 import { isChannelConnected, providerForChannel } from "../../src/server/channel-status.ts";
 import { recordSandboxVerification } from "../../src/server/integration-verification.ts";
 import { deriveWorkspaceSecret } from "../../src/server/webhook-signature.ts";
+import { auth, buildSessionDeps } from "../../src/server/auth.ts";
+import { resolveWorkspace } from "../../src/server/session.ts";
 
 export const TARGET_CHANNEL = "meta_page";
 export const SANDBOX_PAGE_ID = "page-1";
@@ -520,13 +523,20 @@ export async function recordHumanDecision(
  * `recordHumanDecision` above calls `decideApproval` directly, which skips
  * everything `performApproval` (apps/web/src/server/actions/approve.ts) adds
  * on top of it: the tenant cross-check, `assertRenderable`, and the T17
- * channel gate -- none of which this sequence ever exercised despite the
- * sequence's own claim to prove the golden path end to end. These deps are
- * the same ones `submitApproval` wires in production, read for read and
- * write for write; the only thing not exercised is `submitApproval`'s own
- * FormData parsing and `requireWorkspace()` session resolution, because on
- * this branch `requireWorkspace()` is still the documented stub that always
- * throws (apps/web/src/server/auth.ts) -- see this file's header.
+ * channel gate.
+ *
+ * Superseded, for the Golden Sequence's OWN happy path, by
+ * `recordHumanDecisionViaSubmitApproval` below (hardening task 2):
+ * `requireWorkspace()` is no longer the documented stub this comment used to
+ * describe -- real authentication landed on `main` (0029_auth_schema.sql,
+ * better-auth) after this branch was cut and is now merged in -- so the
+ * sequence can and should enter one layer higher, through the real session
+ * resolution AND the real `submitApproval`-equivalent FormData handling.
+ * This function is kept (rather than deleted) because the BREAK 6/BREAK 7
+ * tests still use it deliberately: they are about the web layer's OWN gates
+ * (the channel check, the webhook signature binding), not about session
+ * resolution, and injecting a trusted `{userId, workspaceId}` directly here
+ * keeps those two tests focused on exactly the one thing each is proving.
  */
 export async function recordHumanDecisionViaWebLayer(
   pool: pg.Pool,
@@ -608,6 +618,77 @@ export async function recordHumanDecisionViaWebLayer(
     );
     return decision.id;
   });
+}
+
+/**
+ * Hardening task 2: pushes the Golden Sequence's entry point up from
+ * `performApproval` to the real production Server Action's own logic --
+ * `submitApproval` (apps/web/src/server/actions/submit-approval.ts). Late-
+ * findings-fix-report.md's concern (5) was that the sequence entered one
+ * layer too low because `requireWorkspace()` was a stub when that report
+ * was written; it no longer is (0029_auth_schema.sql + better-auth,
+ * apps/web/src/server/auth.ts, now merged onto this branch).
+ *
+ * What this drives, for real, in order:
+ *
+ *  1. A real password sign-in through the production `auth` instance
+ *     (`disableSignUp: true` -- the same instance every real request uses,
+ *     never the admin/migration one) -- `ws.email`/`ws.password` must be a
+ *     real, previously provisioned credential (see
+ *     `apps/web/e2e/fixtures/auth-seed.ts`'s `seedWorkspaceWithLogin`).
+ *  2. The real session cookie better-auth's own `signInEmail` sets,
+ *     captured exactly the way a browser would carry it back
+ *     (apps/web/src/server/auth.test.ts's own pattern).
+ *  3. `buildSessionDeps`/`resolveWorkspace` -- the EXACT two functions
+ *     `requireWorkspace()` itself calls -- resolving that real cookie to a
+ *     real `{userId, workspaceId}`, including the `resolve_user_workspace`
+ *     SECURITY DEFINER lookup against a real `workspace_member` row.
+ *  4. A real `FormData` built the way the actual `<form
+ *     action={submitApproval.bind(null, approvalRequestId)}>` in
+ *     `approvals/[id]/page.tsx` builds it (`name="decision"` /
+ *     `name="reason"`), parsed by the exact same `parseApprovalFormData`
+ *     `submitApproval` itself calls.
+ *  5. `recordApprovalDecision` -- the exact function `submitApproval` calls
+ *     once it has a session, wiring the SAME `PerformApprovalDeps` from
+ *     `submit-approval.ts` (not a fixture-local reimplementation) into the
+ *     real `performApproval`.
+ *
+ * What this still does NOT reach, stated plainly (and provably: this is not
+ * a gap papered over, see this repo's own reasoning for staying on a
+ * vitest integration test rather than Playwright, this file's header):
+ * `requireWorkspace()`'s own one-line `await headers()` call, and
+ * `submitApproval`'s trailing `revalidatePath` calls. Both resolve only
+ * inside a live Next.js request -- reproduced live: calling `revalidatePath`
+ * from this process throws "Invariant: static generation store missing"
+ * unconditionally, regardless of branch or auth state, since there is no
+ * Next.js request machinery running at all in a vitest process. Everything
+ * upstream and downstream of those two framework-only lines is the real
+ * production code path, not a stand-in for it.
+ */
+export async function recordHumanDecisionViaSubmitApproval(
+  ws: { email: string; password: string },
+  input: { approvalRequestId: Id; decision: ApprovalDecisionKind; reason: string },
+): Promise<Id> {
+  const { headers: responseHeaders } = await auth.api.signInEmail({
+    body: { email: ws.email, password: ws.password },
+    returnHeaders: true,
+  });
+  const setCookie = responseHeaders.get("set-cookie");
+  if (setCookie === null) throw new Error("sign-in did not set a session cookie");
+  const cookieHeaders = new Headers({ cookie: setCookie.split(";")[0] as string });
+
+  const session = await resolveWorkspace(buildSessionDeps(cookieHeaders));
+
+  const formData = new FormData();
+  formData.set("decision", input.decision);
+  formData.set("reason", input.reason);
+
+  const decision = await recordApprovalDecision(
+    input.approvalRequestId,
+    parseApprovalFormData(formData),
+    session,
+  );
+  return decision.id;
 }
 
 /** The recorded decision as the database actually holds it -- including the

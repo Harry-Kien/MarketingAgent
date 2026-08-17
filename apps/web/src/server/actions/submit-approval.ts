@@ -97,6 +97,72 @@ async function writeAuditTx(tx: TenantTx, event: ApprovalAuditEvent): Promise<vo
   );
 }
 
+export interface ApprovalFormInput {
+  decision: ApprovalDecisionKind;
+  reason: string;
+}
+
+/**
+ * The FormData parsing half of `submitApproval`, pulled out on its own
+ * (hardening task 2) so a caller that has ALREADY resolved a real session
+ * some other way -- the Golden Sequence fixture, specifically -- can drive
+ * the exact same validation `submitApproval` itself runs, rather than a
+ * hand-built `{decision, reason}` object. Throws exactly the same two
+ * errors, in exactly the same order, that `submitApproval` always has:
+ * `submitApproval.test.ts`'s "refuses ... before ever resolving a session"
+ * tests depend on decision/reason being checked before any session or
+ * database work happens at all, and this function still runs first in
+ * `submitApproval` below, so that ordering is unchanged.
+ */
+export function parseApprovalFormData(formData: FormData): ApprovalFormInput {
+  const decisionRaw = formData.get("decision");
+  const reasonRaw = formData.get("reason");
+  if (typeof decisionRaw !== "string" || !VALID_DECISIONS.has(decisionRaw)) {
+    throw new Error("A decision (approve, reject, or request_changes) is required");
+  }
+  if (typeof reasonRaw !== "string") {
+    throw new Error("A reason is required");
+  }
+  return { decision: decisionRaw as ApprovalDecisionKind, reason: reasonRaw };
+}
+
+/**
+ * The database half of `submitApproval`: everything it does once a decision
+ * is validated and a session is resolved, wiring the SAME
+ * `PerformApprovalDeps` `submitApproval` always has -- one `withTenant`
+ * scope, `checkChannelConnected` read inside it, `performApproval` as the
+ * one place a decision is actually recorded.
+ *
+ * Exported (hardening task 2), not merely inlined into `submitApproval`, so
+ * the Golden Sequence (`apps/web/e2e/fixtures/seed.ts`'s
+ * `recordHumanDecisionViaSubmitApproval`) can drive this EXACT function --
+ * the real production code, not a second reimplementation of it -- once it
+ * has resolved a real session of its own (a real password sign-in, a real
+ * cookie, `buildSessionDeps`/`resolveWorkspace` -- the same two functions
+ * `requireWorkspace()` calls). Returns the recorded `ApprovalDecision`,
+ * which `submitApproval` itself discards (a Server Action returns `void` to
+ * its `<form>`) but which a caller resolving its own session, like the
+ * fixture, needs.
+ */
+export async function recordApprovalDecision(
+  approvalRequestId: Id,
+  input: ApprovalFormInput,
+  session: { userId: Id; workspaceId: Id },
+): Promise<ApprovalDecision> {
+  return withTenant(getPool(), session.workspaceId, async (tx) => {
+    const deps: PerformApprovalDeps = {
+      loadRequest: (id) => loadApprovalRequestTx(tx, session.workspaceId, id),
+      isChannelConnected: (channel) => checkChannelConnected(getPool(), session.workspaceId, channel),
+      saveDecision: (d) => saveDecisionTx(tx, d),
+      writeAudit: (event) => writeAuditTx(tx, event),
+    };
+    return performApproval(
+      { approvalRequestId, decision: input.decision, reason: input.reason, session },
+      deps,
+    );
+  });
+}
+
 /**
  * The one real entry point a browser can reach to decide an approval
  * request. Bound as a Next.js Server Action (`"use server"`), invoked from
@@ -120,32 +186,18 @@ async function writeAuditTx(tx: TenantTx, event: ApprovalAuditEvent): Promise<vo
  * workspace with no integration configured yet still refuses here, exactly
  * as before, but now for the real, verifiable reason ("no row exists")
  * rather than an unconditional stub.
+ *
+ * `parseApprovalFormData` and `recordApprovalDecision` above are this
+ * function's own two halves, pulled out (hardening task 2) so the Golden
+ * Sequence can drive them directly once it has resolved a real session of
+ * its own -- this function itself is unchanged in behaviour, still
+ * validating strictly before resolving a session, still `requireWorkspace()`
+ * for its own session, still ending in the same two `revalidatePath` calls.
  */
 export async function submitApproval(approvalRequestId: Id, formData: FormData): Promise<void> {
-  const decisionRaw = formData.get("decision");
-  const reasonRaw = formData.get("reason");
-  if (typeof decisionRaw !== "string" || !VALID_DECISIONS.has(decisionRaw)) {
-    throw new Error("A decision (approve, reject, or request_changes) is required");
-  }
-  if (typeof reasonRaw !== "string") {
-    throw new Error("A reason is required");
-  }
-  const decision = decisionRaw as ApprovalDecisionKind;
-
-  const { userId, workspaceId } = await requireWorkspace();
-
-  await withTenant(getPool(), workspaceId, async (tx) => {
-    const deps: PerformApprovalDeps = {
-      loadRequest: (id) => loadApprovalRequestTx(tx, workspaceId, id),
-      isChannelConnected: (channel) => checkChannelConnected(getPool(), workspaceId, channel),
-      saveDecision: (d) => saveDecisionTx(tx, d),
-      writeAudit: (event) => writeAuditTx(tx, event),
-    };
-    await performApproval(
-      { approvalRequestId, decision, reason: reasonRaw, session: { userId, workspaceId } },
-      deps,
-    );
-  });
+  const input = parseApprovalFormData(formData);
+  const session = await requireWorkspace();
+  await recordApprovalDecision(approvalRequestId, input, session);
 
   revalidatePath("/approvals");
   revalidatePath(`/approvals/${approvalRequestId}`);

@@ -24,6 +24,7 @@ import {
   markChannelSandboxVerified,
   recordHumanDecision,
   recordHumanDecisionViaWebLayer,
+  recordHumanDecisionViaSubmitApproval,
   readApprovalDecision,
   readAgentRunRoles,
   readContentVersion,
@@ -40,6 +41,7 @@ import {
   PUBLICATION_CONTENT,
   type GoldenWorkspace,
 } from "./fixtures/seed.ts";
+import { seedWorkspaceWithLogin, cleanupAuthWorkspace, type AuthSeededWorkspace } from "./fixtures/auth-seed.ts";
 
 const url = process.env["DATABASE_URL"] ?? "postgres://smos_app:smos_app_local_dev@127.0.0.1:5433/smos";
 const pool = createDbPool(url);
@@ -47,6 +49,11 @@ const adminUrl = process.env["DATABASE_MIGRATION_URL"] ?? "postgres://smos:smos_
 const adminPool = createDbPool(adminUrl);
 
 const workspacesToClean: Array<GoldenWorkspace["workspaceId"]> = [];
+// Hardening task 2: workspaces seeded WITH a real login (real user_account +
+// workspace_member + hashed password credential) so the happy path can sign
+// in for real -- tracked separately because they need `workspace_member`
+// cleaned up too (cleanupWorkspace alone never touches that table).
+const authWorkspacesToClean: AuthSeededWorkspace[] = [];
 
 // Step 7 now goes through the real webhook route, which refuses everything
 // without a configured root secret (a missing secret fails exactly like a
@@ -61,6 +68,9 @@ afterAll(async () => {
   for (const workspaceId of workspacesToClean) {
     await cleanupWorkspace(adminPool, workspaceId).catch(() => undefined);
   }
+  for (const ws of authWorkspacesToClean) {
+    await cleanupAuthWorkspace(adminPool, ws).catch(() => undefined);
+  }
   await pool.end();
   await adminPool.end();
 });
@@ -68,6 +78,17 @@ afterAll(async () => {
 async function newWorkspace() {
   const ws = await seedWorkspace(adminPool);
   workspacesToClean.push(ws.workspaceId);
+  const registry = await seedAgentRegistry(adminPool, ws.workspaceId);
+  return { ws, registry };
+}
+
+/** Hardening task 2: a workspace that can actually sign in for real, so the
+ * happy path can drive `submitApproval`'s own session resolution instead of
+ * injecting a trusted `{userId, workspaceId}` directly. */
+async function newLoginableWorkspace() {
+  const ws = await seedWorkspaceWithLogin(adminPool, "golden-sequence");
+  workspacesToClean.push(ws.workspaceId);
+  authWorkspacesToClean.push(ws);
   const registry = await seedAgentRegistry(adminPool, ws.workspaceId);
   return { ws, registry };
 }
@@ -97,7 +118,7 @@ describe("Golden Sequence", () => {
   it(
     "goal to published post to measured result, traceable end to end (E6, E12)",
     async () => {
-      const { ws, registry } = await newWorkspace();
+      const { ws, registry } = await newLoginableWorkspace();
 
       // 1-4: orchestrator -> research -> content -> qa_brand_safety, all
       // through the real runAgent runtime and the real fake provider.
@@ -117,16 +138,18 @@ describe("Golden Sequence", () => {
       expect(contentVersion.citationCount).toBe(pipeline.citationIds.length);
       expect(contentVersion.citationCount).toBeGreaterThan(0);
 
-      // 5: the founder configures the Meta channel, then decides. The
-      // decision now goes through the WEB LAYER (performApproval), so the
-      // tenant cross-check, assertRenderable and the T17 channel gate all
-      // run -- none of which this sequence exercised while it called
-      // decideApproval directly (late-review IMPORTANT 6).
+      // 5: the founder configures the Meta channel, then decides. Hardening
+      // task 2: the decision now goes through the real `submitApproval`
+      // Server Action's own logic -- a real password sign-in, a real
+      // session cookie, the real requireWorkspace()-equivalent session
+      // resolution, real FormData -- not merely `performApproval` in
+      // isolation (late-review IMPORTANT 6 got the sequence as far as
+      // performApproval; that report's own concern (5) is what this closes).
       const approvalRequestId = await createApprovalRequest(pool, ws, {
         contentVersionId: pipeline.contentVersionId,
       });
       await configureChannel(pool, ws);
-      const approvalDecisionId = await recordHumanDecisionViaWebLayer(pool, ws, {
+      const approvalDecisionId = await recordHumanDecisionViaSubmitApproval(ws, {
         approvalRequestId,
         decision: "approve",
         reason: "Nội dung đã có bằng chứng xác thực và đúng giọng thương hiệu.",
