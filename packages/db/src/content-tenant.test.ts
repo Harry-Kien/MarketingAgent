@@ -96,7 +96,7 @@ describe("content_item, content_version, source_citation — row level security"
           [B, campaignId, marker],
         );
       }),
-    ).rejects.toThrow(/permission denied|row-level security|violates/i);
+    ).rejects.toThrow(/new row violates row-level security policy for table "content_item"/);
   });
 
   it("an insert tagged with workspace B is refused while scoped to workspace A (content_version)", async () => {
@@ -114,7 +114,7 @@ describe("content_item, content_version, source_citation — row level security"
           [B, item.rows[0].id, marker],
         );
       }),
-    ).rejects.toThrow(/permission denied|row-level security|violates/i);
+    ).rejects.toThrow(/new row violates row-level security policy for table "content_version"/);
   });
 
   it("an insert tagged with workspace B is refused while scoped to workspace A (source_citation)", async () => {
@@ -137,6 +137,6 @@ describe("content_item, content_version, source_citation — row level security"
           [B, version.rows[0].id, marker],
         );
       }),
-    ).rejects.toThrow(/permission denied|row-level security|violates/i);
+    ).rejects.toThrow(/new row violates row-level security policy for table "source_citation"/);
   });
 });
