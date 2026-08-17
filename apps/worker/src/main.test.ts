@@ -49,9 +49,27 @@ describe("bootstrapWorker", () => {
   // actually needs smos_worker's elevated privilege, so that is what gets
   // wired, rather than leaving the role provisioned and unused.
   it("exposes drainOutbox, backed by a pool connected as smos_worker (not smos_app)", async () => {
+    // A bare typeof check never asserts the role the test's own name sells.
+    // Proved vacuous two ways:
+    //  1) Silently rewiring main.ts's drainOutbox to the smos_app pool (a
+    //     real regression -- exactly the privilege-widening FINDING 7
+    //     closed) left `expect(handle.drainOutbox).toBeTypeOf("function")`
+    //     green: it is still a function either way.
+    //  2) A weaker fix attempt -- independently connecting over the same
+    //     env.DATABASE_WORKER_URL string and checking current_user -- also
+    //     stayed green under that same break, because it never touches the
+    //     pool `handle.drainOutbox` itself actually closed over.
+    // 0017_outbox_claim_token.sql revokes ALL on outbox_claim_batch /
+    // outbox_mark_published from smos_app (smos_worker is the only role
+    // granted EXECUTE), so calling outbox_claim_batch through smos_app's
+    // pool throws permission-denied before it ever looks at whether there
+    // is a row to claim. Actually invoking drainOutbox and asserting it
+    // resolves (rather than merely checking its type) is therefore a real,
+    // deterministic proof of which role backs it -- no seeded row needed.
     const handle = await bootstrapWorker(env());
     try {
       expect(handle.drainOutbox).toBeTypeOf("function");
+      await expect(handle.drainOutbox(0)).resolves.toBeTypeOf("number");
     } finally {
       await handle.shutdown();
     }
