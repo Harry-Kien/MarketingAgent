@@ -368,13 +368,18 @@ describe("Golden Sequence", () => {
     const pipeline = await runContentPipeline(pool, ws, registry);
     const approvalRequestId = await createApprovalRequest(pool, ws, { contentVersionId: pipeline.contentVersionId });
     // configureChannel is deliberately NOT called: no integration row exists.
+    // Bare toThrow() (no args) is vacuous -- it passes on ANY thrown error,
+    // including an unrelated bug (proved: bypassing the real channel gate
+    // in approve.ts and throwing an unrelated error instead left this test
+    // green). Pin to t("approval.disconnected")'s actual message so only
+    // the channel-gate refusal, not some other failure, satisfies it.
     await expect(
       recordHumanDecisionViaWebLayer(pool, ws, {
         approvalRequestId,
         decision: "approve",
         reason: "Duyệt dù kênh chưa kết nối.",
       }),
-    ).rejects.toThrow();
+    ).rejects.toThrow(/ngắt kết nối/);
 
     const decisions = await adminPool.query(
       `select count(*)::int as n from approval_decision where workspace_id = $1`,
@@ -419,8 +424,14 @@ describe("Golden Sequence", () => {
     expect(evidence.events).toEqual([]);
     expect(evidence.metrics).toEqual([]);
     // ...and the rejected delivery left an honest receipt without consuming
-    // the delivery id it claimed.
-    expect(evidence.deliveries.every((d) => !d.signatureOk)).toBe(true);
+    // the delivery id it claimed. `.every(...)` on an empty array is
+    // vacuously true -- it passed even when recordRejectedDelivery wrote
+    // nothing at all (proved: gutting it to a no-op left this test green).
+    // Pin to the exact receipt route.ts's recordRejectedDelivery writes:
+    // one row, keyed on the body digest (never the claimed deliveryId --
+    // that would consume the nonce the forgery is not entitled to), with
+    // signature_ok = false.
+    expect(evidence.deliveries).toEqual([{ externalId: expect.stringMatching(/^rejected:/), signatureOk: false }]);
   });
 
   it("BREAK 5/5 (audit chain): a decision that is never audited must leave the trace visibly incomplete, not silently patched over", async () => {
