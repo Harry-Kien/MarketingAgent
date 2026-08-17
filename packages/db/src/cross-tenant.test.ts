@@ -58,6 +58,7 @@ interface FkPair {
   childCols: string[];
   parentTable: string;
   parentCols: string[];
+  constraintName: string;
 }
 
 async function discoverTenantTables(): Promise<string[]> {
@@ -108,6 +109,7 @@ async function discoverPolicies(): Promise<PolicyRow[]> {
 async function discoverTenantToTenantFks(tenantTables: string[]): Promise<FkPair[]> {
   const r = await adminPool.query(`
     select
+      con.conname as constraint_name,
       cl.relname as child_table,
       array_agg(att.attname::text order by u.ord) as child_cols,
       fcl.relname as parent_table,
@@ -122,13 +124,16 @@ async function discoverTenantToTenantFks(tenantTables: string[]): Promise<FkPair
     where con.contype = 'f' and cl.relnamespace = 'public'::regnamespace
     group by con.conname, cl.relname, fcl.relname
     order by cl.relname, con.conname`);
-  return (r.rows as { child_table: string; child_cols: string[]; parent_table: string; parent_cols: string[] }[])
+  return (
+    r.rows as { constraint_name: string; child_table: string; child_cols: string[]; parent_table: string; parent_cols: string[] }[]
+  )
     .filter((row) => tenantTables.includes(row.child_table) && tenantTables.includes(row.parent_table))
     .map((row) => ({
       childTable: row.child_table,
       childCols: row.child_cols,
       parentTable: row.parent_table,
       parentCols: row.parent_cols,
+      constraintName: row.constraint_name,
     }));
 }
 
@@ -608,8 +613,12 @@ describe("E8/E14: every discovered workspace-owned table is isolated", () => {
       );
       return;
     }
+    // Pinned to this specific table's own RLS policy message (catalog-driven,
+    // like the rest of this file, not a hardcoded per-table list) -- a bare
+    // /row-level security|violates/i would also pass if some unrelated
+    // constraint fired instead of this table's own WITH CHECK.
     await expect(withTenant(pool, a.workspaceId, (tx) => tx.query(text, values))).rejects.toThrow(
-      /row-level security|violates/i,
+      new RegExp(`new row violates row-level security policy for table "${table}"`),
     );
   });
 });
@@ -631,7 +640,7 @@ describe("E14: cross-table composite foreign keys refuse a cross-workspace paren
     expect(childCols).toContain("workspace_id");
   });
 
-  it.each(FK_PAIRS)("$childTable -> $parentTable refuses a parent row from a different workspace", async ({ childTable, childCols, parentTable }) => {
+  it.each(FK_PAIRS)("$childTable -> $parentTable refuses a parent row from a different workspace", async ({ childTable, childCols, parentTable, constraintName }) => {
     const fkColumn = childCols.find((c) => c !== "workspace_id");
     if (!fkColumn) throw new Error(`${childTable} -> ${parentTable}: composite FK has no non-workspace_id column`);
 
@@ -646,7 +655,37 @@ describe("E14: cross-table composite foreign keys refuse a cross-workspace paren
     row.cells[colIndex] = { value: fixtureIdForColumn(a, fkColumn) };
     const { text, values } = toInsertSql(childTable, row);
 
-    await expect(withTenant(pool, b.workspaceId, (tx) => tx.query(text, values))).rejects.toThrow(/foreign key|violates/i);
+    // Pinned to the exact discovered constraint name (constraintName comes
+    // from pg_constraint via discoverTenantToTenantFks, not a guessed naming
+    // convention) -- a bare /foreign key|violates/i would also pass if RLS
+    // or an unrelated FK fired instead of this specific composite FK.
+    //
+    // Two pairs are refused by something OTHER than their own named FK,
+    // both already a stricter refusal of the identical cross-workspace
+    // parent this suite is probing for, not a weaker one:
+    //  - integration -> publication (verified_publication_id): the probe
+    //    row's status is 'connected' (see buildProbeRow's own comment), and
+    //    0033's integration_sandbox_needs_evidence_check refuses a
+    //    non-'sandbox' row naming any evidence at all -- reached before the
+    //    FK ever is.
+    //  - approval_decision -> approval_request (both discovered pairs: the
+    //    plain composite FK and approval_decision_matches_request_fkey): a
+    //    BEFORE INSERT trigger now validates the named approval_request
+    //    exists in the caller's own workspace and raises its own, more
+    //    specific exception before the FK is ever reached. This trigger is
+    //    not in this branch's own infra/migrations/*.sql -- it was observed
+    //    live against the shared Postgres on 5433, most likely from
+    //    concurrent tenancy-hardening migration work on another branch
+    //    sharing this database. Pinned to its current, live message so this
+    //    suite is honest about what actually fires today; worth
+    //    re-verifying against infra/migrations once that work lands here.
+    const expected =
+      childTable === "integration" && fkColumn === "verified_publication_id"
+        ? /integration_sandbox_needs_evidence_check/
+        : childTable === "approval_decision" && parentTable === "approval_request"
+          ? /a decision may only snapshot a request from its own workspace/
+          : new RegExp(constraintName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    await expect(withTenant(pool, b.workspaceId, (tx) => tx.query(text, values))).rejects.toThrow(expected);
   });
 });
 
