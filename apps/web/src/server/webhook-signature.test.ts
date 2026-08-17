@@ -25,8 +25,15 @@ describe("verifySignature", () => {
     );
   });
 
-  it("uses a constant-time comparison", () => {
-    // Length mismatch must not throw; it must simply return false.
+  // Renamed for late-review IMPORTANT 5. This test was called "uses a
+  // constant-time comparison" but asserted only that a length mismatch does
+  // not throw -- true of ANY implementation, including the variable-time
+  // `provided.toLowerCase() === expectedHex` the reviewer swapped in to
+  // prove the point (0 failures across 1433 tests). The assertions are
+  // unchanged and still worth having; only the name was a claim they did not
+  // support. The property the old name asserted is now genuinely tested, in
+  // webhook-signature-constant-time.test.ts.
+  it("returns false rather than throwing when the signature length does not match", () => {
     expect(() => verifySignature(body, "sha256=aa", secret)).not.toThrow();
     expect(verifySignature(body, "sha256=aa", secret)).toBe(false);
   });
