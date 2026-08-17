@@ -77,6 +77,23 @@ export async function performApproval(
   // channel must never even reach a decision.
   assertRenderable(req);
 
+  // Late-review MINOR (d): `approvals/[id]/page.tsx` renders these flags to
+  // the founder under "Cảnh báo chính sách", but nothing anywhere refused on
+  // `severity: "block"` -- so a blocking policy violation was a label, never
+  // a gate. A "block" flag means exactly one thing: this must not be
+  // approved. REJECT and REQUEST_CHANGES stay available, because the block
+  // is on publishing rather than on the founder answering at all -- someone
+  // who could not say "no" to a blocked item would have no way to clear it
+  // from their queue.
+  if (input.decision === "approve") {
+    const blocking = req.policyFlags.filter((flag) => flag.severity === "block");
+    if (blocking.length > 0) {
+      throw new Error(
+        `${t("approval.blockedByPolicy")}: ${blocking.map((flag) => `${flag.ruleId} — ${flag.message}`).join("; ")}`,
+      );
+    }
+  }
+
   // T17: a target channel that isn't actually connected must also refuse,
   // independently of whether the request itself is otherwise renderable.
   const connected = await deps.isChannelConnected(req.targetChannel);

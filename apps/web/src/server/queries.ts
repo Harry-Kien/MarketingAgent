@@ -432,3 +432,77 @@ export async function getApprovalRequestDetail(
     };
   });
 }
+
+export interface LatestMetricView {
+  campaignId: Id;
+  campaignName: string;
+  name: string;
+  value: number;
+  unit: string | null;
+  freshnessAt: Date;
+  attributionModel: string;
+  attributionWindow: string;
+  confidence: "low" | "medium" | "high";
+  missingDataNote: string | null;
+}
+
+/**
+ * Late-review MINOR (e): the Analytics page claimed "there is no
+ * metrics/analytics table anywhere in infra/migrations/**" and rendered an
+ * empty state on that basis. `metric` HAS existed since
+ * 0028_integration.sql, and the webhook route writes to it on every
+ * verified delivery -- so real numbers were accumulating in the database
+ * while the page told the founder no data source existed. That is the exact
+ * failure mode ("Không fake-success") inverted: not a fabricated success,
+ * but a fabricated absence.
+ *
+ * One row per (campaign, metric name): the most recent observation. `metric`
+ * is deliberately an append-only time series (a fresh row per observation,
+ * ADR-005 -- and now immutable at the database,
+ * 0034_metric_is_an_observation.sql), so "current" means "the newest
+ * observation", picked with DISTINCT ON rather than by mutating a summary
+ * row. Ordering by freshness_at, then created_at, so two observations
+ * stamped the same instant resolve deterministically to the later-written
+ * one.
+ */
+export async function getLatestMetrics(pool: pg.Pool, workspaceId: Id): Promise<LatestMetricView[]> {
+  return withTenant(pool, workspaceId, async (tx) => {
+    const result = await tx.query(
+      `select distinct on (m.campaign_id, m.name)
+              m.campaign_id, c.name as campaign_name, m.name, m.value, m.unit, m.freshness_at,
+              m.attribution_model, m.attribution_window, m.confidence, m.missing_data_note
+         from metric m
+         join campaign c on c.id = m.campaign_id and c.workspace_id = m.workspace_id
+        where m.workspace_id = $1
+        order by m.campaign_id, m.name, m.freshness_at desc, m.created_at desc`,
+      [workspaceId],
+    );
+    return (
+      result.rows as Array<{
+        campaign_id: string;
+        campaign_name: string;
+        name: string;
+        value: string;
+        unit: string | null;
+        freshness_at: Date;
+        attribution_model: string;
+        attribution_window: string;
+        confidence: "low" | "medium" | "high";
+        missing_data_note: string | null;
+      }>
+    ).map((row) => ({
+      campaignId: row.campaign_id as Id,
+      campaignName: row.campaign_name,
+      name: row.name,
+      // numeric comes back from pg as a string so no precision is lost in
+      // transit; the presentation layer needs a number.
+      value: Number(row.value),
+      unit: row.unit,
+      freshnessAt: row.freshness_at,
+      attributionModel: row.attribution_model,
+      attributionWindow: row.attribution_window,
+      confidence: row.confidence,
+      missingDataNote: row.missing_data_note,
+    }));
+  });
+}

@@ -101,10 +101,16 @@ BEGIN
    WHERE p.id = NEW.verified_publication_id
      AND p.workspace_id = NEW.workspace_id;
 
+  -- Existence and tenancy are the composite FOREIGN KEY's job, not this
+  -- trigger's. A BEFORE trigger runs ahead of constraint checks, so raising
+  -- here would mask the foreign key's own, more precise error for exactly
+  -- the case the foreign key exists to catch -- and
+  -- packages/db/src/cross-tenant.test.ts's exhaustive E14 probe checks that
+  -- the FK is what speaks for a cross-workspace parent. One mechanism per
+  -- fact: the FK owns "this publication exists, in this workspace", this
+  -- trigger owns "and it is real evidence".
   IF NOT FOUND THEN
-    RAISE EXCEPTION
-      'integration.verified_publication_id % names no publication in workspace %',
-      NEW.verified_publication_id, NEW.workspace_id;
+    RETURN NEW;
   END IF;
 
   IF pub_state <> 'succeeded' OR pub_external_id IS NULL THEN

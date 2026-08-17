@@ -80,8 +80,14 @@ async function seedSucceededPublication(): Promise<Id> {
 }
 
 afterAll(async () => {
+  // Only the rows this file can actually remove. `seedSucceededPublication`
+  // builds a full goal -> campaign -> ... -> approval_decision -> publication
+  // chain, and approval_decision/audit_log are append-only for every role
+  // (0001/0007), which transitively pins everything they reference -- the
+  // workspace included. Same convention as cross-tenant.test.ts and
+  // apps/web/e2e/fixtures/seed.ts: every id here comes from newId(), so what
+  // is left behind can never collide with a later run.
   await adminPool.query(`delete from integration where workspace_id = $1`, [workspaceId]);
-  await adminPool.query(`delete from workspace where id = $1`, [workspaceId]);
   await adminPool.end();
   await appPool.end();
 });

@@ -5,10 +5,18 @@ import { t } from "../i18n/index.ts";
  * extracted out of `approvals/[id]/page.tsx` verbatim (same markup, same
  * three literal `value`s, same required `reason` textarea with no default)
  * so it can be exercised in isolation -- specifically by the E11 keyboard
- * harness (`apps/web/e2e/build-harness.mjs`), which cannot render the real
- * page (it needs a live session + Postgres) but must still drive real
- * keyboard interaction against the actual production markup, not a
- * look-alike stand-in. Extracting this changes nothing about how a decision
+ * harness (`apps/web/e2e/harness.tsx`, driven by
+ * `apps/web/e2e/harness.test.tsx`), which cannot render the real page (it
+ * needs a live session + Postgres) but must still drive real keyboard
+ * interaction against the actual production markup, not a look-alike
+ * stand-in.
+ *
+ * Late-review MINOR (f): this comment previously cited
+ * `apps/web/e2e/build-harness.mjs`, which does not exist -- a reader
+ * following the reference found nothing and could not tell whether the
+ * harness was missing or the pointer was simply wrong.
+ *
+ * Extracting this changes nothing about how a decision
  * reaches `submitApproval` -- `action` is still bound to the exact same
  * server action by the caller.
  */

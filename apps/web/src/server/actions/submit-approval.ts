@@ -2,7 +2,14 @@
 
 import { revalidatePath } from "next/cache";
 import { withTenant, type TenantTx } from "@smos/db";
-import { newId, type ApprovalDecision, type ApprovalDecisionKind, type ApprovalRequest, type Id } from "@smos/domain";
+import {
+  newId,
+  type ApprovalDecision,
+  type ApprovalDecisionKind,
+  type ApprovalRequest,
+  type Id,
+  type PolicyFlag,
+} from "@smos/domain";
 import { requireWorkspace } from "../auth.ts";
 import { getPool } from "../db.ts";
 import { isChannelConnected as checkChannelConnected } from "../channel-status.ts";
@@ -20,13 +27,19 @@ interface ApprovalRequestRow {
   campaign_id: string;
   content_version_id: string;
   target_channel: string;
+  policy_flags: PolicyFlag[] | null;
   estimated_impact: string | null;
   created_at: Date;
 }
 
 async function loadApprovalRequestTx(tx: TenantTx, workspaceId: Id, approvalRequestId: Id): Promise<ApprovalRequest> {
   const result = await tx.query(
-    `select id, workspace_id, campaign_id, content_version_id, target_channel, estimated_impact, created_at
+    // Late-review MINOR (d): policy_flags was never selected and
+    // `policyFlags` below was hardcoded to [] -- so performApproval's
+    // blocking-flag gate could never see a flag, and the flags the Approval
+    // Center renders (queries.ts DOES select them) gated nothing. The gate
+    // and the screen now read the same column.
+    `select id, workspace_id, campaign_id, content_version_id, target_channel, policy_flags, estimated_impact, created_at
      from approval_request
      where id = $1 and workspace_id = $2`,
     [approvalRequestId, workspaceId],
@@ -45,7 +58,7 @@ async function loadApprovalRequestTx(tx: TenantTx, workspaceId: Id, approvalRequ
     campaignId: row.campaign_id as Id,
     contentVersionId: row.content_version_id as Id,
     targetChannel: row.target_channel,
-    policyFlags: [],
+    policyFlags: row.policy_flags ?? [],
     evidenceCitationIds: (citations.rows as Array<{ id: string }>).map((r) => r.id as Id),
     estimatedImpact: row.estimated_impact,
     createdAt: row.created_at,
