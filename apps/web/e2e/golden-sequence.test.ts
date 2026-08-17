@@ -55,16 +55,14 @@ const workspacesToClean: Array<GoldenWorkspace["workspaceId"]> = [];
 // cleaned up too (cleanupWorkspace alone never touches that table).
 const authWorkspacesToClean: AuthSeededWorkspace[] = [];
 
-// Step 7 now goes through the real webhook route, which refuses everything
-// without a configured root secret (a missing secret fails exactly like a
-// bad signature -- never "skip verification"). This is a sandbox value used
-// only to sign the fixture's own deliveries; nothing real is ever contacted.
-const PREVIOUS_WEBHOOK_SECRET = process.env["META_WEBHOOK_SECRET"];
-process.env["META_WEBHOOK_SECRET"] = "golden-sequence-sandbox-secret";
-
+// Step 7 goes through the real webhook route. Credential vault task: there
+// is no fleet-wide root secret to configure anymore -- the route resolves
+// (and, on first use, provisions) each workspace's own secret from the
+// vault via server/webhook-secret.ts, which ingestSandboxEventViaWebhook
+// (fixtures/seed.ts) reads through the identical call. Nothing real is
+// ever contacted; the vault itself points at the same sandbox PostgreSQL
+// every other test in this suite uses.
 afterAll(async () => {
-  if (PREVIOUS_WEBHOOK_SECRET === undefined) delete process.env["META_WEBHOOK_SECRET"];
-  else process.env["META_WEBHOOK_SECRET"] = PREVIOUS_WEBHOOK_SECRET;
   for (const workspaceId of workspacesToClean) {
     await cleanupWorkspace(adminPool, workspaceId).catch(() => undefined);
   }

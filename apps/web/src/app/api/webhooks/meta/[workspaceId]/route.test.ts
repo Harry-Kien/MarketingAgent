@@ -7,17 +7,21 @@
 // one pure function in isolation. webhook-signature.test.ts and
 // ingest-event.test.ts already cover those pure pieces on their own; this
 // file is the seam between them and the database.
+//
+// Credential vault task: signFor no longer derives a workspace secret from
+// a fleet-wide root -- there is no root secret anymore. It resolves (and,
+// on first use, provisions) the SAME real per-workspace secret the route
+// itself reads via getWorkspaceWebhookSecret (server/webhook-secret.ts),
+// through the identical vault. Every call site below is now `await`ed.
 import { createHmac } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createDbPool } from "@smos/db";
-import { newId } from "@smos/domain";
+import { newId, type Id } from "@smos/domain";
 import { seedTwoWorkspaces, type TenantFixture } from "@smos/testing";
+import { getWorkspaceWebhookSecret } from "../../../../../server/webhook-secret.ts";
 import { MAX_WEBHOOK_BODY_BYTES } from "../../../../../server/read-bounded-body.ts";
 import { MAX_EVENTS_PER_DELIVERY } from "../../../../../server/webhook-limits.ts";
 import { WEBHOOK_RATE_LIMITS } from "../../../../../server/webhook-rate-limit.ts";
-
-const SECRET = "route-test-sandbox-secret";
-const PREVIOUS_SECRET = process.env["META_WEBHOOK_SECRET"];
 
 const url = process.env["DATABASE_URL"] ?? "postgres://smos_app:smos_app_local_dev@127.0.0.1:5433/smos";
 const adminUrl = process.env["DATABASE_MIGRATION_URL"] ?? "postgres://smos:smos_local_dev@127.0.0.1:5433/smos";
@@ -30,23 +34,23 @@ let baselineEventsA: number;
 let baselineEventsB: number;
 let POST: typeof import("./route.ts").POST;
 
-function sign(body: string, secret = SECRET): string {
+function sign(body: string, secret: string): string {
   return "sha256=" + createHmac("sha256", secret).update(body).digest("hex");
 }
 
 /**
- * Late-review CRITICAL 2: the signature now binds the workspace the request
- * claims to be for. This helper reproduces, independently of the module under
- * test, the derivation a real sender performs -- so a signature made for
- * workspace A is by construction not a valid signature for workspace B, and
- * a captured (body, signature) pair cannot be replayed at another tenant's
- * callback URL.
+ * Late-review CRITICAL 2: the signature binds the workspace the request
+ * claims to be for. Resolves the REAL secret for `workspaceId` from the
+ * credential vault -- the same call the route itself makes -- so a
+ * signature made "for workspace A" is, by construction, signed under A's
+ * own stored secret and cannot be a valid signature for B's.
  */
-function signFor(workspaceId: string, body: string, rootSecret = SECRET): string {
-  const workspaceSecret = createHmac("sha256", rootSecret)
-    .update(`smos:meta-webhook:v1:${workspaceId}`)
-    .digest("hex");
-  return sign(body, workspaceSecret);
+async function signFor(workspaceId: Id, body: string): Promise<string> {
+  const secret = await getWorkspaceWebhookSecret(workspaceId);
+  if (secret === null) {
+    throw new Error(`route.test.ts: could not resolve/provision a webhook secret for workspace ${workspaceId}`);
+  }
+  return sign(body, secret);
 }
 
 function req(workspaceId: string, body: string, signatureHeader: string, forwardedFor?: string): {
@@ -97,12 +101,15 @@ async function rejectedDeliveryCount(workspaceId: string): Promise<number> {
  * recordRejectedDelivery's INSERT fails (silently swallowed, per its own
  * doc) for a `newId()` that names no row at all -- exactly the ghost-
  * workspace case elsewhere in this file, which deliberately never reaches
- * that INSERT (it 404s on the workspace-exists check first, only for a
- * VALID signature). The rate-limit tests below need a workspace id that IS
- * real (so the rejected-receipt assertions are meaningful) but is used by
- * NOTHING else in this file, so its buckets start genuinely empty and an
- * exact "first N calls succeed, the next one is throttled" assertion is
- * safe against cross-test interference.
+ * that INSERT (it 401s at the signature-resolution step, before any row is
+ * even considered, since a nonexistent workspace can never have a real
+ * vault-stored secret to sign against -- see this file's own "answers 401
+ * for a well-formed workspace id that names no workspace" test for why that
+ * is 401 rather than the pre-vault 404). The rate-limit tests below need a
+ * workspace id that IS real (so the rejected-receipt assertions are
+ * meaningful) but is used by NOTHING else in this file, so its buckets
+ * start genuinely empty and an exact "first N calls succeed, the next one
+ * is throttled" assertion is safe against cross-test interference.
  */
 async function createBareWorkspace(): Promise<string> {
   const id = newId();
@@ -135,7 +142,6 @@ async function webhookDeliveryCount(workspaceId: string, externalId: string): Pr
 }
 
 beforeAll(async () => {
-  process.env["META_WEBHOOK_SECRET"] = SECRET;
   ({ a, b } = await seedTwoWorkspaces(adminPool));
   // Simulate: this publication was already posted to the sandbox and Meta
   // assigned it a real external post id -- exactly the state handlePublish
@@ -165,9 +171,12 @@ afterAll(async () => {
     await adminPool.query("delete from webhook_delivery where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
     await adminPool.query("delete from credential_reference where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
     await adminPool.query("delete from integration where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
+    // Credential vault (0036_vault_secret.sql): seedTwoWorkspaces now seeds
+    // one placeholder vault_secret row per workspace, and this file's own
+    // tests provision a real per-workspace webhook secret through the vault
+    // too (signFor, above).
+    await adminPool.query("delete from vault_secret where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
   }
-  if (PREVIOUS_SECRET === undefined) delete process.env["META_WEBHOOK_SECRET"];
-  else process.env["META_WEBHOOK_SECRET"] = PREVIOUS_SECRET;
   await pool.end();
   await adminPool.end();
 });
@@ -178,7 +187,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
     const body = JSON.stringify({
       events: [{ externalId, eventType: "post.impression", value: 42, occurredAt: new Date().toISOString(), deliveryId: "d-ok-1" }],
     });
-    const { request, context } = req(a.workspaceId, body, signFor(a.workspaceId, body));
+    const { request, context } = req(a.workspaceId, body, await signFor(a.workspaceId, body));
     const res = await POST(request, context);
     expect(res.status).toBe(200);
     expect(await eventCount(a.workspaceId, a.publicationId)).toBe(baselineEventsA + 1);
@@ -191,7 +200,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
       events: [{ externalId, eventType: "post.impression", value: 7, occurredAt: new Date().toISOString(), deliveryId: "d-replay-1" }],
     });
     const before = await eventCount(a.workspaceId, a.publicationId);
-    const sig = signFor(a.workspaceId, body);
+    const sig = await signFor(a.workspaceId, body);
     const call1 = req(a.workspaceId, body, sig);
     const call2 = req(a.workspaceId, body, sig);
     const first = await POST(call1.request, call1.context);
@@ -238,7 +247,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
         },
       ],
     });
-    const validSignatureForOriginal = signFor(a.workspaceId, originalBody);
+    const validSignatureForOriginal = await signFor(a.workspaceId, originalBody);
     const tamperedBody = originalBody.replace('"value":1', '"value":99999');
     const { request, context } = req(a.workspaceId, tamperedBody, validSignatureForOriginal);
     const res = await POST(request, context);
@@ -262,16 +271,29 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
 
   it("rejects malformed JSON that arrives with a genuinely valid signature, and creates no row", async () => {
     const body = "{not-valid-json";
-    const { request, context } = req(a.workspaceId, body, signFor(a.workspaceId, body));
+    const { request, context } = req(a.workspaceId, body, await signFor(a.workspaceId, body));
     const res = await POST(request, context);
     expect(res.status).toBe(400);
   });
 
-  it("rejects a malformed workspace id in the URL even with a valid signature", async () => {
+  // Was "... even with a valid signature" and asserted 404. Credential vault
+  // task: a "valid signature" is no longer a concept that can exist for a
+  // malformed workspace id at all -- there is no fleet-wide root left to
+  // derive one from, and getWorkspaceWebhookSecret only ever resolves a
+  // secret through vault_secret, which is keyed on a REAL workspace id.
+  // isId(rawWorkspaceId) is checked before the vault is ever consulted
+  // (route.ts step 2), so a malformed id short-circuits straight to a null
+  // secret -- indistinguishable, on the wire, from any other failed
+  // signature check: 401, not 404. This is a genuine, deliberate behaviour
+  // change, not a weakened assertion: it removes a distinction ("malformed
+  // id" vs "bad signature") an unauthenticated caller could previously use
+  // to learn something about the URL shape, which is strictly less
+  // information leaked, not more.
+  it("rejects a malformed workspace id in the URL with 401, since no secret can ever be resolved for it", async () => {
     const body = JSON.stringify({ events: [] });
-    const { request, context } = req("not-a-real-workspace-id", body, signFor("not-a-real-workspace-id", body));
+    const { request, context } = req("not-a-real-workspace-id", body, sign(body, "irrelevant-secret"));
     const res = await POST(request, context);
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(401);
   });
 
   // --- Late-review CRITICAL 2 -------------------------------------------
@@ -296,7 +318,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
     });
     const beforeA = await eventCount(a.workspaceId, a.publicationId);
     // The exact bytes and the exact signature workspace A would have sent.
-    const { request, context } = req(b.workspaceId, body, signFor(a.workspaceId, body));
+    const { request, context } = req(b.workspaceId, body, await signFor(a.workspaceId, body));
     const res = await POST(request, context);
 
     expect(res.status).toBe(401);
@@ -321,7 +343,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
     const burnBody = JSON.stringify({
       events: [{ externalId, eventType: "post.impression", value: 1, occurredAt: new Date().toISOString(), deliveryId }],
     });
-    const burn = req(b.workspaceId, burnBody, signFor(a.workspaceId, burnBody));
+    const burn = req(b.workspaceId, burnBody, await signFor(a.workspaceId, burnBody));
     expect((await POST(burn.request, burn.context)).status).toBe(401);
 
     // B's genuine delivery, with the same delivery id, must still be
@@ -330,7 +352,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
     const realBody = JSON.stringify({
       events: [{ externalId, eventType: "post.impression", value: 77, occurredAt: new Date().toISOString(), deliveryId }],
     });
-    const real = req(b.workspaceId, realBody, signFor(b.workspaceId, realBody));
+    const real = req(b.workspaceId, realBody, await signFor(b.workspaceId, realBody));
     expect((await POST(real.request, real.context)).status).toBe(200);
     expect(await eventCount(b.workspaceId, b.publicationId)).toBe(before + 1);
   });
@@ -359,7 +381,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
     expect(await webhookDeliveryCount(a.workspaceId, deliveryId)).toBe(0);
 
     const before = await eventCount(a.workspaceId, a.publicationId);
-    const real = req(a.workspaceId, body, signFor(a.workspaceId, body));
+    const real = req(a.workspaceId, body, await signFor(a.workspaceId, body));
     expect((await POST(real.request, real.context)).status).toBe(200);
     expect(await eventCount(a.workspaceId, a.publicationId)).toBe(before + 1);
   });
@@ -373,7 +395,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
       deliveryId: `d-flood-${i}`,
     }));
     const body = JSON.stringify({ events });
-    const { request, context } = req(a.workspaceId, body, signFor(a.workspaceId, body));
+    const { request, context } = req(a.workspaceId, body, await signFor(a.workspaceId, body));
     expect((await POST(request, context)).status).toBe(400);
     expect(await webhookDeliveryCount(a.workspaceId, "d-flood-0")).toBe(0);
   });
@@ -390,12 +412,25 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
         },
       ],
     });
-    const { request, context } = req(a.workspaceId, body, signFor(a.workspaceId, body));
+    const { request, context } = req(a.workspaceId, body, await signFor(a.workspaceId, body));
     expect((await POST(request, context)).status).toBe(400);
     expect(await webhookDeliveryCount(a.workspaceId, `d-baddate-${a.workspaceId}`)).toBe(0);
   });
 
-  it("answers 404 for a well-formed workspace id that names no workspace, leaking no constraint name", async () => {
+  // Was "answers 404 ... leaking no constraint name". Credential vault
+  // task: a well-formed but nonexistent workspace id can never have a real
+  // vault-stored secret either -- getWorkspaceWebhookSecret attempts to
+  // provision one on first use, that INSERT fails on vault_secret's own FK
+  // to `workspace` (0036_vault_secret.sql), and server/webhook-secret.ts
+  // catches that failure and resolves to `null` rather than letting the raw
+  // driver error (which, for a Postgres FK violation, names the constraint)
+  // propagate anywhere. There is therefore no way to produce "a genuinely
+  // valid signature for a workspace that doesn't exist" anymore, so this
+  // case collapses into the same 401 every other unverifiable signature
+  // gets -- and the constraint-name-leak property the old test's name
+  // promised is, if anything, MORE true now: the failure is caught two
+  // layers before it could ever reach an HTTP response.
+  it("answers 401 for a well-formed workspace id that names no workspace, leaking no constraint name", async () => {
     const ghost = newId();
     const body = JSON.stringify({
       events: [
@@ -408,9 +443,9 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
         },
       ],
     });
-    const { request, context } = req(ghost, body, signFor(ghost, body));
+    const { request, context } = req(ghost, body, sign(body, "irrelevant-secret"));
     const res = await POST(request, context);
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(401);
     expect(await res.text()).toBe("");
   });
 
@@ -500,7 +535,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
         events: [{ externalId, eventType: "post.impression", value: 999, occurredAt: new Date().toISOString(), deliveryId }],
       });
       const before = await eventCount(a.workspaceId, a.publicationId);
-      const { request: genuineReq, context: genuineCtx } = req(a.workspaceId, genuineBody, signFor(a.workspaceId, genuineBody));
+      const { request: genuineReq, context: genuineCtx } = req(a.workspaceId, genuineBody, await signFor(a.workspaceId, genuineBody));
       const res = await POST(genuineReq, genuineCtx);
 
       expect(res.status).toBe(200);
@@ -526,7 +561,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
         events: [{ externalId, eventType: "post.impression", value: 123, occurredAt: new Date().toISOString(), deliveryId }],
       });
       const before = await eventCount(b.workspaceId, b.publicationId);
-      const { request: genuineReq, context: genuineCtx } = req(b.workspaceId, genuineBody, signFor(b.workspaceId, genuineBody));
+      const { request: genuineReq, context: genuineCtx } = req(b.workspaceId, genuineBody, await signFor(b.workspaceId, genuineBody));
       const res = await POST(genuineReq, genuineCtx);
 
       expect(res.status).toBe(200); // B is completely unaffected by A's flood

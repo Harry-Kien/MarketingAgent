@@ -9,7 +9,24 @@
 // the two failure directions, losing a token *count* from telemetry is
 // recoverable (it's just missing a number in a log line); leaking a secret
 // into a log is not.
-const SENSITIVE_KEY = /(pass(word)?|secret|token|api[-_]?key|authorization|cookie|credential)/i;
+// Credential vault (0036_vault_secret.sql, packages/vault): "plaintext",
+// "data[-_]?key" and "kek" cover the three things that task's own brief
+// names as things that must never reach a log -- a plaintext secret, a data
+// key, or a key-encryption key -- under any of the field names this
+// codebase's envelope-encryption types (SealedSecret, WrappedKey,
+// vault_secret's own columns) actually use: plaintext, dataKey/data_key,
+// kek/kekId/kek_id. "ciphertext" and "wrapped[-_]?data[-_]?key" are added
+// too even though ciphertext alone is not the secret (that is the entire
+// point of encrypting it) -- purely defensive, matching this file's own
+// stated bias that over-redacting a harmless field costs nothing next to
+// under-redacting a real one. Deliberately NOT added: bare "iv" or
+// "auth_tag" -- both are two- and eight-character substrings common enough
+// in ordinary words/identifiers (e.g. "private", "activity") that matching
+// them here would repeat round 1's mistake (a loose pattern that over-masks
+// unrelated fields) for values that, on their own, carry no exploitable
+// secrecy in AES-GCM's threat model.
+const SENSITIVE_KEY =
+  /(pass(word)?|secret|token|api[-_]?key|authorization|cookie|credential|plaintext|data[-_]?key|kek|ciphertext)/i;
 const CONNECTION_STRING_PASSWORD = /(:\/\/[^:/@]+:)([^@]+)(@)/g;
 
 // The ONLY exemptions from SENSITIVE_KEY. Each entry here is a deliberate,

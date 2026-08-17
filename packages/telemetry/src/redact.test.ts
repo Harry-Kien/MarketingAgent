@@ -144,4 +144,49 @@ describe("redact", () => {
       sometokenvalue: "[redacted]",
     });
   });
+
+  // Credential vault (0036_vault_secret.sql, packages/vault): none of
+  // "plaintext", "dataKey"/"data_key", "kek"/"kekId" or "ciphertext"
+  // matched SENSITIVE_KEY before this task -- a struct like
+  // sealSecret()'s SealedSecret, or a raw vault_secret row, accidentally
+  // reaching a log call would have leaked unredacted.
+  it("redacts a plaintext secret field, however it is named", () => {
+    expect(redact({ plaintext: "top-secret-value" })).toEqual({ plaintext: "[redacted]" });
+    expect(redact({ plaintextSecret: "top-secret-value" })).toEqual({ plaintextSecret: "[redacted]" });
+  });
+
+  it("redacts a data key field, camelCase or snake_case", () => {
+    expect(redact({ dataKey: Buffer.from("k").toString("hex") })).toEqual({ dataKey: "[redacted]" });
+    expect(redact({ data_key: "abc" })).toEqual({ data_key: "[redacted]" });
+    expect(redact({ plaintextDataKey: "abc" })).toEqual({ plaintextDataKey: "[redacted]" });
+  });
+
+  it("redacts a key-encryption-key (KEK) field, including its id/version label", () => {
+    expect(redact({ kek: "abc" })).toEqual({ kek: "[redacted]" });
+    expect(redact({ kekId: "v1" })).toEqual({ kekId: "[redacted]" });
+    expect(redact({ kek_id: "v1" })).toEqual({ kek_id: "[redacted]" });
+  });
+
+  it("redacts ciphertext-shaped fields defensively, even though ciphertext alone is not the secret", () => {
+    expect(redact({ ciphertext: "deadbeef" })).toEqual({ ciphertext: "[redacted]" });
+    expect(redact({ wrappedDataKey: "deadbeef" })).toEqual({ wrappedDataKey: "[redacted]" });
+    expect(redact({ wrapped_data_key: "deadbeef" })).toEqual({ wrapped_data_key: "[redacted]" });
+  });
+
+  it("redacts a whole sealed-secret-shaped object at any depth", () => {
+    const input = {
+      workspaceId: "019ff775-f7f6-7e31-9114-45c0fb0e8fd2",
+      sealed: {
+        ciphertext: "deadbeef",
+        iv: "aa",
+        authTag: "bb",
+        wrappedKey: { kekId: "v1", ciphertext: "cc", iv: "dd", authTag: "ee" },
+      },
+    };
+    const out = redact(input) as typeof input;
+    expect(out.workspaceId).toBe("019ff775-f7f6-7e31-9114-45c0fb0e8fd2");
+    expect(out.sealed.ciphertext).toBe("[redacted]");
+    expect(out.sealed.wrappedKey.kekId).toBe("[redacted]");
+    expect(out.sealed.wrappedKey.ciphertext).toBe("[redacted]");
+  });
 });

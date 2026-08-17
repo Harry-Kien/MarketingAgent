@@ -32,6 +32,9 @@ afterAll(async () => {
     await adminPool.query("delete from event where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
     await adminPool.query("delete from metric where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
     await adminPool.query("delete from webhook_delivery where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
+    // Credential vault (0036_vault_secret.sql): seedTwoWorkspaces now seeds
+    // one placeholder vault_secret row per workspace too.
+    await adminPool.query("delete from vault_secret where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
   }
   await pool.end();
   await adminPool.end();

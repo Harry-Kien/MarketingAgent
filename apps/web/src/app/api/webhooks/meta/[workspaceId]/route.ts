@@ -4,7 +4,8 @@ import { withTenant, type TenantTx } from "@smos/db";
 import { handleIngestEvent, type IngestEventDeps, type IngestEventPayload } from "@smos/worker";
 import { logger } from "@smos/telemetry";
 import { getPool } from "../../../../../server/db.ts";
-import { deriveWorkspaceSecret, verifySignature } from "../../../../../server/webhook-signature.ts";
+import { verifySignature } from "../../../../../server/webhook-signature.ts";
+import { getWorkspaceWebhookSecret } from "../../../../../server/webhook-secret.ts";
 import { MAX_EVENTS_PER_DELIVERY } from "../../../../../server/webhook-limits.ts";
 import { checkWebhookRateLimit, extractClientIp } from "../../../../../server/webhook-rate-limit.ts";
 import { BodyTooLargeError, MAX_WEBHOOK_BODY_BYTES, readBoundedBody } from "../../../../../server/read-bounded-body.ts";
@@ -29,11 +30,14 @@ const PROVIDER = "meta";
  * `(body, sha256=...)` replayed at workspace B's URL verified, returned 200,
  * and wrote A's payload and A's Meta post id into B's `webhook_delivery` --
  * permanently burning that delivery id for B, because `deliveryId` is the
- * replay nonce and the row can never be deleted. The signature is now
- * derived per workspace (`deriveWorkspaceSecret`, whose header records why a
- * per-workspace secret was chosen over signing `wsId + body`), so the
- * workspace a request claims to be for is bound into what was signed and a
- * cross-tenant replay cannot verify at all.
+ * replay nonce and the row can never be deleted. The signature is now over
+ * a genuinely per-workspace secret (`getWorkspaceWebhookSecret`,
+ * server/webhook-secret.ts -- whose own header records why a per-workspace
+ * secret was chosen over signing `wsId + body`, and, since the credential
+ * vault task, why that secret is independently random per workspace rather
+ * than derived from one fleet-wide root), so the workspace a request claims
+ * to be for is bound into what was signed and a cross-tenant replay cannot
+ * verify at all.
  *
  * The other half of that fix lives at the database: the replay nonce is now
  * a PARTIAL unique index restricted to `signature_ok` rows
@@ -84,11 +88,15 @@ export async function POST(
 
   // 2) Verify the signature over the exact raw bytes received, under the
   // secret for the workspace this request CLAIMS to be for -- so that claim
-  // is itself part of what was signed. A missing root secret (misconfigured
-  // server) fails exactly like a bad signature, never "skip verification".
+  // is itself part of what was signed. The secret now comes from the
+  // credential vault (server/webhook-secret.ts), never a fleet-wide root:
+  // a workspace id that is malformed, or names no real workspace, or hits
+  // any other vault failure all resolve to `null` here and fail exactly
+  // like a bad signature -- 401, never "skip verification" and never a 500
+  // that would distinguish "vault unreachable" from "wrong signature" for
+  // an unauthenticated caller.
   const signatureHeader = request.headers.get(SIGNATURE_HEADER) ?? "";
-  const rootSecret = getWebhookRootSecret();
-  const workspaceSecret = rootSecret === null ? null : deriveWorkspaceSecret(rootSecret, rawWorkspaceId);
+  const workspaceSecret = isId(rawWorkspaceId) ? await getWorkspaceWebhookSecret(rawWorkspaceId as Id) : null;
   const signatureOk = workspaceSecret !== null && verifySignature(rawBody, signatureHeader, workspaceSecret);
   const pool = getPool();
 
@@ -219,15 +227,6 @@ export async function POST(
   });
 
   return new Response(null, { status: 200 });
-}
-
-function getWebhookRootSecret(): string | null {
-  // M0/M1 has exactly one sandbox Meta app (invariant #11: "Meta chỉ
-  // sandbox/dry-run"), so there is one configured secret. It is the ROOT of
-  // a per-workspace derivation, never the signing key itself -- see
-  // deriveWorkspaceSecret for why that distinction is the whole fix.
-  const value = process.env["META_WEBHOOK_SECRET"];
-  return value !== undefined && value.length > 0 ? value : null;
 }
 
 /**

@@ -68,7 +68,7 @@ import { performApproval, type PerformApprovalDeps } from "../../src/server/acti
 import { parseApprovalFormData, recordApprovalDecision } from "../../src/server/actions/submit-approval.ts";
 import { isChannelConnected, providerForChannel } from "../../src/server/channel-status.ts";
 import { recordSandboxVerification } from "../../src/server/integration-verification.ts";
-import { deriveWorkspaceSecret } from "../../src/server/webhook-signature.ts";
+import { getWorkspaceWebhookSecret } from "../../src/server/webhook-secret.ts";
 import { auth, buildSessionDeps } from "../../src/server/auth.ts";
 import { resolveWorkspace } from "../../src/server/session.ts";
 
@@ -1019,21 +1019,25 @@ export async function ingestSandboxEvent(pool: pg.Pool, ws: GoldenWorkspace, pay
  *
  * This drives the REAL route handler (apps/web/src/app/api/webhooks/meta/
  * [workspaceId]/route.ts) with a real `Request`, a real streamed body and a
- * real `x-hub-signature-256` header signed under the workspace-derived
- * secret -- exactly what a sandbox delivery looks like on the wire. It
- * returns the HTTP status so the caller can assert on it.
+ * real `x-hub-signature-256` header -- exactly what a sandbox delivery looks
+ * like on the wire. Credential vault task: the signing secret now comes
+ * from `getWorkspaceWebhookSecret` (server/webhook-secret.ts), the same
+ * call the route itself makes -- there is no fleet-wide root secret left to
+ * derive from, so this fixture provisions/reads the SAME real, per-workspace
+ * secret through the SAME vault the route resolves it from, rather than
+ * recomputing it independently. Returns the HTTP status so the caller can
+ * assert on it.
  */
 export async function ingestSandboxEventViaWebhook(
   ws: GoldenWorkspace,
   payload: IngestEventPayload,
 ): Promise<number> {
-  const rootSecret = process.env["META_WEBHOOK_SECRET"];
-  if (rootSecret === undefined || rootSecret.length === 0) {
-    throw new Error("META_WEBHOOK_SECRET must be set before driving the webhook route");
+  const workspaceSecret = await getWorkspaceWebhookSecret(ws.workspaceId as Id);
+  if (workspaceSecret === null) {
+    throw new Error(`could not provision a webhook secret for workspace ${ws.workspaceId} from the vault`);
   }
   const body = JSON.stringify({ events: [payload] });
-  const signature =
-    "sha256=" + createHmac("sha256", deriveWorkspaceSecret(rootSecret, ws.workspaceId)).update(body).digest("hex");
+  const signature = "sha256=" + createHmac("sha256", workspaceSecret).update(body).digest("hex");
 
   const { POST } = await import("../../src/app/api/webhooks/meta/[workspaceId]/route.ts");
   const response = await POST(
@@ -1048,19 +1052,23 @@ export async function ingestSandboxEventViaWebhook(
 }
 
 /**
- * The same delivery, signed under the ROOT secret instead of this
- * workspace's derived one -- i.e. a signature that would have been accepted
- * before late-review CRITICAL 2 and must now be refused. Used by the
+ * The same delivery, signed under a secret that is definitely NOT this
+ * workspace's own -- i.e. a signature that must be refused. Used by the
  * sequence's BREAK 7 to prove the measurement step genuinely depends on the
- * workspace-bound signature rather than merely coexisting with it.
+ * workspace-bound signature rather than merely coexisting with it. Under
+ * the old fleet-wide-root scheme this signed with the root secret directly
+ * (the pre-CRITICAL-2 vulnerability, reproduced as a regression check);
+ * there is no root secret anymore, so a fixed, obviously-wrong literal
+ * proves the identical property -- "a signature not derived from THIS
+ * workspace's real vault-stored secret is refused" -- without requiring one.
  */
 export async function ingestSandboxEventWithForeignSignature(
   ws: GoldenWorkspace,
   payload: IngestEventPayload,
 ): Promise<number> {
-  const rootSecret = process.env["META_WEBHOOK_SECRET"] ?? "";
+  const foreignSecret = "definitely-not-this-workspaces-real-vault-secret";
   const body = JSON.stringify({ events: [payload] });
-  const signature = "sha256=" + createHmac("sha256", rootSecret).update(body).digest("hex");
+  const signature = "sha256=" + createHmac("sha256", foreignSecret).update(body).digest("hex");
 
   const { POST } = await import("../../src/app/api/webhooks/meta/[workspaceId]/route.ts");
   const response = await POST(
@@ -1163,4 +1171,7 @@ export async function cleanupWorkspace(adminPool: pg.Pool, workspaceId: Id): Pro
   await adminPool.query(`delete from event where workspace_id = $1`, [workspaceId]);
   await adminPool.query(`delete from metric where workspace_id = $1`, [workspaceId]);
   await adminPool.query(`delete from webhook_delivery where workspace_id = $1`, [workspaceId]);
+  // Credential vault (0036_vault_secret.sql): ingestSandboxEventViaWebhook
+  // provisions a real per-workspace webhook secret through the vault.
+  await adminPool.query(`delete from vault_secret where workspace_id = $1`, [workspaceId]);
 }
