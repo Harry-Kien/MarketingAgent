@@ -129,6 +129,14 @@ export async function seedWorkspace(adminPool: pg.Pool): Promise<GoldenWorkspace
     `golden-sequence-${workspaceId}@test.local`,
     "Người sáng lập",
   ]);
+  // The live schema enforces approval_decision_actor_is_workspace_member_
+  // fkey: a decision's actor must already be a member of the workspace, so
+  // this founder user needs a workspace_member row before anything in this
+  // fixture records a decision on their behalf.
+  await adminPool.query(
+    `insert into workspace_member (id, workspace_id, user_id, role) values ($1, $2, $3, 'owner')`,
+    [newId(), workspaceId, userId],
+  );
   await adminPool.query(`insert into goal (id, workspace_id, statement) values ($1, $2, $3)`, [
     goalId,
     workspaceId,
