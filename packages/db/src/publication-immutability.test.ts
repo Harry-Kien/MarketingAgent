@@ -62,6 +62,12 @@ interface Chain {
 }
 
 async function seedChain(ws: string, userId: string): Promise<Chain> {
+  // The live schema enforces approval_decision_actor_is_workspace_member_
+  // fkey: the decision's actor must already be a member of this workspace.
+  await adminPool.query(
+    `insert into workspace_member (id, workspace_id, user_id, role) values (gen_random_uuid(), $1, $2, 'owner')`,
+    [ws, userId],
+  );
   return withTenant(pool, ws, async (tx) => {
     const goal = await tx.query(
       `insert into goal (id, workspace_id, statement) values (gen_random_uuid(), $1, 'publication immutability probe') returning id`,
@@ -146,7 +152,7 @@ async function insertPublication(overrides: {
 
 describe("INSERT: content_hash must match publication_content", () => {
   it("refuses a fabricated / stale hash", async () => {
-    await expect(insertPublication({ contentHash: "deadbeef" })).rejects.toThrow(/check|violates/i);
+    await expect(insertPublication({ contentHash: "deadbeef" })).rejects.toThrow(/publication_content_hash_check/);
   });
 
   it("still accepts a correctly computed hash", async () => {
