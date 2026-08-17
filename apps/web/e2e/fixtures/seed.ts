@@ -1075,7 +1075,13 @@ export async function ingestSandboxEventWithForeignSignature(
     new Request(`http://sandbox.test/api/webhooks/meta/${ws.workspaceId}`, {
       method: "POST",
       body,
-      headers: { "x-hub-signature-256": signature },
+      // A dedicated IP, not the shared "unknown" fallback: this is the one
+      // call in this whole test suite that deliberately sends an invalid
+      // signature through the real route, and webhook-rate-limit.ts's
+      // `invalid_ip` scope is a single shared bucket for every caller that
+      // omits x-forwarded-for (route.test.ts's own header carries the full
+      // reasoning for why that collision is real and was reproduced live).
+      headers: { "x-hub-signature-256": signature, "x-forwarded-for": `golden-sequence-break7-${newId()}` },
     }),
     { params: Promise.resolve({ workspaceId: ws.workspaceId }) },
   );

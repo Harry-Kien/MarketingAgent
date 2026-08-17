@@ -10,7 +10,7 @@
 // guard, the output contract, and the audit chain -- and assert the
 // sequence genuinely fails for each. A sequence that stays green with a
 // middle step broken would prove nothing.
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { newId } from "@smos/domain";
 import { createDbPool, traceToGoal } from "@smos/db";
 import { startFakeMetaServer, createMetaAdapter, AdapterError, type FakeMetaServer } from "@smos/integrations";
@@ -62,6 +62,20 @@ const authWorkspacesToClean: AuthSeededWorkspace[] = [];
 // (fixtures/seed.ts) reads through the identical call. Nothing real is
 // ever contacted; the vault itself points at the same sandbox PostgreSQL
 // every other test in this suite uses.
+//
+// BREAK 7 sends exactly one deliberately-invalid signature through the real
+// route, which increments webhook-rate-limit.ts's `invalid_global` scope --
+// a single shared row (bucket_index always 0) that route.test.ts's own
+// suite, and webhook-rate-limit.test.ts's suite, also touch. Reproduced
+// live: whichever of those files happens to run first within the same
+// 60-second window can leave that one row already past its production
+// ceiling, turning BREAK 7's expected 401 into a 429 for a reason that has
+// nothing to do with this sequence's own correctness. Reset here, same
+// reasoning as route.test.ts's own beforeAll.
+beforeAll(async () => {
+  await adminPool.query("delete from webhook_rate_limit_bucket where scope = 'invalid_global'");
+});
+
 afterAll(async () => {
   for (const workspaceId of workspacesToClean) {
     await cleanupWorkspace(adminPool, workspaceId).catch(() => undefined);

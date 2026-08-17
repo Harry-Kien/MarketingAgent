@@ -117,6 +117,49 @@ async function createBareWorkspace(): Promise<string> {
   return id;
 }
 
+/**
+ * `count` distinct keys that are guaranteed to hash to DIFFERENT
+ * `invalid_ip` bucket indices (webhook-rate-limit.ts: 1021 buckets).
+ *
+ * Generating N plain random keys and assuming none collide is exactly what
+ * webhook-rate-limit.test.ts's own `findCollidingKeys` helper proves is
+ * UNSAFE ("a birthday-style collision among random candidates is expected
+ * within a few dozen tries") -- for the ~25 keys the distributed-flood test
+ * below needs against only 1021 buckets, the birthday-paradox probability
+ * of at least one collision is roughly 1 in 4 per run. A collision there
+ * means two "different source IPs" silently share ONE bucket, so
+ * `invalid_ip`'s own limit (10) can trip before the test's real target,
+ * `invalid_workspace`'s limit (20), ever does -- an intermittent, spurious
+ * 429 in the middle of an expected run of 401s, with nothing wrong in the
+ * route or the rate limiter itself. This asks Postgres for the exact same
+ * hash the real UPSERT uses (never a JS reimplementation) and discards any
+ * candidate that would land on a bucket already claimed, so the generated
+ * set is collision-free by construction rather than by luck.
+ */
+async function distinctNonCollidingBucketKeys(count: number, label: string): Promise<string[]> {
+  // Also avoid any bucket_index that already has traffic recorded for this
+  // scope RIGHT NOW, from whatever else has run in this same process --
+  // colliding with an already-warm bucket is the same failure mode as
+  // colliding within this function's own batch, just sourced externally.
+  const occupied = await pool.query<{ idx: number }>(
+    "select bucket_index as idx from webhook_rate_limit_bucket where scope = 'invalid_ip'",
+  );
+  const seenIndexes = new Set<number>(occupied.rows.map((row) => row.idx));
+  const keys: string[] = [];
+  let attempt = 0;
+  while (keys.length < count) {
+    const candidate = `${label}-${newId()}-${attempt++}`;
+    const r = await pool.query<{ idx: number }>("select (abs(hashtext($1)::bigint) % 1021)::int as idx", [
+      candidate,
+    ]);
+    const idx = r.rows[0]!.idx;
+    if (seenIndexes.has(idx)) continue;
+    seenIndexes.add(idx);
+    keys.push(candidate);
+  }
+  return keys;
+}
+
 async function eventCount(workspaceId: string, publicationId: string): Promise<number> {
   const r = await adminPool.query(
     "select count(*)::int as n from event where workspace_id = $1 and publication_id = $2",
@@ -142,6 +185,21 @@ async function webhookDeliveryCount(workspaceId: string, externalId: string): Pr
 }
 
 beforeAll(async () => {
+  // webhook-rate-limit.ts's `invalid_global` scope is a single shared row
+  // (bucket_index always 0, by design: N=1) -- the SAME row real production
+  // traffic reads, and the same row webhook-rate-limit.test.ts's own suite
+  // deliberately drives past its limit to prove the mechanism. Every other
+  // scope this file touches now uses a fresh, per-call key/IP (never the
+  // shared "unknown" fallback), so the only remaining source of cross-file
+  // interference is this one un-avoidable-by-key-diversification row.
+  // Resetting it here does not change what THIS file's own tests prove --
+  // every assertion below about throttling still drives its OWN scope past
+  // ITS OWN real limit and checks for 429 -- it only removes accidental
+  // pollution left behind by whichever OTHER file happened to run earlier
+  // in the same 60-second window, reproduced live by running this file
+  // together with webhook-rate-limit.test.ts (see the per-test comments
+  // below for the concrete failure that motivated this).
+  await adminPool.query("delete from webhook_rate_limit_bucket where scope = 'invalid_global'");
   ({ a, b } = await seedTwoWorkspaces(adminPool));
   // Simulate: this publication was already posted to the sandbox and Meta
   // assigned it a real external post id -- exactly the state handlePublish
@@ -229,7 +287,17 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
         },
       ],
     });
-    const { request, context } = req(a.workspaceId, body, sign(body, "wrong-secret"));
+    // A dedicated IP, not the shared "unknown" fallback: every test in this
+    // file that sends an invalid signature would otherwise collide on the
+    // SAME `invalid_ip` bucket (limit 10/60s, webhook-rate-limit.ts) --
+    // reproduced live: running this file together with
+    // webhook-rate-limit.test.ts (which also touches the shared,
+    // cardinality-1 `invalid_global` bucket directly) intermittently threw
+    // LATER tests in this file's own execution order from 401 to 429,
+    // purely from cumulative cross-test volume against a real, persistent,
+    // production-shaped counter -- nothing to do with whether any
+    // individual signature check is actually correct.
+    const { request, context } = req(a.workspaceId, body, sign(body, "wrong-secret"), `test-ip-forged-${newId()}`);
     const res = await POST(request, context);
     expect(res.status).toBe(401);
     expect(await webhookDeliveryCount(a.workspaceId, "d-forged-1")).toBe(0);
@@ -249,7 +317,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
     });
     const validSignatureForOriginal = await signFor(a.workspaceId, originalBody);
     const tamperedBody = originalBody.replace('"value":1', '"value":99999');
-    const { request, context } = req(a.workspaceId, tamperedBody, validSignatureForOriginal);
+    const { request, context } = req(a.workspaceId, tamperedBody, validSignatureForOriginal, `test-ip-tampered-${newId()}`);
     const res = await POST(request, context);
     expect(res.status).toBe(401);
     expect(await webhookDeliveryCount(a.workspaceId, "d-tampered-1")).toBe(0);
@@ -291,7 +359,12 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
   // information leaked, not more.
   it("rejects a malformed workspace id in the URL with 401, since no secret can ever be resolved for it", async () => {
     const body = JSON.stringify({ events: [] });
-    const { request, context } = req("not-a-real-workspace-id", body, sign(body, "irrelevant-secret"));
+    const { request, context } = req(
+      "not-a-real-workspace-id",
+      body,
+      sign(body, "irrelevant-secret"),
+      `test-ip-malformed-${newId()}`,
+    );
     const res = await POST(request, context);
     expect(res.status).toBe(401);
   });
@@ -318,7 +391,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
     });
     const beforeA = await eventCount(a.workspaceId, a.publicationId);
     // The exact bytes and the exact signature workspace A would have sent.
-    const { request, context } = req(b.workspaceId, body, await signFor(a.workspaceId, body));
+    const { request, context } = req(b.workspaceId, body, await signFor(a.workspaceId, body), `test-ip-replay-${newId()}`);
     const res = await POST(request, context);
 
     expect(res.status).toBe(401);
@@ -343,7 +416,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
     const burnBody = JSON.stringify({
       events: [{ externalId, eventType: "post.impression", value: 1, occurredAt: new Date().toISOString(), deliveryId }],
     });
-    const burn = req(b.workspaceId, burnBody, await signFor(a.workspaceId, burnBody));
+    const burn = req(b.workspaceId, burnBody, await signFor(a.workspaceId, burnBody), `test-ip-burn-${newId()}`);
     expect((await POST(burn.request, burn.context)).status).toBe(401);
 
     // B's genuine delivery, with the same delivery id, must still be
@@ -367,7 +440,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
     const body = JSON.stringify({
       events: [{ externalId, eventType: "post.impression", value: 5, occurredAt: new Date().toISOString(), deliveryId }],
     });
-    const forged = req(a.workspaceId, body, sign(body, "wrong-secret"));
+    const forged = req(a.workspaceId, body, sign(body, "wrong-secret"), `test-ip-audit-${newId()}`);
     expect((await POST(forged.request, forged.context)).status).toBe(401);
 
     const rejected = await adminPool.query(
@@ -443,7 +516,7 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
         },
       ],
     });
-    const { request, context } = req(ghost, body, sign(body, "irrelevant-secret"));
+    const { request, context } = req(ghost, body, sign(body, "irrelevant-secret"), `test-ip-ghost-${newId()}`);
     const res = await POST(request, context);
     expect(res.status).toBe(401);
     expect(await res.text()).toBe("");
@@ -497,14 +570,15 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
       const targetWorkspaceId = await createBareWorkspace();
       const limit = WEBHOOK_RATE_LIMITS.invalid_workspace.limit;
 
+      // Collision-free by construction (see distinctNonCollidingBucketKeys):
+      // a per-IP budget individually never trips, so only the
+      // per-claimed-workspace scope can be what throttles this.
+      const ips = await distinctNonCollidingBucketKeys(limit + 5, "test-ip-distributed");
+
       const statuses: number[] = [];
       for (let i = 0; i < limit + 5; i++) {
-        // A FRESH IP every single request -- the per-IP budget individually
-        // never trips, so only the per-claimed-workspace scope can be what
-        // throttles this.
-        const ip = `test-ip-distributed-${newId()}-${i}`;
         const body = forgedEventBody(targetWorkspaceId, `d-distflood-${i}-${newId()}`);
-        const { request, context } = req(targetWorkspaceId, body, sign(body, "wrong-secret"), ip);
+        const { request, context } = req(targetWorkspaceId, body, sign(body, "wrong-secret"), ips[i]);
         statuses.push((await POST(request, context)).status);
       }
 
@@ -565,6 +639,54 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
       const res = await POST(genuineReq, genuineCtx);
 
       expect(res.status).toBe(200); // B is completely unaffected by A's flood
+      expect(await eventCount(b.workspaceId, b.publicationId)).toBe(before + 1);
+    });
+
+    // `invalid_global` (webhook-rate-limit.ts) is the ONE scope with a
+    // single shared row (N=1, bucket_index always 0) across every
+    // workspace and every IP -- deliberately, so a flood distributed
+    // across many fabricated workspace ids AND many source IPs still trips
+    // something. That also means it is the one scope where "workspace A's
+    // attacker can affect workspace B" is TRUE for the invalid-signature
+    // bookkeeping itself (B's own rare invalid-signature attempt could get
+    // 429 instead of a recorded rejection during A's flood window) -- but
+    // the property that actually matters is narrower and load-bearing: a
+    // GENUINE, validly-signed delivery must never be blocked by it. Proven
+    // directly here, not assumed: the bucket is driven straight to its real
+    // production ceiling by SQL (not by sending 200 HTTP requests, for
+    // speed), and a brand-new workspace's correctly-signed delivery is
+    // shown to still succeed. This holds structurally, not by luck --
+    // route.ts only ever checks `invalid_global` on the branch where
+    // `signatureOk` is false; a validly-signed request takes the
+    // `valid_workspace` branch instead (checkWebhookRateLimit(pool,
+    // "valid_workspace", rawWorkspaceId)), a completely separate row keyed
+    // per-workspace, which forged traffic can never write into at all.
+    it("a genuine, validly signed delivery still succeeds even with the fleet-wide invalid_global bucket already at its real production ceiling", async () => {
+      await adminPool.query(
+        `insert into webhook_rate_limit_bucket (scope, bucket_index, window_start, request_count)
+         values ('invalid_global', 0, now(), $1)
+         on conflict (scope, bucket_index) do update set window_start = now(), request_count = $1`,
+        [WEBHOOK_RATE_LIMITS.invalid_global.limit + 50],
+      );
+
+      // Sanity: the scope really is exhausted right now for an INVALID
+      // signature (this is the cross-tenant cost the header above names).
+      const forgedBody = forgedEventBody(a.workspaceId, `d-global-exhausted-forged-${newId()}`);
+      const forged = req(a.workspaceId, forgedBody, sign(forgedBody, "wrong-secret"), `test-ip-global-sanity-${newId()}`);
+      expect((await POST(forged.request, forged.context)).status).toBe(429);
+
+      // The load-bearing property: a GENUINE delivery is entirely
+      // unaffected, for a workspace that has sent nothing else this test.
+      const externalId = `route-test-post-${b.publicationId}`;
+      const deliveryId = `d-global-exhausted-genuine-${newId()}`;
+      const genuineBody = JSON.stringify({
+        events: [{ externalId, eventType: "post.impression", value: 55, occurredAt: new Date().toISOString(), deliveryId }],
+      });
+      const before = await eventCount(b.workspaceId, b.publicationId);
+      const { request, context } = req(b.workspaceId, genuineBody, await signFor(b.workspaceId, genuineBody));
+      const res = await POST(request, context);
+
+      expect(res.status).toBe(200);
       expect(await eventCount(b.workspaceId, b.publicationId)).toBe(before + 1);
     });
   });
