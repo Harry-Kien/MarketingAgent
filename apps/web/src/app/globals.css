@@ -8,6 +8,12 @@
  * scripts/generate-tokens-css.mjs and checked byte-for-byte.
  */
 @import "../ui/tokens.css";
+/* fonts.css supplies the @font-face rules tokens.css's --font-display and
+ * --font-body names refer to. Without it those custom properties name fonts
+ * nothing loads, and every page silently renders in the system-ui fallback
+ * instead of Archivo / Be Vietnam Pro -- see fonts.css's own header and
+ * apps/web/e2e/typography.spec.ts for the render proof. */
+@import "./fonts.css";
 
 *,
 *::before,
