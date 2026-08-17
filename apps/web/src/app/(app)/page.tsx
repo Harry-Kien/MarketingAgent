@@ -56,28 +56,37 @@ export default async function TodayPage() {
           {t("home.needsYou")}: {t("approval.pendingCount", { count: board.pendingApprovalCount })}
         </p>
       )}
-      <table style={{ width: "100%", borderCollapse: "collapse", marginTop: tokens.space[3] }}>
-        <thead>
-          <tr>
-            <th style={{ textAlign: "left", lineHeight: "var(--lh-table)" }}>{t("campaign.name")}</th>
-            <th style={{ textAlign: "left", lineHeight: "var(--lh-table)" }}>{t("campaign.lifecycle")}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {board.campaigns.map((campaign) => (
-            <tr key={campaign.id} style={{ borderTop: "1px solid var(--color-rule)" }}>
-              <td style={{ lineHeight: "var(--lh-table)" }}>
-                <a href={`/campaigns/${campaign.id}`} style={{ color: "var(--color-cham)" }}>
-                  {campaign.name}
-                </a>
-              </td>
-              <td style={{ lineHeight: "var(--lh-table)" }}>
-                <StateRibbon state={campaign.state} />
-              </td>
+      {/* overflow-x here, not on the page or AppShell: a table whose
+          content is genuinely too wide for a narrow viewport (e.g. a long
+          campaign name at 390px) should scroll locally, not force the whole
+          page wider than the screen -- the exact defect E7's real mobile
+          screenshot caught (AppShell.tsx's `minWidth: 0` is the other half
+          of this fix, letting this container actually shrink enough for
+          this rule to matter). */}
+      <div style={{ overflowX: "auto", marginTop: tokens.space[3] }}>
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead>
+            <tr>
+              <th style={{ textAlign: "left", lineHeight: "var(--lh-table)" }}>{t("campaign.name")}</th>
+              <th style={{ textAlign: "left", lineHeight: "var(--lh-table)" }}>{t("campaign.lifecycle")}</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {board.campaigns.map((campaign) => (
+              <tr key={campaign.id} style={{ borderTop: "1px solid var(--color-rule)" }}>
+                <td style={{ lineHeight: "var(--lh-table)" }}>
+                  <a href={`/campaigns/${campaign.id}`} style={{ color: "var(--color-cham)" }}>
+                    {campaign.name}
+                  </a>
+                </td>
+                <td style={{ lineHeight: "var(--lh-table)" }}>
+                  <StateRibbon state={campaign.state} />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

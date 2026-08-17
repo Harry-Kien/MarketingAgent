@@ -20,7 +20,8 @@ const DESTINATIONS: NavDestination[] = [
   { href: "/analytics", label: () => t("nav.analytics") },
 ];
 
-const RAIL_WIDTH = 224;
+// The rail's width (224px) lives in globals.css alongside its media query,
+// because the value and the breakpoint that retires it have to stay together.
 
 /**
  * The operating console shell (blueprint: "AppShell"). A left rail plus a
@@ -44,16 +45,19 @@ export function AppShell({
   children: ReactNode;
 }) {
   return (
-    <div style={{ display: "flex", minHeight: "100vh", background: "var(--color-paper)" }}>
+    <div className="app-shell" style={{ minHeight: "100vh", background: "var(--color-paper)" }}>
+      {/* Layout lives in globals.css, not here, because the rail has to change
+          axis below 720px and an inline style cannot express a media query.
+          Above that it is a fixed-width left rail; below it becomes a
+          horizontally scrollable strip along the top, so the five
+          destinations stay the navigation surface at every size instead of
+          the document growing wider than the viewport. E7's real-browser
+          mobile run caught the fixed rail pushing the page past 390px. */}
       <nav
+        className="app-rail"
         aria-label={t("shell.landmark")}
         style={{
-          width: RAIL_WIDTH,
-          flexShrink: 0,
-          borderRight: "1px solid var(--color-rule)",
           padding: tokens.space[3],
-          display: "flex",
-          flexDirection: "column",
           gap: tokens.space[1],
         }}
       >
@@ -92,7 +96,15 @@ export function AppShell({
           );
         })}
       </nav>
-      <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
+      {/* `minWidth: 0` overrides the flex default of `min-width: auto`, which
+          otherwise refuses to let this column shrink below the intrinsic
+          width of whatever it contains (a long campaign name in a table, for
+          instance) -- the exact bug E7's real-browser mobile (390px)
+          screenshot caught live: without this, the whole page grew wider
+          than the viewport instead of the content wrapping/scrolling
+          locally. See (app)/page.tsx's own `overflow-x: auto` wrapper around
+          its table for the other half of this fix. */}
+      <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
         <header
           style={{
             display: "flex",

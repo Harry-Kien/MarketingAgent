@@ -5,6 +5,7 @@ import { getPool } from "../../../../server/db.ts";
 import { getCampaign } from "../../../../server/queries.ts";
 import { PageState } from "../../../../ui/PageState.tsx";
 import { StateRibbon } from "../../../../ui/StateRibbon.tsx";
+import { tokens } from "../../../../ui/tokens.ts";
 import { t } from "../../../../i18n/index.ts";
 
 /**
@@ -48,12 +49,22 @@ export default async function CampaignPage({ params }: { params: Promise<{ id: s
 
   return (
     <div>
-      <h1 className="font-display" style={{ lineHeight: "var(--lh-heading)", margin: 0 }}>
+      {/* overflowWrap: campaign.name is founder-entered free text with no
+          guaranteed spaces (E7's real mobile screenshot caught this live
+          with a long hyphenated name); without it, one long unbroken run of
+          characters refuses to wrap and pushes the whole page wider than a
+          390px viewport instead of breaking onto a second line. */}
+      <h1 className="font-display" style={{ lineHeight: "var(--lh-heading)", margin: 0, overflowWrap: "anywhere" }}>
         {campaign.name}
       </h1>
-      <p>
+      {/* The ribbon has eleven fixed stops, so it is intrinsically wider than a
+          390px viewport. It scrolls inside its own container rather than
+          widening the document -- same treatment (app)/page.tsx gives its
+          table. Caught by E7's real-browser mobile run, not by any unit test:
+          nothing that renders to a string can observe a horizontal scrollbar. */}
+      <div style={{ overflowX: "auto", marginTop: tokens.space[2], marginBottom: tokens.space[2] }}>
         <StateRibbon state={campaign.state} />
-      </p>
+      </div>
       <dl>
         <dt>{t("campaign.lifecycle")}</dt>
         <dd>{t(`lifecycle.${campaign.state}`)}</dd>
