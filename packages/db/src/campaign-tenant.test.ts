@@ -79,6 +79,6 @@ describe("campaign table — row level security", () => {
           [B, goal.rows[0].id, marker],
         );
       }),
-    ).rejects.toThrow(/permission denied|row-level security|violates/i);
+    ).rejects.toThrow(/new row violates row-level security policy for table "campaign"/);
   });
 });
