@@ -40,6 +40,12 @@ interface Chain {
 }
 
 async function seedChain(ws: string, userId: string): Promise<Chain> {
+  // The live schema enforces approval_decision_actor_is_workspace_member_
+  // fkey: the decision's actor must already be a member of this workspace.
+  await adminPool.query(
+    `insert into workspace_member (id, workspace_id, user_id, role) values (gen_random_uuid(), $1, $2, 'owner')`,
+    [ws, userId],
+  );
   return withTenant(pool, ws, async (tx) => {
     const goal = await tx.query(
       `insert into goal (id, workspace_id, statement) values (gen_random_uuid(), $1, 'publication invariants probe') returning id`,
@@ -145,7 +151,7 @@ describe("E3: a publication requires a recorded approval decision", () => {
 
   it("refuses an approval_decision_id belonging to another workspace (composite FK)", async () => {
     await expect(insertPublication(B, { decisionId: chainA.decisionId })).rejects.toThrow(
-      /foreign key|violates/i,
+      /publication_approval_decision_id_workspace_fkey/,
     );
   });
 
@@ -156,15 +162,15 @@ describe("E3: a publication requires a recorded approval decision", () => {
 
 describe("E3: publication_content cannot be blank", () => {
   it("refuses an empty string", async () => {
-    await expect(insertPublication(A, { content: "" })).rejects.toThrow(/check|violates/i);
+    await expect(insertPublication(A, { content: "" })).rejects.toThrow(/publication_publication_content_check/);
   });
 
   it("refuses a whitespace-only string", async () => {
-    await expect(insertPublication(A, { content: "   " })).rejects.toThrow(/check|violates/i);
+    await expect(insertPublication(A, { content: "   " })).rejects.toThrow(/publication_publication_content_check/);
   });
 
   it("refuses a string made only of tabs and newlines", async () => {
-    await expect(insertPublication(A, { content: "\t\n" })).rejects.toThrow(/check|violates/i);
+    await expect(insertPublication(A, { content: "\t\n" })).rejects.toThrow(/publication_publication_content_check/);
   });
 });
 
@@ -179,13 +185,13 @@ describe("idempotency_key uniqueness", () => {
 describe("cross-workspace composite FKs on campaign and content_version", () => {
   it("refuses a publication in workspace B pointing at workspace A's campaign", async () => {
     await expect(insertPublication(B, { campaignId: chainA.campaignId })).rejects.toThrow(
-      /foreign key|violates/i,
+      /publication_campaign_id_workspace_fkey/,
     );
   });
 
   it("refuses a publication in workspace B pointing at workspace A's content_version", async () => {
     await expect(insertPublication(B, { versionId: chainA.versionId })).rejects.toThrow(
-      /foreign key|violates/i,
+      /publication_content_version_id_workspace_fkey/,
     );
   });
 });
