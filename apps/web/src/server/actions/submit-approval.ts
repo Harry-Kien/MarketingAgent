@@ -113,8 +113,19 @@ export interface ApprovalFormInput {
  * tests depend on decision/reason being checked before any session or
  * database work happens at all, and this function still runs first in
  * `submitApproval` below, so that ordering is unchanged.
+ *
+ * `async`, despite doing nothing asynchronous, because this file starts
+ * with `"use server"`: Next.js's Server Actions compiler treats every
+ * exported function in such a file as a Server Function and refuses to
+ * build the app at all if one isn't async ("Server Actions must be async
+ * functions") -- reproduced live the first time a real browser (not
+ * Vitest, which never applies this transform) actually requested
+ * `approvals/[id]`, which imports this file: the page 500'd. That failure
+ * mode is exactly why this task exists (E7's own browser suite is what
+ * caught it), so the fix belongs here, in the shape Next.js requires, not
+ * in loosening any check this function makes.
  */
-export function parseApprovalFormData(formData: FormData): ApprovalFormInput {
+export async function parseApprovalFormData(formData: FormData): Promise<ApprovalFormInput> {
   const decisionRaw = formData.get("decision");
   const reasonRaw = formData.get("reason");
   if (typeof decisionRaw !== "string" || !VALID_DECISIONS.has(decisionRaw)) {
@@ -195,7 +206,7 @@ export async function recordApprovalDecision(
  * for its own session, still ending in the same two `revalidatePath` calls.
  */
 export async function submitApproval(approvalRequestId: Id, formData: FormData): Promise<void> {
-  const input = parseApprovalFormData(formData);
+  const input = await parseApprovalFormData(formData);
   const session = await requireWorkspace();
   await recordApprovalDecision(approvalRequestId, input, session);
 

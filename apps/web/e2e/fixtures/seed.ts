@@ -65,12 +65,34 @@ import {
 } from "@smos/worker";
 import type { ChannelAdapter } from "@smos/integrations";
 import { performApproval, type PerformApprovalDeps } from "../../src/server/actions/approve.ts";
-import { parseApprovalFormData, recordApprovalDecision } from "../../src/server/actions/submit-approval.ts";
 import { isChannelConnected, providerForChannel } from "../../src/server/channel-status.ts";
 import { recordSandboxVerification } from "../../src/server/integration-verification.ts";
 import { deriveWorkspaceSecret } from "../../src/server/webhook-signature.ts";
-import { auth, buildSessionDeps } from "../../src/server/auth.ts";
-import { resolveWorkspace } from "../../src/server/session.ts";
+// `auth`/`buildSessionDeps` (auth.ts) and `resolveWorkspace` (session.ts)
+// and `parseApprovalFormData`/`recordApprovalDecision` (submit-approval.ts)
+// are imported dynamically INSIDE recordHumanDecisionViaSubmitApproval
+// below, the one function that uses them, rather than statically here.
+//
+// Why: `apps/web/e2e/golden-sequence-browser.spec.ts` (the Playwright
+// E7-approval suite) imports this file's Next.js-free helpers
+// (seedWorkspace, runContentPipeline, createApprovalRequest, ...) directly,
+// and Playwright's own TypeScript loader -- unlike Vitest's, which resolves
+// this fine -- cannot resolve `next/cache` (submit-approval.ts's own
+// import) or `next/headers` (auth.ts's) at all: `Cannot find module
+// '.../next/cache' imported from submit-approval.ts` at test-collection
+// time, reproduced live, before a single test runs. A static import at the
+// top of this file evaluates the WHOLE module graph regardless of which
+// export is actually used, so keeping these as top-level imports would
+// make importing anything else from this file -- even `runContentPipeline`
+// -- fail under Playwright. `performApproval` (approve.ts) stays a static
+// import above because approve.ts itself has no Next.js dependency at all
+// (only @smos/domain and the i18n module) -- it is submit-approval.ts and
+// auth.ts specifically, not approve.ts, that reach into Next.js internals.
+// Deferring the other three to a dynamic `import()` means Node only
+// resolves those modules when recordHumanDecisionViaSubmitApproval is
+// actually invoked -- which Vitest's golden-sequence.test.ts still does,
+// unchanged, and Playwright's browser suite never does (it drives the real
+// button instead).
 
 export const TARGET_CHANNEL = "meta_page";
 export const SANDBOX_PAGE_ID = "page-1";
@@ -543,6 +565,9 @@ export async function recordHumanDecisionViaWebLayer(
   ws: GoldenWorkspace,
   input: { approvalRequestId: Id; decision: ApprovalDecisionKind; reason: string },
 ): Promise<Id> {
+  // Dynamic: see this file's header comment on why (Playwright cannot
+  // resolve approve.ts's transitive imports at static-import time).
+  const { performApproval } = await import("../../src/server/actions/approve.ts");
   return withTenant(pool, ws.workspaceId, async (tx) => {
     const deps: PerformApprovalDeps = {
       async loadRequest(id) {
@@ -669,6 +694,16 @@ export async function recordHumanDecisionViaSubmitApproval(
   ws: { email: string; password: string },
   input: { approvalRequestId: Id; decision: ApprovalDecisionKind; reason: string },
 ): Promise<Id> {
+  // Dynamic: see this file's header comment on why (Playwright cannot
+  // resolve auth.ts's/submit-approval.ts's transitive Next.js imports at
+  // static-import time; Vitest, the only runner that calls this function,
+  // resolves them fine).
+  const { auth, buildSessionDeps } = await import("../../src/server/auth.ts");
+  const { resolveWorkspace } = await import("../../src/server/session.ts");
+  const { parseApprovalFormData, recordApprovalDecision } = await import(
+    "../../src/server/actions/submit-approval.ts"
+  );
+
   const { headers: responseHeaders } = await auth.api.signInEmail({
     body: { email: ws.email, password: ws.password },
     returnHeaders: true,
@@ -685,7 +720,7 @@ export async function recordHumanDecisionViaSubmitApproval(
 
   const decision = await recordApprovalDecision(
     input.approvalRequestId,
-    parseApprovalFormData(formData),
+    await parseApprovalFormData(formData),
     session,
   );
   return decision.id;
