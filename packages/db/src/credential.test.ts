@@ -115,7 +115,7 @@ describe("E16: cross-tenant WRITE is refused as smos_app", () => {
       `insert into credential_reference (id, workspace_id, integration_id, vault_key)
        values (gen_random_uuid(), $1, $2, 'vault://hijack/plain')`,
       [a.workspaceId, a.integrationId],
-    ))).rejects.toThrow(/row-level security|violates/i);
+    ))).rejects.toThrow(/new row violates row-level security policy for table "credential_reference"/);
   });
 
   it("refuses a same-workspace-tagged INSERT whose integration_id belongs to another workspace (composite FK, RLS bypassed on the referenced table)", async () => {
@@ -127,7 +127,7 @@ describe("E16: cross-tenant WRITE is refused as smos_app", () => {
       `insert into credential_reference (id, workspace_id, integration_id, vault_key)
        values (gen_random_uuid(), $1, $2, 'vault://hijack/fk')`,
       [b.workspaceId, a.integrationId],
-    ))).rejects.toThrow(/foreign key|violates/i);
+    ))).rejects.toThrow(/credential_reference_integration_id_workspace_id_fkey/);
   });
 
   it("still allows a credential reference pointing at its own workspace's integration", async () => {
@@ -160,7 +160,7 @@ describe("E16: metric rows require freshness and attribution", () => {
       `insert into metric (id, workspace_id, campaign_id, name, value, freshness_at, attribution_model, attribution_window, confidence)
        values (gen_random_uuid(), $1, $2, 'reach', 1, now(), 'last_touch', '7d', 'low')`,
       [b.workspaceId, a.campaignId],
-    ))).rejects.toThrow(/foreign key|violates/i);
+    ))).rejects.toThrow(/metric_campaign_id_workspace_id_fkey/);
   });
 });
 
@@ -177,7 +177,7 @@ describe("E16: event tolerates an out-of-order webhook and refuses a cross-works
       `insert into event (id, workspace_id, publication_id, event_type, occurred_at)
        values (gen_random_uuid(), $1, $2, 'webhook.received', now())`,
       [b.workspaceId, a.publicationId],
-    ))).rejects.toThrow(/foreign key|violates/i);
+    ))).rejects.toThrow(/event_publication_id_workspace_id_fkey/);
   });
 
   it("still allows an event pointing at its own workspace's publication", async () => {
@@ -250,7 +250,7 @@ describe("E16: integration.status is constrained to the known lifecycle values",
     await expect(withTenant(pool, a.workspaceId, (tx) => tx.query(
       `insert into integration (id, workspace_id, provider, status) values (gen_random_uuid(), $1, 'meta_ads', 'made_up_status')`,
       [a.workspaceId],
-    ))).rejects.toThrow(/check|violates/i);
+    ))).rejects.toThrow(/integration_status_check/);
   });
 
   // Late-review IMPORTANT 3: 'sandbox' is no longer a status that can simply
@@ -274,6 +274,6 @@ describe("E16: integration.status is constrained to the known lifecycle values",
     await expect(withTenant(pool, a.workspaceId, (tx) => tx.query(
       `insert into integration (id, workspace_id, provider, status) values (gen_random_uuid(), $1, $2, 'sandbox')`,
       [a.workspaceId, `probe-sandbox-${Date.now()}-${Math.random()}`],
-    ))).rejects.toThrow(/check|violates/i);
+    ))).rejects.toThrow(/integration_sandbox_needs_evidence_check/);
   });
 });

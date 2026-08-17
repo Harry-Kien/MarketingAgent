@@ -42,7 +42,7 @@ describe("campaign.state — CHECK constraint", () => {
            values (gen_random_uuid(), $1, $2, $3, 'NOT_A_REAL_STATE')`,
           [WS, goalId, `invalid-insert ${Date.now()}`],
         )),
-    ).rejects.toThrow(/violates check constraint|check constraint/i);
+    ).rejects.toThrow(/campaign_state_valid/);
   });
 
   it("rejects updating an existing campaign's state to an invalid string", async () => {
@@ -60,7 +60,7 @@ describe("campaign.state — CHECK constraint", () => {
     await expect(
       withTenant(pool, WS, (tx) =>
         tx.query(`update campaign set state = 'NOT_A_REAL_STATE' where id = $1`, [campaignId])),
-    ).rejects.toThrow(/violates check constraint|check constraint/i);
+    ).rejects.toThrow(/campaign_state_valid/);
   });
 
   it("accepts all fifteen valid lifecycle states", async () => {

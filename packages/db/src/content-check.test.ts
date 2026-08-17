@@ -65,7 +65,7 @@ describe("content_item.kind — CHECK constraint", () => {
           `insert into content_item (id, workspace_id, campaign_id, kind, title) values (gen_random_uuid(), $1, $2, 'not_a_real_kind', $3)`,
           [WS, campaignId, `invalid-kind ${Date.now()}-${Math.random()}`],
         )),
-    ).rejects.toThrow(/violates check constraint|check constraint/i);
+    ).rejects.toThrow(/content_item_kind_check/);
   });
 
   it("accepts every valid ContentKind from the domain package", async () => {
@@ -91,7 +91,7 @@ describe("source_citation.verification_status — CHECK constraint", () => {
            values (gen_random_uuid(), $1, $2, 'https://x.test', now(), 'e', 'NOT_A_REAL_STATUS')`,
           [WS, versionId],
         )),
-    ).rejects.toThrow(/violates check constraint|check constraint/i);
+    ).rejects.toThrow(/source_citation_verification_status_check/);
   });
 
   it("accepts every valid VerificationStatus from the domain package", async () => {
@@ -118,7 +118,7 @@ describe("content_version.version_number — uniqueness enforced by the database
            values (gen_random_uuid(), $1, $2, 1, 'duplicate version_number')`,
           [WS, contentItemId],
         )),
-    ).rejects.toThrow(/duplicate key value|violates unique constraint/i);
+    ).rejects.toThrow(/content_version_content_item_id_version_number_key/);
   });
 
   it("allows the same version_number for two different content items", async () => {

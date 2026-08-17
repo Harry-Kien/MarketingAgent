@@ -159,7 +159,7 @@ async function insertPublication(overrides: {
 
 describe("INSERT: content_hash must match publication_content", () => {
   it("refuses a fabricated / stale hash", async () => {
-    await expect(insertPublication({ contentHash: "deadbeef" })).rejects.toThrow(/check|violates/i);
+    await expect(insertPublication({ contentHash: "deadbeef" })).rejects.toThrow(/publication_content_hash_check/);
   });
 
   it("still accepts a correctly computed hash", async () => {

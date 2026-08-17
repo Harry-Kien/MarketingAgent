@@ -86,6 +86,19 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
     `e12-${label}-${workspaceId}@test.local`,
     label,
   ]);
+  // 0029_auth_schema.sql: binds the fixture's own user_account row to this
+  // workspace. Seeded here, before approval_decision, because the live
+  // schema now enforces approval_decision_actor_is_workspace_member_fkey --
+  // a decision's actor must already be a member of the workspace at insert
+  // time, not merely inserted into workspace_member eventually in this same
+  // function. 0037_approval_actor_must_be_a_member.sql later made this the
+  // SAME constraint approval_decision (workspace_id, actor_user_id) itself
+  // enforces via its composite FK onto workspace_member (workspace_id,
+  // user_id) -- this single insert, this early, already satisfies both.
+  await client.query(
+    `insert into workspace_member (id, workspace_id, user_id, role) values ($1, $2, $3, 'owner')`,
+    [workspaceMemberId, workspaceId, userId],
+  );
   await client.query(`insert into goal (id, workspace_id, statement) values ($1, $2, 'e12 seed goal')`, [
     goalId,
     workspaceId,
@@ -112,19 +125,6 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
     `insert into approval_request (id, workspace_id, campaign_id, content_version_id, target_channel)
      values ($1, $2, $3, $4, 'meta_page')`,
     [approvalRequestId, workspaceId, campaignId, contentVersionId],
-  );
-  // 0037_approval_actor_must_be_a_member.sql: this MUST come before the
-  // approval_decision insert below, not after it as it originally did --
-  // approval_decision (workspace_id, actor_user_id) is now a composite
-  // foreign key onto workspace_member (workspace_id, user_id), so the
-  // membership has to exist before a decision can name that person as the
-  // approver. 0029_auth_schema.sql's original reason for the row is
-  // unchanged: it binds the fixture's own user_account row to this
-  // workspace, the same "first membership wins" shape resolve_user_workspace
-  // expects.
-  await client.query(
-    `insert into workspace_member (id, workspace_id, user_id, role) values ($1, $2, $3, 'owner')`,
-    [workspaceMemberId, workspaceId, userId],
   );
   await client.query(
     `insert into approval_decision (id, workspace_id, approval_request_id, actor_user_id, decision, reason)

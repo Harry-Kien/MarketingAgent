@@ -438,15 +438,21 @@ describe("gateway budget: estimatedCostUsd validation and contract (fix round 2,
     const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.01 });
     const settled = await Promise.allSettled(Array.from({ length: 50 }, () => g.generate(req, ctx)));
     const K = 8;
-    expect(calls).toBeLessThanOrEqual(K);
+    // Pinned to exactly K, not just "<= K" -- confirmed deterministic across
+    // repeated runs against the real implementation (N=50 >> K, so the cold
+    // cap is always the binding constraint). A gateway that refused every
+    // call (e.g. a broken concurrency cap admitting nobody) would also
+    // satisfy an upper bound alone: proved by temporarily setting
+    // COLD_CONCURRENCY_CAP to 0 in gateway.ts, which made every one of
+    // these calls stall out to the wallclock timeout with zero provider
+    // calls, and left the old "<= K" assertion green.
+    expect(calls).toBe(K);
     // Every one of the calls that DID reach the provider is loudly flagged
     // (contract violation or budget-exceeded) -- none silently succeeds.
     expect(settled.filter((r) => r.status === "fulfilled")).toHaveLength(0);
     // Fix round 4, FIX 2: the ledger now equals the REAL total the vendor
-    // was billed for -- exactly `calls * 0.7`, and by construction never
-    // more than `K * 0.7`.
-    expect(g.spentUsd()).toBeCloseTo(calls * 0.7);
-    expect(g.spentUsd()).toBeLessThanOrEqual(K * 0.7 + 1e-9);
+    // was billed for -- exactly `K * 0.7`.
+    expect(g.spentUsd()).toBeCloseTo(K * 0.7);
   });
 
   it("cold gateway, N=200, same dishonest estimate: the bound holds regardless of N", async () => {
@@ -462,8 +468,11 @@ describe("gateway budget: estimatedCostUsd validation and contract (fix round 2,
     const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.01 });
     await Promise.allSettled(Array.from({ length: 200 }, () => g.generate(req, ctx)));
     const K = 8;
-    expect(calls).toBeLessThanOrEqual(K);
-    expect(g.spentUsd()).toBeLessThanOrEqual(K * 0.7 + 1e-9);
+    // Pinned to exactly K (see the N=50 test above for the proof this was
+    // vacuous as "<= K": a broken cap that admits nobody also satisfies an
+    // upper bound alone).
+    expect(calls).toBe(K);
+    expect(g.spentUsd()).toBeCloseTo(K * 0.7);
   });
 
   it("cold gateway, estimate 0.001 vs real 0.70: the bound holds regardless of how small the estimate is", async () => {
@@ -479,8 +488,8 @@ describe("gateway budget: estimatedCostUsd validation and contract (fix round 2,
     const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.001 });
     await Promise.allSettled(Array.from({ length: 999 }, () => g.generate(req, ctx)));
     const K = 8;
-    expect(calls).toBeLessThanOrEqual(K);
-    expect(g.spentUsd()).toBeLessThanOrEqual(K * 0.7 + 1e-9);
+    expect(calls).toBe(K);
+    expect(g.spentUsd()).toBeCloseTo(K * 0.7);
   });
 
   it("cold gateway, estimate 0.0001, N=2000: the reviewer's most extreme case -- 2000/2000 calls, $1400 against a $1 budget, pre-fix -- stays bounded at K", async () => {
@@ -496,9 +505,9 @@ describe("gateway budget: estimatedCostUsd validation and contract (fix round 2,
     const g = createGateway({ provider, budgetUsd: 1, maxWallclockMs: 5000, estimatedCostUsd: 0.0001 });
     await Promise.allSettled(Array.from({ length: 2000 }, () => g.generate(req, ctx)));
     const K = 8;
-    expect(calls).toBeLessThanOrEqual(K);
-    // $5.60 worst case, not $1400.
-    expect(g.spentUsd()).toBeLessThanOrEqual(K * 0.7 + 1e-9);
+    expect(calls).toBe(K);
+    // $5.60, not $1400.
+    expect(g.spentUsd()).toBeCloseTo(K * 0.7);
   });
 
   it("after a bad-ESTIMATE gateway fails to even construct, a correctly-constructed gateway is completely unaffected (no shared, corruptible module state)", () => {

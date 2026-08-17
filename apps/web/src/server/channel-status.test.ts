@@ -46,7 +46,10 @@ async function seedSucceededPublication(): Promise<Id> {
   // 0037_approval_actor_must_be_a_member.sql: an approval_decision's actor
   // must hold a workspace_member row in the workspace being approved for,
   // so this probe's approver is enrolled as an actual member rather than
-  // being a bare user_account row that merely exists somewhere.
+  // being a bare user_account row that merely exists somewhere. Must happen
+  // before the approval_decision insert below -- approval_decision
+  // (workspace_id, actor_user_id) is now a composite foreign key onto
+  // workspace_member (workspace_id, user_id).
   await adminPool.query(
     `insert into workspace_member (id, workspace_id, user_id, role) values ($1, $2, $3, 'owner')`,
     [newId(), workspaceId, userId],
@@ -157,7 +160,7 @@ describe("isChannelConnected", () => {
         newId(),
         workspaceId,
       ]),
-    ).rejects.toThrow(/check|violates/i);
+    ).rejects.toThrow(/integration_sandbox_needs_evidence_check/);
     await expect(isChannelConnected(appPool, workspaceId, "meta_page")).resolves.toBe(false);
   });
 

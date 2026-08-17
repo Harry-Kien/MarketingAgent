@@ -123,15 +123,17 @@ describe("campaign.goal_id -> goal", () => {
           `insert into campaign (id, workspace_id, goal_id, name, state) values (gen_random_uuid(), $1, $2, $3, 'DRAFT')`,
           [B, chains[A]!.goalId, `hijack-campaign ${Date.now()}-${Math.random()}`],
         )),
-    ).rejects.toThrow(/foreign key|violates/i);
+    ).rejects.toThrow(/campaign_goal_id_workspace_fkey/);
   });
 
   it("still allows a campaign in workspace B pointing at workspace B's own goal", async () => {
-    await withTenant(pool, B, (tx) =>
+    const result = await withTenant(pool, B, (tx) =>
       tx.query(
-        `insert into campaign (id, workspace_id, goal_id, name, state) values (gen_random_uuid(), $1, $2, $3, 'DRAFT')`,
+        `insert into campaign (id, workspace_id, goal_id, name, state) values (gen_random_uuid(), $1, $2, $3, 'DRAFT') returning id, goal_id`,
         [B, chains[B]!.goalId, `legit-campaign ${Date.now()}-${Math.random()}`],
       ));
+    expect(result.rowCount).toBe(1);
+    expect(result.rows[0].goal_id).toBe(chains[B]!.goalId);
   });
 });
 
@@ -143,15 +145,17 @@ describe("content_item.campaign_id -> campaign", () => {
           `insert into content_item (id, workspace_id, campaign_id, kind, title) values (gen_random_uuid(), $1, $2, 'social_post', $3)`,
           [B, chains[A]!.campaignId, `hijack-item ${Date.now()}-${Math.random()}`],
         )),
-    ).rejects.toThrow(/foreign key|violates/i);
+    ).rejects.toThrow(/content_item_campaign_id_workspace_fkey/);
   });
 
   it("still allows a content_item in workspace B pointing at workspace B's own campaign", async () => {
-    await withTenant(pool, B, (tx) =>
+    const result = await withTenant(pool, B, (tx) =>
       tx.query(
-        `insert into content_item (id, workspace_id, campaign_id, kind, title) values (gen_random_uuid(), $1, $2, 'social_post', $3)`,
+        `insert into content_item (id, workspace_id, campaign_id, kind, title) values (gen_random_uuid(), $1, $2, 'social_post', $3) returning id, campaign_id`,
         [B, chains[B]!.campaignId, `legit-item ${Date.now()}-${Math.random()}`],
       ));
+    expect(result.rowCount).toBe(1);
+    expect(result.rows[0].campaign_id).toBe(chains[B]!.campaignId);
   });
 });
 
@@ -163,15 +167,17 @@ describe("content_version.content_item_id -> content_item", () => {
           `insert into content_version (id, workspace_id, content_item_id, version_number, body) values (gen_random_uuid(), $1, $2, 99, 'hijack body')`,
           [B, chains[A]!.contentItemId],
         )),
-    ).rejects.toThrow(/foreign key|violates/i);
+    ).rejects.toThrow(/content_version_content_item_id_workspace_fkey/);
   });
 
   it("still allows a content_version in workspace B pointing at workspace B's own content_item", async () => {
-    await withTenant(pool, B, (tx) =>
+    const result = await withTenant(pool, B, (tx) =>
       tx.query(
-        `insert into content_version (id, workspace_id, content_item_id, version_number, body) values (gen_random_uuid(), $1, $2, 99, 'legit body')`,
+        `insert into content_version (id, workspace_id, content_item_id, version_number, body) values (gen_random_uuid(), $1, $2, 99, 'legit body') returning id, content_item_id`,
         [B, chains[B]!.contentItemId],
       ));
+    expect(result.rowCount).toBe(1);
+    expect(result.rows[0].content_item_id).toBe(chains[B]!.contentItemId);
   });
 });
 
@@ -183,15 +189,17 @@ describe("source_citation.content_version_id -> content_version", () => {
           `insert into source_citation (id, workspace_id, content_version_id, url, accessed_at, excerpt, verification_status) values (gen_random_uuid(), $1, $2, 'https://hijack.test', now(), 'x', 'VERIFIED')`,
           [B, chains[A]!.contentVersionId],
         )),
-    ).rejects.toThrow(/foreign key|violates/i);
+    ).rejects.toThrow(/source_citation_content_version_id_workspace_fkey/);
   });
 
   it("still allows a source_citation in workspace B pointing at workspace B's own content_version", async () => {
-    await withTenant(pool, B, (tx) =>
+    const result = await withTenant(pool, B, (tx) =>
       tx.query(
-        `insert into source_citation (id, workspace_id, content_version_id, url, accessed_at, excerpt, verification_status) values (gen_random_uuid(), $1, $2, 'https://legit.test', now(), 'x', 'VERIFIED')`,
+        `insert into source_citation (id, workspace_id, content_version_id, url, accessed_at, excerpt, verification_status) values (gen_random_uuid(), $1, $2, 'https://legit.test', now(), 'x', 'VERIFIED') returning id, content_version_id`,
         [B, chains[B]!.contentVersionId],
       ));
+    expect(result.rowCount).toBe(1);
+    expect(result.rows[0].content_version_id).toBe(chains[B]!.contentVersionId);
   });
 });
 
@@ -203,15 +211,17 @@ describe("approval_request.campaign_id -> campaign", () => {
           `insert into approval_request (id, workspace_id, campaign_id, content_version_id, target_channel) values (gen_random_uuid(), $1, $2, $3, 'meta_page')`,
           [B, chains[A]!.campaignId, chains[B]!.contentVersionId],
         )),
-    ).rejects.toThrow(/foreign key|violates/i);
+    ).rejects.toThrow(/approval_request_campaign_id_workspace_fkey/);
   });
 
   it("still allows an approval_request in workspace B pointing at workspace B's own campaign", async () => {
-    await withTenant(pool, B, (tx) =>
+    const result = await withTenant(pool, B, (tx) =>
       tx.query(
-        `insert into approval_request (id, workspace_id, campaign_id, content_version_id, target_channel) values (gen_random_uuid(), $1, $2, $3, 'meta_page')`,
+        `insert into approval_request (id, workspace_id, campaign_id, content_version_id, target_channel) values (gen_random_uuid(), $1, $2, $3, 'meta_page') returning id, campaign_id`,
         [B, chains[B]!.campaignId, chains[B]!.contentVersionId],
       ));
+    expect(result.rowCount).toBe(1);
+    expect(result.rows[0].campaign_id).toBe(chains[B]!.campaignId);
   });
 });
 
@@ -223,15 +233,17 @@ describe("approval_request.content_version_id -> content_version", () => {
           `insert into approval_request (id, workspace_id, campaign_id, content_version_id, target_channel) values (gen_random_uuid(), $1, $2, $3, 'meta_page')`,
           [B, chains[B]!.campaignId, chains[A]!.contentVersionId],
         )),
-    ).rejects.toThrow(/foreign key|violates/i);
+    ).rejects.toThrow(/approval_request_content_version_id_workspace_fkey/);
   });
 
   it("still allows an approval_request in workspace B pointing at workspace B's own content_version", async () => {
-    await withTenant(pool, B, (tx) =>
+    const result = await withTenant(pool, B, (tx) =>
       tx.query(
-        `insert into approval_request (id, workspace_id, campaign_id, content_version_id, target_channel) values (gen_random_uuid(), $1, $2, $3, 'meta_page')`,
+        `insert into approval_request (id, workspace_id, campaign_id, content_version_id, target_channel) values (gen_random_uuid(), $1, $2, $3, 'meta_page') returning id, content_version_id`,
         [B, chains[B]!.campaignId, chains[B]!.contentVersionId],
       ));
+    expect(result.rowCount).toBe(1);
+    expect(result.rows[0].content_version_id).toBe(chains[B]!.contentVersionId);
   });
 });
 
@@ -244,16 +256,18 @@ describe("approval_decision.approval_request_id -> approval_request (the reporte
           `insert into approval_decision (id, workspace_id, approval_request_id, actor_user_id, decision, reason) values (gen_random_uuid(), $1, $2, $3, 'approve', 'hijacked')`,
           [B, chains[A]!.approvalRequestId, userId],
         )),
+    ).rejects.toThrow(
       // 0037_approval_actor_must_be_a_member.sql (IMPORTANT 6) makes
       // approval_decision_snapshot_request refuse a request from another
       // workspace ITSELF, before the composite foreign key that used to be
-      // the only thing catching this ever gets a chance to. The refusal is
-      // therefore now the trigger's named message rather than a foreign key
-      // violation -- an earlier and more specific rejection of the exact
-      // same attempt, not a weaker one. Both wordings are accepted so this
-      // test keeps proving the attempt is refused whichever of the two
-      // independent mechanisms gets there first.
-    ).rejects.toThrow(/foreign key|violates|does not exist in workspace/i);
+      // the only thing catching this ever gets a chance to -- an earlier and
+      // more specific rejection of the exact same attempt, not a weaker one.
+      // Pinned to the trigger's own message (not this file's composite FK
+      // message, and not a broad "foreign key|violates" alternation that
+      // would also pass if some other constraint fired instead), matching
+      // cross-tenant.test.ts's identical pin for this same pair.
+      /a decision may only snapshot a request from its own workspace/,
+    );
   });
 
   it("still allows a decision in workspace B pointing at workspace B's own approval_request", async () => {
@@ -265,10 +279,12 @@ describe("approval_decision.approval_request_id -> approval_request (the reporte
         `insert into approval_request (id, workspace_id, campaign_id, content_version_id, target_channel) values (gen_random_uuid(), $1, $2, $3, 'meta_page') returning id`,
         [B, chains[B]!.campaignId, chains[B]!.contentVersionId],
       ).then((r) => r.rows[0].id as string));
-    await withTenant(pool, B, (tx) =>
+    const result = await withTenant(pool, B, (tx) =>
       tx.query(
-        `insert into approval_decision (id, workspace_id, approval_request_id, actor_user_id, decision, reason) values (gen_random_uuid(), $1, $2, $3, 'approve', 'legit')`,
+        `insert into approval_decision (id, workspace_id, approval_request_id, actor_user_id, decision, reason) values (gen_random_uuid(), $1, $2, $3, 'approve', 'legit') returning id, approval_request_id`,
         [B, freshRequestId, userId],
       ));
+    expect(result.rowCount).toBe(1);
+    expect(result.rows[0].approval_request_id).toBe(freshRequestId);
   });
 });

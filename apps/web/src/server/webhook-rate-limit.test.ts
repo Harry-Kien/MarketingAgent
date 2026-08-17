@@ -119,6 +119,36 @@ describe("checkRateLimitBucket (real Postgres, real smos_app)", () => {
     },
   );
 
+  it(
+    "valid_workspace: two DIFFERENT, entirely legitimate workspaces that hash-collide share one " +
+      "counter -- webhook-rate-limit.ts's comment claims forged traffic can never exhaust a real " +
+      "sender's own budget, which is true, but bucket sharing is a separate, untested gap: a " +
+      "workspace that never sent an excessive request of its own can still be throttled by a " +
+      "colliding neighbour's real traffic, no forgery involved at all",
+    async () => {
+      const [wsA, wsB] = await findCollidingKeys("valid_workspace");
+      const { limit } = WEBHOOK_RATE_LIMITS.valid_workspace;
+
+      // Workspace A alone sends exactly its own full, legitimate budget --
+      // every one of these calls is the "already passed HMAC verification
+      // under wsA's own derived secret" path the comment describes.
+      let lastForA = { allowed: true, retryAfterSeconds: 0 };
+      for (let i = 0; i < limit; i++) {
+        lastForA = await checkWebhookRateLimit(pool, "valid_workspace", wsA);
+      }
+      expect(lastForA.allowed).toBe(true); // A's own traffic, alone, still fits A's own limit
+
+      // Workspace B has never sent a single request -- forged or
+      // otherwise. It is a completely different, innocent workspace whose
+      // id merely happens to hash to the same bucket_index as A's. Its
+      // very first, genuinely legitimate, already-signature-verified
+      // request is refused anyway, purely because it shares A's counter.
+      const firstForB = await checkWebhookRateLimit(pool, "valid_workspace", wsB);
+      expect(firstForB.allowed).toBe(false);
+      expect(firstForB.retryAfterSeconds).toBeGreaterThanOrEqual(1);
+    },
+  );
+
   it("attempting the attack directly as smos_app: a raw duplicate (scope, bucket_index) INSERT is refused by the primary key", async () => {
     // Force the row to exist first (idempotent — same mechanism the route uses).
     await checkRateLimitBucket(pool, "invalid_global", "any-key", { limit: 1_000_000, windowSeconds: 60 });

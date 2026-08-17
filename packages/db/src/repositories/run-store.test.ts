@@ -167,7 +167,7 @@ describe("createRunStore: persists a run, its checkpoints and its terminal state
 
     await expect(
       store.finishRun(runId, { state: "NONSENSE", costUsd: 0, budgetExceeded: false, output: { should: "never persist" } }),
-    ).rejects.toThrow(/check|violates/i);
+    ).rejects.toThrow(/agent_run_state_check/);
 
     const cp = await withTenant(pool, workspaceId, (tx) =>
       tx.query(

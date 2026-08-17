@@ -31,6 +31,12 @@ describe("server queries", () => {
   it("returns only the caller's workspace rows", async () => {
     const { a, b } = await seedTwoWorkspaces(adminPool);
     const boardA = await getTodayBoard(pool, a.workspaceId);
+    // `.every(...)` on an empty array is vacuously true -- proved: breaking
+    // the query's own WHERE clause to return zero rows left this test
+    // green. Assert the caller's own seeded campaign is actually present
+    // before checking isolation, so an isolation query that returns
+    // nothing at all (rather than correctly-scoped rows) fails loudly.
+    expect(boardA.campaigns.some((c) => c.id === a.campaignId)).toBe(true);
     expect(boardA.campaigns.every((c) => c.workspaceId === a.workspaceId)).toBe(true);
     expect(boardA.campaigns.some((c) => c.id === b.campaignId)).toBe(false);
   });

@@ -133,7 +133,7 @@ describe("approval_request is frozen once a decision exists (CRITICAL 1)", () =>
       withTenant(pool, workspaceId, (tx) =>
         tx.query(`update approval_request set content_version_id = $1 where id = $2`, [versionV2, arId]),
       ),
-    ).rejects.toThrow(/decided|immutable|violates/i);
+    ).rejects.toThrow(/has already been decided; it is the immutable record/);
 
     const after = await adminPool.query(`select content_version_id from approval_request where id = $1`, [arId]);
     expect(after.rows[0].content_version_id).toBe(versionV1);
@@ -147,7 +147,7 @@ describe("approval_request is frozen once a decision exists (CRITICAL 1)", () =>
       withTenant(pool, workspaceId, (tx) =>
         tx.query(`update approval_request set target_channel = 'tiktok_account' where id = $1`, [arId]),
       ),
-    ).rejects.toThrow(/decided|immutable|violates/i);
+    ).rejects.toThrow(/has already been decided; it is the immutable record/);
 
     const after = await adminPool.query(`select target_channel from approval_request where id = $1`, [arId]);
     expect(after.rows[0].target_channel).toBe("meta_page");
@@ -166,7 +166,7 @@ describe("approval_request is frozen once a decision exists (CRITICAL 1)", () =>
 
     await expect(
       withTenant(pool, workspaceId, (tx) => tx.query(`update approval_request set ${setClause} where id = $1`, [arId])),
-    ).rejects.toThrow(/decided|immutable|violates|denied/i);
+    ).rejects.toThrow(/has already been decided; it is the immutable record/);
   });
 
   it("still allows editing a request that has NOT been decided yet", async () => {
@@ -190,12 +190,12 @@ describe("approval_request is frozen once a decision exists (CRITICAL 1)", () =>
 describe("approval_decision records WHAT was approved, independently of the request (CRITICAL 1, lock 2)", () => {
   it("refuses a decision whose recorded content_version_id disagrees with its request", async () => {
     const arId = await seedRequest(versionV1);
-    await expect(decide(arId, versionV2)).rejects.toThrow(/foreign key|violates/i);
+    await expect(decide(arId, versionV2)).rejects.toThrow(/approval_decision_matches_request_fkey/);
   });
 
   it("refuses a decision whose recorded target_channel disagrees with its request", async () => {
     const arId = await seedRequest(versionV1);
-    await expect(decide(arId, versionV1, "tiktok_account")).rejects.toThrow(/foreign key|violates/i);
+    await expect(decide(arId, versionV1, "tiktok_account")).rejects.toThrow(/approval_decision_matches_request_fkey/);
   });
 
   it("records the approved content version and channel on the immutable decision row itself", async () => {

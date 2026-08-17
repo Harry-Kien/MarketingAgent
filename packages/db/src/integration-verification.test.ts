@@ -57,7 +57,10 @@ async function seedPublication(
   // 0037_approval_actor_must_be_a_member.sql: an approval_decision's actor
   // must hold a workspace_member row in the workspace being approved for,
   // so this probe's approver is enrolled as an actual member rather than
-  // being a bare user_account row that merely exists somewhere.
+  // being a bare user_account row that merely exists somewhere. Must happen
+  // before the approval_decision insert below -- approval_decision
+  // (workspace_id, actor_user_id) is now a composite foreign key onto
+  // workspace_member (workspace_id, user_id).
   await adminPool.query(
     `insert into workspace_member (id, workspace_id, user_id, role) values ($1, $2, $3, 'owner')`,
     [newId(), ws, userId],
@@ -132,12 +135,12 @@ afterAll(async () => {
 
 describe("integration.status = 'sandbox' must be earned (IMPORTANT 3)", () => {
   it("refuses the reviewer's bare assertion: 'sandbox' with no verifying publication", async () => {
-    await expect(insertIntegration(workspaceId, "sandbox", null)).rejects.toThrow(/check|violates|verif/i);
+    await expect(insertIntegration(workspaceId, "sandbox", null)).rejects.toThrow(/integration_sandbox_needs_evidence_check/);
   });
 
   it("refuses 'sandbox' pointing at a publication that never actually succeeded", async () => {
     await expect(insertIntegration(workspaceId, "sandbox", preparedPublicationId)).rejects.toThrow(
-      /succeeded|violates|verif/i,
+      /which is not evidence the adapter ever succeeded/,
     );
   });
 
@@ -147,14 +150,14 @@ describe("integration.status = 'sandbox' must be earned (IMPORTANT 3)", () => {
     // refuse it independently if the trigger were dropped, which is what the
     // mutation test for this migration checks.
     await expect(insertIntegration(workspaceId, "sandbox", foreignPublicationId)).rejects.toThrow(
-      /foreign key|violates|names no publication/i,
+      /integration_verified_publication_fkey/,
     );
   });
 
   it("refuses 'sandbox' whose verifying publication went to a different provider's channel", async () => {
     const tiktokPublicationId = await seedPublication(workspaceId, "succeeded", `tt_${newId()}`, "tiktok_account");
     await expect(insertIntegration(workspaceId, "sandbox", tiktokPublicationId)).rejects.toThrow(
-      /provider|channel|violates/i,
+      /cannot be verified by a publication sent to channel/,
     );
   });
 
@@ -176,6 +179,6 @@ describe("integration.status = 'sandbox' must be earned (IMPORTANT 3)", () => {
           workspaceId,
         ]),
       ),
-    ).rejects.toThrow(/check|violates|verif/i);
+    ).rejects.toThrow(/integration_sandbox_needs_evidence_check/);
   });
 });

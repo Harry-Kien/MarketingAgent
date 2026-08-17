@@ -109,7 +109,7 @@ describe("tenant isolation", () => {
           `insert into agent_definition (id, workspace_id, role, mission) values (gen_random_uuid(), $1, 'research', $2)`,
           [B, marker],
         )),
-    ).rejects.toThrow(/permission denied|row-level security|violates/i);
+    ).rejects.toThrow(/new row violates row-level security policy for table "agent_definition"/);
   });
 
   it("an agent_version insert tagged with workspace B is refused while scoped to workspace A", async () => {
@@ -128,7 +128,7 @@ describe("tenant isolation", () => {
            values (gen_random_uuid(), $1, $2, 1, 'p1', 'm1', 1.0)`,
           [B, definitionId],
         )),
-    ).rejects.toThrow(/permission denied|row-level security|violates|foreign key/i);
+    ).rejects.toThrow(/new row violates row-level security policy for table "agent_version"/);
   });
 });
 
@@ -153,7 +153,7 @@ describe("agent_version.agent_definition_id -> agent_definition composite FK", (
            values (gen_random_uuid(), $1, $2, 1, 'p1', 'm1', 1.0)`,
           [B, definitionAId],
         )),
-    ).rejects.toThrow(/foreign key|violates/i);
+    ).rejects.toThrow(/agent_version_agent_definition_id_workspace_id_fkey/);
   });
 
   it("still allows an agent_version in workspace B pointing at workspace B's own agent_definition", async () => {
@@ -196,7 +196,7 @@ describe("agent_version CHECK constraints", () => {
            values (gen_random_uuid(), $1, $2, 1, 'p1', 'm1', 0)`,
           [A, definitionId],
         )),
-    ).rejects.toThrow(/violates|check constraint/i);
+    ).rejects.toThrow(/agent_version_budget_usd_check/);
   });
 
   it("rejects budget_usd that is negative", async () => {
@@ -207,7 +207,7 @@ describe("agent_version CHECK constraints", () => {
            values (gen_random_uuid(), $1, $2, 2, 'p1', 'm1', -5)`,
           [A, definitionId],
         )),
-    ).rejects.toThrow(/violates|check constraint/i);
+    ).rejects.toThrow(/agent_version_budget_usd_check/);
   });
 
   it("rejects version_number of zero", async () => {
@@ -218,7 +218,7 @@ describe("agent_version CHECK constraints", () => {
            values (gen_random_uuid(), $1, $2, 0, 'p1', 'm1', 1.0)`,
           [A, definitionId],
         )),
-    ).rejects.toThrow(/violates|check constraint/i);
+    ).rejects.toThrow(/agent_version_version_number_check/);
   });
 
   it("rejects version_number that is negative", async () => {
@@ -229,7 +229,7 @@ describe("agent_version CHECK constraints", () => {
            values (gen_random_uuid(), $1, $2, -1, 'p1', 'm1', 1.0)`,
           [A, definitionId],
         )),
-    ).rejects.toThrow(/violates|check constraint/i);
+    ).rejects.toThrow(/agent_version_version_number_check/);
   });
 });
 
@@ -249,6 +249,6 @@ describe("agent_definition role CHECK", () => {
           `insert into agent_definition (id, workspace_id, role, mission) values (gen_random_uuid(), $1, $2, $3)`,
           [A, "not_a_real_role", marker],
         )),
-    ).rejects.toThrow(/violates|check constraint/i);
+    ).rejects.toThrow(/agent_definition_role_check/);
   });
 });

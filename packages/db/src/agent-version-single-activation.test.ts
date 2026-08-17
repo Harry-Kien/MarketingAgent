@@ -101,14 +101,14 @@ describe("agent_version: at most one activated version per definition", () => {
            values (gen_random_uuid(), $1, $2, 2, true, 'p1', 'm1', 1.0)`,
           [W5, orchestratorDefId],
         )),
-    ).rejects.toThrow(/duplicate key|unique constraint|violates/i);
+    ).rejects.toThrow(/agent_version_one_activated_per_definition/);
   });
 
   it("refuses UPDATE ... SET activated = true on a second version of an already-activated definition", async () => {
     const v3 = await insertVersion(W5, orchestratorDefId, 3, false);
     await expect(
       withTenant(pool, W5, (tx) => tx.query(`update agent_version set activated = true where id = $1`, [v3])),
-    ).rejects.toThrow(/duplicate key|unique constraint|violates/i);
+    ).rejects.toThrow(/agent_version_one_activated_per_definition/);
   });
 
   it("an inactive second version can still be inserted -- version history must remain possible", async () => {
@@ -159,7 +159,7 @@ describe("regression: exactly four activated rows, no definition holds more than
            values (gen_random_uuid(), $1, $2, 2, true, 'p1', 'm1', 1.0)`,
           [W6, contentDefId],
         )),
-    ).rejects.toThrow(/duplicate key|unique constraint|violates/i);
+    ).rejects.toThrow(/agent_version_one_activated_per_definition/);
 
     // Attack 2: update-flip, against `research`.
     const researchDefId = definitionByRole.get("research")!;
@@ -167,7 +167,7 @@ describe("regression: exactly four activated rows, no definition holds more than
     await expect(
       withTenant(pool, W6, (tx) =>
         tx.query(`update agent_version set activated = true where id = $1`, [researchV2])),
-    ).rejects.toThrow(/duplicate key|unique constraint|violates/i);
+    ).rejects.toThrow(/agent_version_one_activated_per_definition/);
 
     const count = await withTenant(pool, W6, (tx) =>
       tx.query("select count(*)::int as n from agent_version where workspace_id = $1 and activated = true", [W6]));
