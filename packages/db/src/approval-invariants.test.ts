@@ -26,12 +26,37 @@ const adminUrl =
   process.env["DATABASE_MIGRATION_URL"] ?? "postgres://smos:smos_local_dev@127.0.0.1:5433/smos";
 const adminPool = createDbPool(adminUrl);
 
-async function seedUser(label: string): Promise<string> {
+/**
+ * A real user row with NO membership anywhere. This is the actor the final
+ * whole-branch review's CRITICAL 2 kill chain used: a genuine row in
+ * user_account, so approval_decision's foreign key to that table is
+ * satisfied, belonging to no workspace at all.
+ */
+async function seedOutsider(label: string): Promise<string> {
   const r = await adminPool.query(
     `insert into user_account (id,email,name) values (gen_random_uuid(),$1,$2) returning id`,
     [`${label}-${Date.now()}-${Math.random()}@test.local`, label],
   );
   return r.rows[0].id as string;
+}
+
+/**
+ * A real user who is a MEMBER of WS. Every existing test in this file that
+ * needs a valid actor uses this: after the final whole-branch review's
+ * CRITICAL 2 fix, `actor_user_id` alone is no longer enough to record a
+ * decision -- the actor must also hold a workspace_member row in the
+ * workspace being approved for -- so a bare user_account row would make
+ * those tests fail (or, worse, pass against the wrong constraint) for a
+ * reason that has nothing to do with what each of them is actually about.
+ */
+async function seedUser(label: string): Promise<string> {
+  const userId = await seedOutsider(label);
+  await adminPool.query(
+    `insert into workspace_member (id, workspace_id, user_id, role) values (gen_random_uuid(), $1, $2, 'owner')
+     on conflict do nothing`,
+    [WS, userId],
+  );
+  return userId;
 }
 
 let requestId: string;
@@ -92,6 +117,27 @@ async function freshRequestId(): Promise<string> {
 }
 
 afterAll(async () => {
+  // Survives a FAILING test. The CRITICAL 2 block below deliberately tries
+  // to record decisions by actors with no membership in WS. If that guard
+  // ever regresses, those rows would be committed -- and because
+  // approval_decision is append-only for every role (0007), they could not
+  // be removed afterwards, permanently blocking 0037's composite foreign
+  // key from being validated on a fresh database. They are cleaned up here
+  // instead, scoped to this file's own workspace, with 0007's trigger
+  // briefly disabled through the migration role (0031's own backfill uses
+  // the same technique, and it is the only way to delete from this
+  // deliberately immutable table at all).
+  await adminPool.query("alter table approval_decision disable trigger approval_decision_no_mutation").catch(() => undefined);
+  await adminPool
+    .query(
+      `delete from approval_decision d
+        where d.workspace_id = $1
+          and not exists (select 1 from workspace_member m
+                           where m.workspace_id = d.workspace_id and m.user_id = d.actor_user_id)`,
+      [WS],
+    )
+    .catch(() => undefined);
+  await adminPool.query("alter table approval_decision enable trigger approval_decision_no_mutation").catch(() => undefined);
   await pool.end();
   await adminPool.end();
 });
@@ -172,6 +218,150 @@ describe("approval invariants enforced by the database (E4)", () => {
       `insert into approval_decision (id,workspace_id,approval_request_id,actor_user_id,decision,reason)
        values (gen_random_uuid(),$1,$2,$3,'approve',$4)`, [WS, reqId, userId, "\t\n"],
     ))).rejects.toThrow(/check|violates/i);
+  });
+});
+
+// Final whole-branch review, CRITICAL 2: "nothing binds the approver to the
+// workspace, and the kill chain holds."
+//
+// approval_decision.actor_user_id's foreign key references user_account(id)
+// and NOTHING ELSE. It proves the actor is a real human somewhere in the
+// system; it says nothing whatsoever about that human having any authority
+// in the workspace being approved for. handlePublish (apps/worker/src/
+// handlers/publish.ts) then checks the actor's SHAPE -- isId(actorUserId),
+// decision === 'approve', workspace match, content-version match, channel
+// match, content-hash match -- and never their AUTHORITY. Reproduced end to
+// end by the reviewer from one smos_app SQL connection: pick any
+// app.workspace_id, insert an approval_request, insert an approval_decision
+// naming ANY row in user_account (including a user with no membership in
+// that workspace at all), insert a publication, and handlePublish passed
+// every gate and published "AGENT-GENERATED TEXT NO HUMAN EVER SAW".
+//
+// The binding must be at the database, not in TypeScript: this project's
+// governing failure mode, now five times over, is an invariant that lived
+// only in application code and was defeated by direct SQL as smos_app.
+describe("CRITICAL 2: the recorded approver must be a member of the workspace being approved for", () => {
+  it("refuses a decision by a real user_account row with no membership anywhere", async () => {
+    const outsider = await seedOutsider("critical2-outsider");
+    const reqId = await freshRequestId();
+    await expect(
+      withTenant(pool, WS, (tx) =>
+        tx.query(
+          `insert into approval_decision (id,workspace_id,approval_request_id,actor_user_id,decision,reason)
+           values (gen_random_uuid(),$1,$2,$3,'approve','AGENT-GENERATED TEXT NO HUMAN EVER SAW')`,
+          [WS, reqId, outsider],
+        )),
+    ).rejects.toThrow(/foreign key|violates/i);
+  });
+
+  it("refuses a decision by a user who is a member of a DIFFERENT workspace", async () => {
+    // The sharper case: not "no authority anywhere" but "authority somewhere
+    // else". A membership-shaped check that forgot the workspace_id half
+    // would pass this one.
+    const otherWorkspaceId = newId();
+    const outsider = await seedOutsider("critical2-other-workspace-member");
+    await adminPool.query(`insert into workspace (id, name) values ($1, $2)`, [
+      otherWorkspaceId,
+      `critical2-other-${otherWorkspaceId}`,
+    ]);
+    try {
+      await adminPool.query(
+        `insert into workspace_member (id, workspace_id, user_id, role) values (gen_random_uuid(), $1, $2, 'owner')`,
+        [otherWorkspaceId, outsider],
+      );
+      const reqId = await freshRequestId();
+      await expect(
+        withTenant(pool, WS, (tx) =>
+          tx.query(
+            `insert into approval_decision (id,workspace_id,approval_request_id,actor_user_id,decision,reason)
+             values (gen_random_uuid(),$1,$2,$3,'approve','member of somewhere else')`,
+            [WS, reqId, outsider],
+          )),
+      ).rejects.toThrow(/foreign key|violates/i);
+    } finally {
+      await adminPool
+        .query("delete from workspace_member where workspace_id = $1", [otherWorkspaceId])
+        .catch(() => undefined);
+      await adminPool.query("delete from workspace where id = $1", [otherWorkspaceId]).catch(() => undefined);
+    }
+  });
+
+  it("accepts a decision by an actual member of the workspace -- the guard refuses authority, not approvals", async () => {
+    const member = await seedUser("critical2-real-member");
+    const reqId = await freshRequestId();
+    const r = await withTenant(pool, WS, (tx) =>
+      tx.query(
+        `insert into approval_decision (id,workspace_id,approval_request_id,actor_user_id,decision,reason)
+         values (gen_random_uuid(),$1,$2,$3,'approve','a real member approved this') returning id`,
+        [WS, reqId, member],
+      ));
+    expect(r.rows[0].id).toBeTruthy();
+  });
+
+  // Binding the approver to workspace_member is worth nothing if the role
+  // being defended against can WRITE workspace_member. 0029 granted smos_app
+  // INSERT and UPDATE there, so a compromised agent could have inserted
+  // `(current workspace, any existing user_account row)` inside its own RLS
+  // scope and then approved as that person -- the identical kill chain, one
+  // statement longer. Membership is an administrative act, exactly like
+  // provisioning the user_account row itself (0030).
+  it("smos_app cannot grant membership by ANY grant path (privilege, not grantee)", async () => {
+    const r = await adminPool.query(
+      `select has_table_privilege('smos_app', 'workspace_member', 'INSERT') as ins,
+              has_table_privilege('smos_app', 'workspace_member', 'UPDATE') as upd,
+              has_table_privilege('smos_app', 'workspace_member', 'DELETE') as del,
+              has_table_privilege('smos_app', 'workspace_member', 'SELECT') as sel`,
+    );
+    expect(r.rows[0].ins).toBe(false);
+    expect(r.rows[0].upd).toBe(false);
+    expect(r.rows[0].del).toBe(false);
+    expect(r.rows[0].sel).toBe(true);
+  });
+
+  it("smos_app is refused when it actually attempts to enrol a user in its own workspace", async () => {
+    const outsider = await seedOutsider("critical2-self-enrol");
+    const memberId = newId();
+    try {
+      await expect(
+        withTenant(pool, WS, (tx) =>
+          tx.query(
+            `insert into workspace_member (id, workspace_id, user_id, role) values ($1, $2, $3, 'owner')`,
+            [memberId, WS, outsider],
+          )),
+      ).rejects.toThrow(/permission denied/i);
+    } finally {
+      await adminPool.query("delete from workspace_member where id = $1", [memberId]).catch(() => undefined);
+    }
+  });
+
+  it("the kill chain stops at the decision: with no decision recorded, no publication can be built", async () => {
+    // publication.approval_decision_id is NOT NULL and foreign-keyed
+    // (0010_publication.sql), so a chain whose decision was refused has
+    // nothing to point a publication at -- handlePublish is never reached
+    // because the row it would load cannot exist. Proved rather than assumed:
+    // a publication naming a decision id that was never recorded is refused
+    // by the database too.
+    const outsider = await seedOutsider("critical2-chain");
+    const reqId = await freshRequestId();
+    const forgedDecisionId = newId();
+    await expect(
+      withTenant(pool, WS, (tx) =>
+        tx.query(
+          `insert into approval_decision (id,workspace_id,approval_request_id,actor_user_id,decision,reason)
+           values ($1,$2,$3,$4,'approve','forged')`,
+          [forgedDecisionId, WS, reqId, outsider],
+        )),
+    ).rejects.toThrow(/foreign key|violates/i);
+
+    await expect(
+      withTenant(pool, WS, (tx) =>
+        tx.query(
+          `insert into publication (id, workspace_id, campaign_id, content_version_id, approval_decision_id,
+                                    publication_content, content_hash, idempotency_key, target_channel, state)
+           values (gen_random_uuid(), $1, $2, $3, $4, $5, encode(digest($5,'sha256'),'hex'), $6, 'meta_page', 'prepared')`,
+          [WS, campaignId, versionId, forgedDecisionId, "AGENT-GENERATED TEXT NO HUMAN EVER SAW", newId()],
+        )),
+    ).rejects.toThrow(/foreign key|violates/i);
   });
 });
 

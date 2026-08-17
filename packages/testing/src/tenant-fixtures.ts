@@ -113,6 +113,19 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
      values ($1, $2, $3, $4, 'meta_page')`,
     [approvalRequestId, workspaceId, campaignId, contentVersionId],
   );
+  // 0037_approval_actor_must_be_a_member.sql: this MUST come before the
+  // approval_decision insert below, not after it as it originally did --
+  // approval_decision (workspace_id, actor_user_id) is now a composite
+  // foreign key onto workspace_member (workspace_id, user_id), so the
+  // membership has to exist before a decision can name that person as the
+  // approver. 0029_auth_schema.sql's original reason for the row is
+  // unchanged: it binds the fixture's own user_account row to this
+  // workspace, the same "first membership wins" shape resolve_user_workspace
+  // expects.
+  await client.query(
+    `insert into workspace_member (id, workspace_id, user_id, role) values ($1, $2, $3, 'owner')`,
+    [workspaceMemberId, workspaceId, userId],
+  );
   await client.query(
     `insert into approval_decision (id, workspace_id, approval_request_id, actor_user_id, decision, reason)
      values ($1, $2, $3, $4, 'approve', 'e12 seed decision')`,
@@ -200,13 +213,6 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
     `insert into metric (id, workspace_id, campaign_id, name, value, freshness_at, attribution_model, attribution_window, confidence)
      values (gen_random_uuid(), $1, $2, 'e12_seed_metric', 1, now(), 'last_touch', '7d', 'low')`,
     [workspaceId, campaignId],
-  );
-  // 0029_auth_schema.sql: binds the fixture's own user_account row to this
-  // workspace, the same "first membership wins" shape resolve_user_workspace
-  // expects.
-  await client.query(
-    `insert into workspace_member (id, workspace_id, user_id, role) values ($1, $2, $3, 'owner')`,
-    [workspaceMemberId, workspaceId, userId],
   );
   // Credential vault (0036_vault_secret.sql): placeholder ciphertext/wrap
   // bytes, never real crypto output -- this row exists only so

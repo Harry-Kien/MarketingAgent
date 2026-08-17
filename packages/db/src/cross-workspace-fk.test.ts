@@ -80,12 +80,26 @@ async function seedChain(ws: string): Promise<Chain> {
   });
 }
 
-async function seedUser(label: string): Promise<string> {
+/**
+ * A real user, enrolled in `workspaceId`. The membership half is required by
+ * 0037_approval_actor_must_be_a_member.sql: approval_decision
+ * (workspace_id, actor_user_id) is now a composite foreign key onto
+ * workspace_member (workspace_id, user_id), so a bare user_account row is no
+ * longer a usable approver. Seeded through the migration role, like every
+ * other administrative act in this suite -- smos_app has no INSERT on
+ * workspace_member any more, deliberately (0037's LOCK 2).
+ */
+async function seedUser(label: string, workspaceId: string): Promise<string> {
   const r = await adminPool.query(
     `insert into user_account (id,email,name) values (gen_random_uuid(),$1,$2) returning id`,
     [`${label}-${Date.now()}-${Math.random()}@test.local`, label],
   );
-  return r.rows[0].id as string;
+  const userId = r.rows[0].id as string;
+  await adminPool.query(
+    `insert into workspace_member (id, workspace_id, user_id, role) values (gen_random_uuid(), $1, $2, 'owner')`,
+    [workspaceId, userId],
+  );
+  return userId;
 }
 
 beforeAll(async () => {
@@ -223,18 +237,27 @@ describe("approval_request.content_version_id -> content_version", () => {
 
 describe("approval_decision.approval_request_id -> approval_request (the reported HIGH bug)", () => {
   it("refuses a decision in workspace B pointing at workspace A's approval_request", async () => {
-    const userId = await seedUser("hijack-decision");
+    const userId = await seedUser("hijack-decision", B);
     await expect(
       withTenant(pool, B, (tx) =>
         tx.query(
           `insert into approval_decision (id, workspace_id, approval_request_id, actor_user_id, decision, reason) values (gen_random_uuid(), $1, $2, $3, 'approve', 'hijacked')`,
           [B, chains[A]!.approvalRequestId, userId],
         )),
-    ).rejects.toThrow(/foreign key|violates/i);
+      // 0037_approval_actor_must_be_a_member.sql (IMPORTANT 6) makes
+      // approval_decision_snapshot_request refuse a request from another
+      // workspace ITSELF, before the composite foreign key that used to be
+      // the only thing catching this ever gets a chance to. The refusal is
+      // therefore now the trigger's named message rather than a foreign key
+      // violation -- an earlier and more specific rejection of the exact
+      // same attempt, not a weaker one. Both wordings are accepted so this
+      // test keeps proving the attempt is refused whichever of the two
+      // independent mechanisms gets there first.
+    ).rejects.toThrow(/foreign key|violates|does not exist in workspace/i);
   });
 
   it("still allows a decision in workspace B pointing at workspace B's own approval_request", async () => {
-    const userId = await seedUser("legit-decision");
+    const userId = await seedUser("legit-decision", B);
     // Fresh request: chains[B].approvalRequestId may already carry a
     // decision from an earlier test run against this persistent database.
     const freshRequestId = await withTenant(pool, B, (tx) =>

@@ -129,6 +129,18 @@ export async function seedWorkspace(adminPool: pg.Pool): Promise<GoldenWorkspace
     `golden-sequence-${workspaceId}@test.local`,
     "Người sáng lập",
   ]);
+  // 0037_approval_actor_must_be_a_member.sql: the founder must hold an
+  // actual workspace_member row in this workspace before any
+  // approval_decision can name them as the approver -- approval_decision
+  // (workspace_id, actor_user_id) is now a composite foreign key onto
+  // workspace_member (workspace_id, user_id). Seeded through the migration
+  // role, exactly like the user_account row above; smos_app has no INSERT
+  // on workspace_member (0037's LOCK 2), so the running app could not do
+  // this even if it tried.
+  await adminPool.query(
+    `insert into workspace_member (id, workspace_id, user_id, role) values ($1, $2, $3, 'owner')`,
+    [newId(), workspaceId, userId],
+  );
   await adminPool.query(`insert into goal (id, workspace_id, statement) values ($1, $2, $3)`, [
     goalId,
     workspaceId,

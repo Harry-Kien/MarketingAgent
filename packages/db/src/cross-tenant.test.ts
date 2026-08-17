@@ -189,6 +189,24 @@ const EXPECTED_TENANT_TABLES = [
  */
 const NO_APP_ACCESS_TABLES = ["vault_secret"];
 
+/**
+ * Readable by smos_app, but NOT writable by it -- a third shape, distinct
+ * from both "RLS-filtered like everything else" and NO_APP_ACCESS_TABLES's
+ * "no grant at all". 0037_approval_actor_must_be_a_member.sql revoked
+ * INSERT and UPDATE on workspace_member from smos_app: enrolling a human in
+ * a workspace is the act that CREATES approval authority, so the role every
+ * agent rides on must not be able to perform it -- otherwise binding
+ * approval_decision to workspace_member would be theatre, since a
+ * compromised agent could simply enrol its chosen user_account row first
+ * and then approve as them. SELECT stays (reading your own workspace's
+ * membership is ordinary application work, still RLS-scoped by 0029's
+ * policy), so the "B's rows are invisible from A's scope" body above still
+ * applies unchanged; only the INSERT probe's expected refusal differs --
+ * permission denied, before RLS's WITH CHECK is ever consulted. Listed
+ * explicitly rather than skipped, per this file's own rule.
+ */
+const NO_APP_WRITE_TABLES = ["workspace_member"];
+
 const EXPECTED_FK_PAIRS = [
   "agent_run->agent_version",
   "agent_run->campaign",
@@ -202,6 +220,14 @@ const EXPECTED_FK_PAIRS = [
   // rule, in the same commit as the migration that adds the second.
   "approval_decision->approval_request",
   "approval_decision->approval_request",
+  // 0037: (workspace_id, actor_user_id) -> workspace_member
+  // (workspace_id, user_id). Nothing previously bound a recorded approver
+  // to the workspace being approved for -- actor_user_id referenced
+  // user_account(id) only, so ANY user row in the system could be named as
+  // the approver of ANY workspace's content, which is exactly the kill
+  // chain the final whole-branch review proved end to end. Listed here, per
+  // this list's own rule, in the same commit as the migration that adds it.
+  "approval_decision->workspace_member",
   "approval_request->campaign",
   "approval_request->content_version",
   "campaign->goal",
@@ -269,8 +295,14 @@ afterAll(async () => {
     // Credential vault (0036_vault_secret.sql): seedTwoWorkspaces now seeds
     // one placeholder vault_secret row per workspace too.
     await adminPool.query("delete from vault_secret where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
-    // Auth schema (0029_auth_schema.sql): workspace_member has no children,
-    // so it is always safely deletable here, unlike the plain-FK chain above.
+    // Auth schema (0029_auth_schema.sql), amended by 0037_approval_actor_
+    // must_be_a_member.sql: workspace_member DOES have a child now -- the
+    // approval_decision row seeded above points at it through the composite
+    // (workspace_id, actor_user_id) foreign key that binds an approver to
+    // their membership. Since approval_decision is append-only for every
+    // role, this delete now joins the same pinned-in-place set as the rest
+    // of the chain above and is expected to be refused; the .catch keeps it
+    // best-effort exactly as before.
     await adminPool.query("delete from workspace_member where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
   }
   await pool.end();
@@ -514,6 +546,12 @@ function fixtureIdForColumn(ws: TenantFixture, column: string): string {
     publication_id: "publicationId",
     // 0033_integration_sandbox_must_be_earned.sql:
     verified_publication_id: "publicationId",
+    // 0037_approval_actor_must_be_a_member.sql: approval_decision
+    // (workspace_id, actor_user_id) -> workspace_member (workspace_id,
+    // user_id) -- the composite FK that binds a recorded approver to
+    // membership in the workspace they approved for (final whole-branch
+    // review, CRITICAL 2).
+    actor_user_id: "userId",
   };
   const key = map[column];
   if (!key) {
@@ -608,6 +646,16 @@ describe("E8/E14: every discovered workspace-owned table is isolated", () => {
       );
       return;
     }
+    if (NO_APP_WRITE_TABLES.includes(table)) {
+      // See NO_APP_WRITE_TABLES: the write is refused by privilege, which is
+      // a STRONGER refusal than RLS's WITH CHECK, not a weaker one -- it
+      // holds for a row tagged with workspace A just as much as for one
+      // tagged with workspace B.
+      await expect(withTenant(pool, a.workspaceId, (tx) => tx.query(text, values))).rejects.toThrow(
+        /permission denied/i,
+      );
+      return;
+    }
     await expect(withTenant(pool, a.workspaceId, (tx) => tx.query(text, values))).rejects.toThrow(
       /row-level security|violates/i,
     );
@@ -646,7 +694,16 @@ describe("E14: cross-table composite foreign keys refuse a cross-workspace paren
     row.cells[colIndex] = { value: fixtureIdForColumn(a, fkColumn) };
     const { text, values } = toInsertSql(childTable, row);
 
-    await expect(withTenant(pool, b.workspaceId, (tx) => tx.query(text, values))).rejects.toThrow(/foreign key|violates/i);
+    // "does not exist in workspace" is 0037's approval_decision_snapshot_
+    // request trigger (final whole-branch review, IMPORTANT 6) refusing a
+    // cross-workspace request BEFORE the composite foreign key is reached.
+    // An earlier and more specific rejection of the identical attempt, not
+    // a weaker one; both wordings are accepted so this generic probe keeps
+    // proving the hijack is refused whichever of the two independent
+    // mechanisms fires first.
+    await expect(withTenant(pool, b.workspaceId, (tx) => tx.query(text, values))).rejects.toThrow(
+      /foreign key|violates|does not exist in workspace/i,
+    );
   });
 });
 

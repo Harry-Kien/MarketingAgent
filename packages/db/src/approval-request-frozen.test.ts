@@ -70,6 +70,16 @@ beforeAll(async () => {
     `approval-frozen-${workspaceId}@test.local`,
     "Người sáng lập",
   ]);
+  // Final whole-branch review, CRITICAL 2: an approval_decision's actor must
+  // now hold a workspace_member row in the workspace being approved for
+  // (0037_approval_actor_must_be_member.sql), so this fixture's founder is
+  // seeded as an actual member -- not merely as a user_account row that
+  // happens to exist somewhere in the system, which is exactly what the
+  // kill chain abused.
+  await adminPool.query(
+    `insert into workspace_member (id, workspace_id, user_id, role) values ($1, $2, $3, 'owner')`,
+    [newId(), workspaceId, userId],
+  );
   const goalId = newId();
   await adminPool.query(`insert into goal (id, workspace_id, statement) values ($1, $2, 'approval frozen probe')`, [
     goalId,
@@ -197,5 +207,136 @@ describe("approval_decision records WHAT was approved, independently of the requ
     );
     expect(r.rows[0].content_version_id).toBe(versionV1);
     expect(r.rows[0].target_channel).toBe("meta_page");
+  });
+});
+
+// Final whole-branch review, IMPORTANT 6: "one FK away from a hole."
+//
+// approval_decision_snapshot_request (0031) is SECURITY DEFINER, owned by a
+// superuser, therefore RLS-blind, and it selected
+// `FROM approval_request r WHERE r.id = NEW.approval_request_id` with NO
+// workspace filter at all. It copies whatever it finds into the decision's
+// own immutable content_version_id / target_channel columns. It happens to
+// be safe today only because a DIFFERENT migration
+// (0031's approval_decision_matches_request_fkey, plus 0008's
+// (approval_request_id, workspace_id) composite) rejects the result
+// afterwards -- a trigger whose safety lives in another statement in another
+// place is one DROP CONSTRAINT away from being a cross-workspace read
+// performed with superuser privileges.
+//
+// The proof has to remove exactly those two crutches and show the trigger
+// still refuses on its own. Both are restored in a finally, and
+// `fileParallelism: false` (vitest.config.ts) means no other suite is
+// touching this table while they are gone.
+describe("IMPORTANT 6: the snapshot trigger is safe on its own, not because of a distant migration's FK", () => {
+  const MATCHES_FK =
+    `alter table approval_decision add constraint approval_decision_matches_request_fkey
+     foreign key (approval_request_id, workspace_id, content_version_id, target_channel)
+     references approval_request (id, workspace_id, content_version_id, target_channel)`;
+  const WS_FK =
+    `alter table approval_decision add constraint approval_decision_approval_request_id_workspace_fkey
+     foreign key (approval_request_id, workspace_id) references approval_request (id, workspace_id)`;
+
+  it("refuses to snapshot another workspace's approval_request, with BOTH composite foreign keys dropped", async () => {
+    const otherWorkspaceId = newId();
+    const otherUserId = newId();
+    const otherGoalId = newId();
+    const otherCampaignId = newId();
+    const otherItemId = newId();
+    const otherVersionId = newId();
+    const otherRequestId = newId();
+
+    await adminPool.query(`insert into workspace (id, name) values ($1, $2)`, [
+      otherWorkspaceId,
+      `approval-frozen-other-${otherWorkspaceId}`,
+    ]);
+    await adminPool.query(`insert into user_account (id, email, name) values ($1, $2, $3)`, [
+      otherUserId,
+      `approval-frozen-other-${otherWorkspaceId}@test.local`,
+      "another workspace's founder",
+    ]);
+    await adminPool.query(`insert into goal (id, workspace_id, statement) values ($1, $2, 'other probe')`, [
+      otherGoalId,
+      otherWorkspaceId,
+    ]);
+    await adminPool.query(
+      `insert into campaign (id, workspace_id, goal_id, name, state) values ($1, $2, $3, $4, 'WAITING_APPROVAL')`,
+      [otherCampaignId, otherWorkspaceId, otherGoalId, `approval-frozen-other-campaign-${otherCampaignId}`],
+    );
+    await adminPool.query(
+      `insert into content_item (id, workspace_id, campaign_id, kind, title) values ($1,$2,$3,'social_post',$4)`,
+      [otherItemId, otherWorkspaceId, otherCampaignId, `approval-frozen-other-item-${otherItemId}`],
+    );
+    await adminPool.query(
+      `insert into content_version (id, workspace_id, content_item_id, version_number, body, publication_content)
+       values ($1,$2,$3,1,'other body','other publication')`,
+      [otherVersionId, otherWorkspaceId, otherItemId],
+    );
+    await adminPool.query(
+      `insert into approval_request (id, workspace_id, campaign_id, content_version_id, target_channel)
+       values ($1,$2,$3,$4,'tiktok_account')`,
+      [otherRequestId, otherWorkspaceId, otherCampaignId, otherVersionId],
+    );
+
+    await adminPool.query(`alter table approval_decision drop constraint approval_decision_matches_request_fkey`);
+    try {
+      await adminPool.query(
+        `alter table approval_decision drop constraint approval_decision_approval_request_id_workspace_fkey`,
+      );
+      try {
+        // A decision recorded in THIS workspace, pointing at ANOTHER
+        // workspace's approval_request, supplying no snapshot of its own so
+        // the trigger is the only thing that can fill those NOT NULL
+        // columns. Without a workspace filter the trigger reads the other
+        // workspace's content_version_id and target_channel with superuser
+        // privileges and writes them here.
+        await expect(
+          withTenant(pool, workspaceId, (tx) =>
+            tx.query(
+              `insert into approval_decision (id, workspace_id, approval_request_id, actor_user_id, decision, reason)
+               values ($1, $2, $3, $4, 'approve', 'cross-workspace snapshot')`,
+              [newId(), workspaceId, otherRequestId, userId],
+            )),
+        ).rejects.toThrow(/workspace/i);
+
+        // ...and specifically not by accidentally copying the other
+        // workspace's channel in.
+        const leaked = await adminPool.query(
+          `select count(*)::int as n from approval_decision where approval_request_id = $1`,
+          [otherRequestId],
+        );
+        expect(leaked.rows[0].n).toBe(0);
+      } finally {
+        // Survives a FAILING test. If the trigger ever lets the
+        // cross-workspace snapshot through again, the row it wrote would
+        // make both ADD CONSTRAINT statements below fail validation and
+        // leave this database permanently missing two foreign keys -- so the
+        // offending row is removed first, through the migration role with
+        // 0007's append-only trigger briefly disabled (the same technique
+        // 0031's own backfill uses, and the only way to delete from this
+        // deliberately immutable table at all).
+        await adminPool
+          .query("alter table approval_decision disable trigger approval_decision_no_mutation")
+          .catch(() => undefined);
+        await adminPool
+          .query("delete from approval_decision where approval_request_id = $1", [otherRequestId])
+          .catch(() => undefined);
+        await adminPool
+          .query("alter table approval_decision enable trigger approval_decision_no_mutation")
+          .catch(() => undefined);
+        await adminPool.query(WS_FK);
+      }
+    } finally {
+      await adminPool.query(MATCHES_FK);
+    }
+  });
+
+  it("both composite foreign keys are back in place after the probe above", async () => {
+    const r = await adminPool.query(
+      `select conname from pg_constraint where conrelid = 'approval_decision'::regclass and contype = 'f' order by conname`,
+    );
+    const names = r.rows.map((row: { conname: string }) => row.conname);
+    expect(names).toContain("approval_decision_matches_request_fkey");
+    expect(names).toContain("approval_decision_approval_request_id_workspace_fkey");
   });
 });

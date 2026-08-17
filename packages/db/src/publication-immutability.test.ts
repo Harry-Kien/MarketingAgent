@@ -40,12 +40,25 @@ function sha256Hex(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
-async function seedUser(label: string): Promise<string> {
+/**
+ * A real user, enrolled in `workspaceId`. The membership half is required by
+ * 0037_approval_actor_must_be_a_member.sql: approval_decision
+ * (workspace_id, actor_user_id) is a composite foreign key onto
+ * workspace_member (workspace_id, user_id), so a bare user_account row can
+ * no longer be named as an approver. Seeded through the migration role --
+ * smos_app has no INSERT on workspace_member, deliberately (0037's LOCK 2).
+ */
+async function seedUser(label: string, workspaceId: string): Promise<string> {
   const r = await adminPool.query(
     `insert into user_account (id,email,name) values (gen_random_uuid(),$1,$2) returning id`,
     [`${label}-${Date.now()}-${Math.random()}@test.local`, label],
   );
-  return r.rows[0].id as string;
+  const userId = r.rows[0].id as string;
+  await adminPool.query(
+    `insert into workspace_member (id, workspace_id, user_id, role) values (gen_random_uuid(), $1, $2, 'owner')`,
+    [workspaceId, userId],
+  );
+  return userId;
 }
 
 interface Chain {
@@ -114,7 +127,7 @@ beforeAll(async () => {
   await db.execute(
     sql`insert into workspace (id, name) values (${WS}::uuid, 'pub-immutability') on conflict do nothing`,
   );
-  const userId = await seedUser("pub-immutability");
+  const userId = await seedUser("pub-immutability", WS);
   chain = await seedChain(WS, userId);
 });
 
