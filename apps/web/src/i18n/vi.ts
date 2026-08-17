@@ -18,6 +18,7 @@ export const messages = {
     citationUrl: "Đường dẫn nguồn",
     citationAccessedAt: "Truy cập lúc",
     policyFlags: "Cảnh báo chính sách",
+    blockedByPolicy: "Không thể phê duyệt vì vi phạm chính sách",
     noPending: "Không có mục nào đang chờ duyệt",
     alreadyDecided: "Yêu cầu này đã được quyết định",
     decidedAt: "Quyết định lúc",
@@ -36,6 +37,7 @@ export const messages = {
     confidenceHigh: "Cao", confidenceMedium: "Trung bình", confidenceLow: "Thấp",
     freshnessUnknown: "Không rõ thời điểm cập nhật nên chưa thể hiển thị số liệu",
     noDataSource: "Chưa có nguồn dữ liệu phân tích nào được kết nối",
+    noMetricsYet: "Chưa có số liệu nào được ghi nhận cho không gian làm việc này",
   },
   state: {
     loading: "Đang tải", empty: "Chưa có dữ liệu", error: "Không tải được dữ liệu",

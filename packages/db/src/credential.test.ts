@@ -60,7 +60,17 @@ describe("E16: smos_app has no DELETE grant on any of the five new tables", () =
     );
     const privileges = r.rows.map((row: { privilege_type: string }) => row.privilege_type);
     expect(privileges, `${table} grants`).not.toContain("DELETE");
-    expect(privileges.toSorted(), `${table} grants`).toEqual(["INSERT", "SELECT", "UPDATE"]);
+    // Late-review CRITICAL 2 / IMPORTANT 4 narrowed two of these five from
+    // {SELECT, INSERT, UPDATE} to {SELECT, INSERT}: webhook_delivery is an
+    // append-only receipt of what actually arrived (0032) and metric is an
+    // immutable observation at a fixed instant (0034), so neither has any
+    // legitimate UPDATE at all. This pin is tightened rather than relaxed --
+    // re-granting UPDATE on either fails here.
+    const expected =
+      table === "webhook_delivery" || table === "metric"
+        ? ["INSERT", "SELECT"]
+        : ["INSERT", "SELECT", "UPDATE"];
+    expect(privileges.toSorted(), `${table} grants`).toEqual(expected);
   });
 });
 
@@ -205,6 +215,31 @@ describe("E16: webhook_delivery records a bad signature rather than dropping it"
       [a.workspaceId, key],
     ))).rejects.toThrow(/unique|duplicate/i);
   });
+
+  // Late-review CRITICAL 2: the uniqueness above is now a PARTIAL index
+  // restricted to verified rows (0032), so that a rejected delivery cannot
+  // burn a delivery id a genuine one will later claim. The property this
+  // suite pins -- two VERIFIED deliveries cannot share the key -- is
+  // unchanged and asserted above; the complementary half is pinned here so
+  // dropping either index is loud.
+  it("keeps rejected and verified receipts in separate key spaces", async () => {
+    const key = `e16-partial-${Date.now()}-${Math.random()}`;
+    await withTenant(pool, a.workspaceId, (tx) => tx.query(
+      `insert into webhook_delivery (id, workspace_id, provider, external_id, signature_ok, payload)
+       values (gen_random_uuid(), $1, 'meta', $2, false, '{}'::jsonb)`,
+      [a.workspaceId, key],
+    ));
+    await withTenant(pool, a.workspaceId, (tx) => tx.query(
+      `insert into webhook_delivery (id, workspace_id, provider, external_id, signature_ok, payload)
+       values (gen_random_uuid(), $1, 'meta', $2, true, '{}'::jsonb)`,
+      [a.workspaceId, key],
+    ));
+    const r = await adminPool.query(
+      `select count(*)::int as n from webhook_delivery where workspace_id = $1 and external_id = $2`,
+      [a.workspaceId, key],
+    );
+    expect(r.rows[0].n).toBe(2);
+  });
 });
 
 describe("E16: integration.status is constrained to the known lifecycle values", () => {
@@ -215,12 +250,27 @@ describe("E16: integration.status is constrained to the known lifecycle values",
     ))).rejects.toThrow(/check|violates/i);
   });
 
-  it("accepts each real lifecycle status", async () => {
-    for (const status of ["not_implemented", "disconnected", "connected", "sandbox"]) {
+  // Late-review IMPORTANT 3: 'sandbox' is no longer a status that can simply
+  // be asserted -- it requires naming a publication that actually succeeded
+  // (0033_integration_sandbox_must_be_earned.sql). This test used to insert
+  // all four values bare, which is precisely the reviewer's attack written
+  // as an expectation. The three claims a row may still make on its own are
+  // still accepted here; the fourth now has its own coverage in
+  // packages/db/src/integration-verification.test.ts, including the case
+  // where it must be refused.
+  it("accepts each lifecycle status a row may claim without external evidence", async () => {
+    for (const status of ["not_implemented", "disconnected", "connected"]) {
       await withTenant(pool, a.workspaceId, (tx) => tx.query(
         `insert into integration (id, workspace_id, provider, status) values (gen_random_uuid(), $1, $2, $3)`,
         [a.workspaceId, `probe-${status}-${Date.now()}-${Math.random()}`, status],
       ));
     }
+  });
+
+  it("refuses 'sandbox' asserted with no verifying publication", async () => {
+    await expect(withTenant(pool, a.workspaceId, (tx) => tx.query(
+      `insert into integration (id, workspace_id, provider, status) values (gen_random_uuid(), $1, $2, 'sandbox')`,
+      [a.workspaceId, `probe-sandbox-${Date.now()}-${Math.random()}`],
+    ))).rejects.toThrow(/check|violates/i);
   });
 });

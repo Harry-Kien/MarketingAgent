@@ -37,6 +37,50 @@ describe("performApproval", () => {
     expect(d.writeAudit).toHaveBeenCalledWith(expect.objectContaining({ eventType: "approval.granted" }));
   });
 
+  // Late-review MINOR (d): the Approval Center renders `policyFlags` under
+  // the heading "Cảnh báo chính sách", but nothing anywhere refused on
+  // `severity: "block"` -- the flags gated nothing at all, so a blocking
+  // policy violation was decoration on a screen.
+  it("refuses to APPROVE a request carrying a blocking policy flag", async () => {
+    const d = deps({
+      loadRequest: async () => ({
+        ...(await deps().loadRequest(base.approvalRequestId)),
+        policyFlags: [
+          { ruleId: "claim.unverified", ruleVersion: 1, severity: "block" as const, message: "Tuyên bố chưa có bằng chứng" },
+        ],
+      }),
+    });
+    await expect(performApproval(base, d)).rejects.toThrow(/chính sách|policy|block/i);
+    expect(d.saveDecision).not.toHaveBeenCalled();
+  });
+
+  it("still allows REJECT on a blocked request -- the block stops publishing, not answering", async () => {
+    const d = deps({
+      loadRequest: async () => ({
+        ...(await deps().loadRequest(base.approvalRequestId)),
+        policyFlags: [
+          { ruleId: "claim.unverified", ruleVersion: 1, severity: "block" as const, message: "Tuyên bố chưa có bằng chứng" },
+        ],
+      }),
+    });
+    await performApproval({ ...base, decision: "reject", reason: "vi phạm chính sách" }, d);
+    expect(d.saveDecision).toHaveBeenCalledOnce();
+  });
+
+  it("does not refuse on info or warn flags", async () => {
+    const d = deps({
+      loadRequest: async () => ({
+        ...(await deps().loadRequest(base.approvalRequestId)),
+        policyFlags: [
+          { ruleId: "tone.casual", ruleVersion: 1, severity: "warn" as const, message: "Giọng văn hơi suồng sã" },
+          { ruleId: "length", ruleVersion: 1, severity: "info" as const, message: "Bài hơi dài" },
+        ],
+      }),
+    });
+    await performApproval(base, d);
+    expect(d.saveDecision).toHaveBeenCalledOnce();
+  });
+
   it("refuses when the request has no evidence", async () => {
     const d = deps({ loadRequest: async () => ({ ...(await deps().loadRequest(base.approvalRequestId)), evidenceCitationIds: [] }) });
     await expect(performApproval(base, d)).rejects.toThrow(/evidence/i);

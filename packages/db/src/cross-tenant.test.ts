@@ -178,6 +178,14 @@ const EXPECTED_FK_PAIRS = [
   "agent_run->agent_version",
   "agent_run->campaign",
   "agent_version->agent_definition",
+  // Two distinct composite FKs now point from approval_decision at
+  // approval_request: the original (approval_request_id, workspace_id), and
+  // 0031's four-column (approval_request_id, workspace_id,
+  // content_version_id, target_channel), which is what makes a decision
+  // unable to disagree with -- or be retargeted away from -- the request it
+  // answers (late-review CRITICAL 1). Both are listed, per this list's own
+  // rule, in the same commit as the migration that adds the second.
+  "approval_decision->approval_request",
   "approval_decision->approval_request",
   "approval_request->campaign",
   "approval_request->content_version",
@@ -186,6 +194,11 @@ const EXPECTED_FK_PAIRS = [
   "content_version->content_item",
   "credential_reference->integration",
   "event->publication",
+  // 0033: integration.verified_publication_id -> publication, the evidence
+  // that makes `status = 'sandbox'` earnable rather than assertable (late-
+  // review IMPORTANT 3). Composite, so one workspace cannot cite another's
+  // successful publish as its own verification.
+  "integration->publication",
   "metric->campaign",
   "publication->approval_decision",
   "publication->campaign",
@@ -380,9 +393,19 @@ function buildProbeRow(table: string, ws: TenantFixture, id: string): { columns:
       };
     // P4 task 3 (infra/migrations/0028_integration.sql):
     case "integration":
+      // verified_publication_id is present but NULL, which is what a
+      // non-'sandbox' row must carry (0033's CHECK). Present so the E14
+      // probe below has a column to hijack; NULL so the honest row inserts.
+      // The hijacked variant is refused because a 'connected' row may not
+      // name evidence at all -- a stricter refusal than the FK's, reached
+      // first, and still a refusal of exactly the cross-workspace parent
+      // this suite is probing for.
       return {
-        columns: ["id", "workspace_id", "provider", "status"],
-        cells: [{ value: id }, { value: ws.workspaceId }, { value: `e12-probe-provider-${id}` }, { value: "connected" }],
+        columns: ["id", "workspace_id", "provider", "status", "verified_publication_id"],
+        cells: [
+          { value: id }, { value: ws.workspaceId }, { value: `e12-probe-provider-${id}` },
+          { value: "connected" }, { value: null },
+        ],
       };
     case "credential_reference":
       return {
@@ -457,6 +480,8 @@ function fixtureIdForColumn(ws: TenantFixture, column: string): string {
     // P4 task 3 (infra/migrations/0028_integration.sql):
     integration_id: "integrationId",
     publication_id: "publicationId",
+    // 0033_integration_sandbox_must_be_earned.sql:
+    verified_publication_id: "publicationId",
   };
   const key = map[column];
   if (!key) {

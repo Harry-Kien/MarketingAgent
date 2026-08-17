@@ -52,6 +52,7 @@ function makeDecision(pub: PublicationRecord, over: Partial<LoadedApprovalDecisi
     actorUserId: newId(),
     decision: "approve",
     contentVersionId: pub.contentVersionId,
+    targetChannel: pub.targetChannel,
     ...over,
   };
 }
@@ -240,5 +241,21 @@ describe("handlePublish", () => {
     const job = { publicationId: newId(), workspaceId: newId() };
     await expect(handlePublish(job, deps)).rejects.toThrow(/not found/i);
     expect(deps.adapter.publish).not.toHaveBeenCalled();
+  });
+
+  // Late-review CRITICAL 1, handler half. The database now freezes
+  // approval_request once decided, but this gate must independently refuse a
+  // mismatch, because `deps` is an injected interface -- not necessarily this
+  // database (publish.ts's own standing rule for the content-hash check).
+  it("refuses to spend an approval granted for a different target channel", async () => {
+    const pub = makePublication({ targetChannel: "tiktok_account" });
+    const deps = makeDeps(pub, {
+      // Approved for meta_page; the publication points at tiktok_account.
+      loadApprovalDecision: async () => makeDecision(pub, { targetChannel: "meta_page" }),
+    });
+    const job = { publicationId: pub.id, workspaceId: pub.workspaceId };
+    await expect(handlePublish(job, deps)).rejects.toThrow(/target channel/i);
+    expect(deps.adapter.publish).not.toHaveBeenCalled();
+    expect(deps.markExecuting).not.toHaveBeenCalled();
   });
 });

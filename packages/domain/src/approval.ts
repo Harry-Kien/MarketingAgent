@@ -12,9 +12,20 @@ export interface ApprovalRequest {
 
 export type ApprovalDecisionKind = "approve" | "reject" | "request_changes";
 
+/**
+ * Late-review CRITICAL 1: a decision must record WHAT was approved, not
+ * merely THAT something was. `contentVersionId` and `targetChannel` are
+ * snapshotted here, off the request, at the moment of the decision, and are
+ * never re-read from `approval_request` afterwards -- that row is precisely
+ * what the reviewer's retarget attack rewrote. See
+ * infra/migrations/0031_approval_request_frozen_after_decision.sql, which
+ * freezes the request once decided AND ties this snapshot to it with a
+ * composite foreign key, so the two can never disagree.
+ */
 export interface ApprovalDecision {
   id: Id; workspaceId: Id; approvalRequestId: Id; actorUserId: Id;
   decision: ApprovalDecisionKind; reason: string; decidedAt: Date;
+  contentVersionId: Id; targetChannel: string;
 }
 
 /**
@@ -55,5 +66,6 @@ export function decideApproval(
     id: newId(), workspaceId: req.workspaceId, approvalRequestId: req.id,
     actorUserId: input.actor.userId, decision: input.decision,
     reason: input.reason.trim(), decidedAt: new Date(),
+    contentVersionId: req.contentVersionId, targetChannel: req.targetChannel,
   };
 }
