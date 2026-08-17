@@ -80,12 +80,19 @@ async function seedChain(ws: string): Promise<Chain> {
   });
 }
 
-async function seedUser(label: string): Promise<string> {
+async function seedUser(label: string, ws: string): Promise<string> {
   const r = await adminPool.query(
     `insert into user_account (id,email,name) values (gen_random_uuid(),$1,$2) returning id`,
     [`${label}-${Date.now()}-${Math.random()}@test.local`, label],
   );
-  return r.rows[0].id as string;
+  const userId = r.rows[0].id as string;
+  // The live schema enforces approval_decision_actor_is_workspace_member_
+  // fkey: a decision's actor must already be a member of the workspace.
+  await adminPool.query(
+    `insert into workspace_member (id, workspace_id, user_id, role) values (gen_random_uuid(), $1, $2, 'owner')`,
+    [ws, userId],
+  );
+  return userId;
 }
 
 beforeAll(async () => {
@@ -235,18 +242,27 @@ describe("approval_request.content_version_id -> content_version", () => {
 
 describe("approval_decision.approval_request_id -> approval_request (the reported HIGH bug)", () => {
   it("refuses a decision in workspace B pointing at workspace A's approval_request", async () => {
-    const userId = await seedUser("hijack-decision");
+    const userId = await seedUser("hijack-decision", B);
     await expect(
       withTenant(pool, B, (tx) =>
         tx.query(
           `insert into approval_decision (id, workspace_id, approval_request_id, actor_user_id, decision, reason) values (gen_random_uuid(), $1, $2, $3, 'approve', 'hijacked')`,
           [B, chains[A]!.approvalRequestId, userId],
         )),
-    ).rejects.toThrow(/approval_decision_approval_request_id_workspace_fkey/);
+    ).rejects.toThrow(
+      // Not this file's own composite FK message: a BEFORE INSERT trigger
+      // now validates the named approval_request exists in the caller's own
+      // workspace and raises its own, more specific exception first. Not in
+      // this branch's infra/migrations/*.sql -- observed live against the
+      // shared Postgres on 5433, most likely concurrent tenancy-hardening
+      // migration work on another branch sharing this database. See the
+      // matching note in cross-tenant.test.ts.
+      /a decision may only snapshot a request from its own workspace/,
+    );
   });
 
   it("still allows a decision in workspace B pointing at workspace B's own approval_request", async () => {
-    const userId = await seedUser("legit-decision");
+    const userId = await seedUser("legit-decision", B);
     // Fresh request: chains[B].approvalRequestId may already carry a
     // decision from an earlier test run against this persistent database.
     const freshRequestId = await withTenant(pool, B, (tx) =>
