@@ -1,0 +1,105 @@
+-- Hardening task 1: the webhook endpoint (apps/web/src/app/api/webhooks/
+-- meta/[workspaceId]/route.ts) is the one unauthenticated entry point in
+-- this system, and late-findings-fix-report.md's own "Concerns" section (2)
+-- named the gap left open by CRITICAL 2's fix: "an attacker who can reach
+-- the webhook with a valid-looking workspace id can add one signature_ok =
+-- false row per DISTINCT forged body. Identical replays collapse (partial
+-- unique index), distinct ones do not." Nothing stopped an attacker from
+-- generating an unbounded number of distinct bodies (trivial -- vary any
+-- field) and therefore an unbounded number of rows in a table with no
+-- DELETE grant.
+--
+-- Design, reasoned through explicitly because there is no Redis or any
+-- other rate-limiter infrastructure in this milestone (STANDING-CONTEXT.md
+-- rule #6: "Out of scope for all of P2: ... Redis/Temporal/Kafka") --
+-- Postgres is what the route has, so the limiter's own storage must be
+-- self-bounding, not merely "small in practice":
+--
+-- 1. FIXED-CARDINALITY HASH BUCKETS, never one row per key. A naive
+--    `UNIQUE (scope, key, window)` table has EXACTLY the shape of the
+--    defect this migration exists to close: an attacker who can choose the
+--    key (a workspace id in the URL, an X-Forwarded-For value) can always
+--    choose a fresh one and grow the table without bound, whether the key
+--    lands in `webhook_delivery` or in the rate limiter's own table. This
+--    table instead has ONE ROW PER (scope, bucket_index) FOREVER --
+--    `bucket_index` is `abs(hashtext(key)) % N`, so the row count is capped
+--    at `4 scopes * N` no matter how many distinct keys, bodies or
+--    workspace ids an attacker ever sends. A shared bucket occasionally
+--    means two unrelated keys share a budget (a hash collision); that is
+--    the deliberate trade-off for a hard ceiling on storage, and is the
+--    same trade-off every fixed-bucket limiter (this is the same idea a
+--    Redis-backed one would use with `INCR`/`EXPIRE` on a hashed key) makes.
+--
+-- 2. The row is RESET IN PLACE, not accumulated. `window_start` is a plain
+--    mutable column (not part of the key), so `count_requests` below
+--    overwrites a stale window rather than inserting a new row for it --
+--    the table's size is therefore constant over time as well as over
+--    attacker behaviour, which a `(scope, bucket_index, window_start)` key
+--    would not have been: that shape grows one row per bucket PER WINDOW
+--    that ever saw traffic, forever.
+--
+-- 3. FOUR DISJOINT SCOPES, chosen to answer the brief's own three questions
+--    together (see apps/web/src/server/webhook-rate-limit.ts for the
+--    limits and the route for the wiring):
+--
+--      valid_workspace   -- keyed on the workspace id, ONLY incremented by
+--        a request that already passed HMAC verification. This is the
+--        genuine-traffic budget, generous, and -- structurally, not just by
+--        policy -- unreachable by anyone who does not hold that workspace's
+--        derived secret: an attacker forging signatures can never write
+--        into this scope for any workspace, so no volume of forged traffic
+--        can ever exhaust a legitimate sender's own budget. This is what
+--        keeps the limiter from reintroducing the delivery-id burn in a new
+--        shape (late-findings-fix-report.md CRITICAL 2): a genuine delivery
+--        is throttled only by ITS OWN workspace's genuine traffic, never by
+--        anyone else's failed attempts.
+--      invalid_ip        -- keyed on the caller's IP (or a shared "unknown"
+--        bucket when no forwarding header is present), for requests whose
+--        signature did not verify. Answers "an attacker who does not know a
+--        valid workspace id still consumes resources": this scope does not
+--        need the workspace id to exist, or even to be well-formed, to
+--        throttle a single source hammering the route.
+--      invalid_workspace -- keyed on the CLAIMED workspace id (well-formed
+--        shape only; a malformed id is already refused elsewhere and never
+--        reaches this scope), for signature-invalid requests. Answers "one
+--        tenant's flood must not be invisible to another's": a distributed
+--        attacker spreading forged requests across many source IPs but one
+--        target workspace is still caught here even though no single IP
+--        bucket trips.
+--      invalid_global    -- one single bucket (N=1) across ALL
+--        signature-invalid traffic regardless of IP or claimed workspace.
+--        Answers the same "invisible flood" question the other direction:
+--        an attacker spreading forgeries across many IPs AND many
+--        (real or fabricated) workspace ids, so that no per-IP or
+--        per-workspace bucket individually trips, is still caught by a
+--        ceiling that does not depend on the key at all.
+--
+--    A request is throttled the instant ANY applicable scope's count
+--    exceeds its configured limit; which scopes apply is decided by
+--    signature validity, never by anything else attacker-controlled.
+--
+-- Not workspace-owned and deliberately not RLS-scoped, added to
+-- GLOBAL_TABLES (scripts/migration-guards.mjs) alongside `workspace`
+-- itself: this table holds no tenant business data, only abuse-prevention
+-- counters that are explicitly cross-tenant by design in three of its four
+-- scopes (an IP or a global ceiling names no single workspace to scope to,
+-- and even `valid_workspace`'s bucket_index is a hash, not the workspace id
+-- itself, so it carries no tenant data to protect). RLS would also be the
+-- wrong tool here: nothing reads or writes this table through a
+-- tenant-scoped `withTenant` session at all, by design -- the whole point
+-- is to decide whether a request may proceed BEFORE any workspace context
+-- is established.
+CREATE TABLE IF NOT EXISTS webhook_rate_limit_bucket (
+  scope         text    NOT NULL CHECK (scope IN ('valid_workspace', 'invalid_ip', 'invalid_workspace', 'invalid_global')),
+  bucket_index  integer NOT NULL CHECK (bucket_index >= 0),
+  window_start  timestamptz NOT NULL,
+  request_count integer NOT NULL DEFAULT 1 CHECK (request_count > 0),
+  PRIMARY KEY (scope, bucket_index)
+);
+
+-- Only INSERT/UPDATE/SELECT: no legitimate caller ever deletes a row (there
+-- is nothing to delete -- the design point above is that rows are reset in
+-- place, never removed), so no DELETE grant is needed or given, matching
+-- 0032_webhook_delivery_nonce_and_audit.sql's own reasoning for why a table
+-- can omit a grant it structurally never needs.
+GRANT SELECT, INSERT, UPDATE ON webhook_rate_limit_bucket TO smos_app;

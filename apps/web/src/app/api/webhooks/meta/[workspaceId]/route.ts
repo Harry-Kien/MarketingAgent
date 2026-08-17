@@ -6,6 +6,7 @@ import { logger } from "@smos/telemetry";
 import { getPool } from "../../../../../server/db.ts";
 import { deriveWorkspaceSecret, verifySignature } from "../../../../../server/webhook-signature.ts";
 import { MAX_EVENTS_PER_DELIVERY } from "../../../../../server/webhook-limits.ts";
+import { checkWebhookRateLimit, extractClientIp } from "../../../../../server/webhook-rate-limit.ts";
 import { BodyTooLargeError, MAX_WEBHOOK_BODY_BYTES, readBoundedBody } from "../../../../../server/read-bounded-body.ts";
 
 // Every request does real I/O (DB); nothing about this route can be
@@ -39,6 +40,24 @@ const PROVIDER = "meta";
  * (0032_webhook_delivery_nonce_and_audit.sql), so a rejected delivery --
  * including the audit receipt this route now writes for one -- can never
  * consume an id a genuine delivery will later need.
+ *
+ * Hardening task 1: late-findings-fix-report.md's own "Concerns" section
+ * named the gap 0032 left open -- "an attacker who can reach the webhook
+ * with a valid-looking workspace id can add one signature_ok = false row
+ * per DISTINCT forged body. Identical replays collapse (partial unique
+ * index), distinct ones do not." The rate-limit gate below
+ * (../../../../../server/webhook-rate-limit.ts) runs immediately after
+ * signature verification and BEFORE any row is ever written for this
+ * request -- a throttled request never reaches `recordRejectedDelivery`,
+ * so distinct forged bodies can no longer buy unbounded rows; the
+ * limiter's own storage is separately bounded by fixed-cardinality hash
+ * buckets (see that module's and 0035's headers). Valid and invalid
+ * traffic are checked against completely disjoint scopes, which is what
+ * keeps this gate itself from becoming a new way to deny a genuine sender
+ * service: forging signatures can only ever exhaust an `invalid_*` bucket,
+ * never the `valid_workspace` bucket a real sender's own traffic depends
+ * on -- see webhook-rate-limit.test.ts and route.test.ts's own rate-limit
+ * tests for the live proof.
  */
 export async function POST(
   request: Request,
@@ -70,7 +89,58 @@ export async function POST(
   const signatureHeader = request.headers.get(SIGNATURE_HEADER) ?? "";
   const rootSecret = getWebhookRootSecret();
   const workspaceSecret = rootSecret === null ? null : deriveWorkspaceSecret(rootSecret, rawWorkspaceId);
-  if (workspaceSecret === null || !verifySignature(rawBody, signatureHeader, workspaceSecret)) {
+  const signatureOk = workspaceSecret !== null && verifySignature(rawBody, signatureHeader, workspaceSecret);
+  const pool = getPool();
+
+  // 2b) Hardening task 1: rate limit BEFORE any webhook_delivery row is
+  // ever written for this request -- genuine or rejected -- so a throttled
+  // request never occupies a nonce slot or a rejected-receipt row.
+  // Signature-valid and signature-invalid requests are checked against
+  // completely disjoint scopes (webhook-rate-limit.ts's own header): a
+  // valid request only ever touches `valid_workspace`, keyed on the
+  // workspace, and can ONLY be reached by someone who already holds that
+  // workspace's derived secret; an invalid one is checked against THREE
+  // scopes at once -- the caller's IP (catches a single-source flood even
+  // with no valid workspace id at all), the claimed workspace id if it is
+  // at least well-formed (catches a distributed flood aimed at one
+  // tenant), and one single global bucket (catches a flood distributed
+  // across many IPs AND many fabricated workspace ids, so no per-key
+  // budget alone ever trips). None of the three invalid scopes can ever
+  // touch `valid_workspace`, so no volume of forged traffic can exhaust a
+  // genuine sender's own budget for their own workspace.
+  let throttledRetryAfterSeconds: number | null = null;
+  if (signatureOk) {
+    const decision = await checkWebhookRateLimit(pool, "valid_workspace", rawWorkspaceId);
+    if (!decision.allowed) throttledRetryAfterSeconds = decision.retryAfterSeconds;
+  } else {
+    const ipDecision = await checkWebhookRateLimit(pool, "invalid_ip", extractClientIp(request));
+    const workspaceDecision = isId(rawWorkspaceId)
+      ? await checkWebhookRateLimit(pool, "invalid_workspace", rawWorkspaceId)
+      : null;
+    const globalDecision = await checkWebhookRateLimit(pool, "invalid_global", "global");
+    const blocked = [ipDecision, workspaceDecision, globalDecision].find(
+      (decision): decision is NonNullable<typeof decision> => decision !== null && !decision.allowed,
+    );
+    if (blocked) throttledRetryAfterSeconds = blocked.retryAfterSeconds;
+  }
+  if (throttledRetryAfterSeconds !== null) {
+    // 429, never a silent drop, and never a delivery/receipt row: Meta (and
+    // any well-behaved sender) retries a 429 with backoff, so a genuine
+    // delivery that arrives while a budget is exhausted is delayed, never
+    // permanently lost -- the same failure mode CRITICAL 2's nonce-burn fix
+    // closed, reproduced here in a new shape, closed the same way: nothing
+    // about a throttled request is ever recorded as having happened.
+    logger.warn("webhook rate limit exceeded; throttling before any delivery row is written", {
+      workspaceId: rawWorkspaceId,
+      signatureOk,
+    });
+    return new Response(null, {
+      status: 429,
+      headers: { "Retry-After": String(throttledRetryAfterSeconds) },
+    });
+  }
+
+  if (!signatureOk) {
     // Never the raw body, never the signature value -- only a fixed-size
     // digest, so a forged giant or secret-shaped payload never leaves a
     // trace bigger than one fingerprint (T7: "never logged in full").
@@ -115,11 +185,11 @@ export async function POST(
   }
 
   // MINOR (a), second half: one process-wide pool (apps/web/src/server/db.ts),
-  // not a fresh `pg.Pool` per request. The old code built and tore down a
-  // pool on every single delivery, so a burst of webhooks opened a burst of
-  // brand-new connections against a database whose connection count is the
-  // scarcest thing it has.
-  const pool = getPool();
+  // not a fresh `pg.Pool` per request -- `pool` was already resolved above,
+  // before the rate-limit gate, for that same reason (the old code built and
+  // tore down a pool on every single delivery, so a burst of webhooks opened
+  // a burst of brand-new connections against a database whose connection
+  // count is the scarcest thing it has).
 
   // 5) MINOR (b): this route's own comment used to promise that an id which
   // merely LOOKS valid but names no real workspace would "fail at the FK,

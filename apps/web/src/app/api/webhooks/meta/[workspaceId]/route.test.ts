@@ -14,6 +14,7 @@ import { newId } from "@smos/domain";
 import { seedTwoWorkspaces, type TenantFixture } from "@smos/testing";
 import { MAX_WEBHOOK_BODY_BYTES } from "../../../../../server/read-bounded-body.ts";
 import { MAX_EVENTS_PER_DELIVERY } from "../../../../../server/webhook-limits.ts";
+import { WEBHOOK_RATE_LIMITS } from "../../../../../server/webhook-rate-limit.ts";
 
 const SECRET = "route-test-sandbox-secret";
 const PREVIOUS_SECRET = process.env["META_WEBHOOK_SECRET"];
@@ -48,18 +49,65 @@ function signFor(workspaceId: string, body: string, rootSecret = SECRET): string
   return sign(body, workspaceSecret);
 }
 
-function req(workspaceId: string, body: string, signatureHeader: string): {
+function req(workspaceId: string, body: string, signatureHeader: string, forwardedFor?: string): {
   request: Request;
   context: { params: Promise<{ workspaceId: string }> };
 } {
+  const headers: Record<string, string> = { "x-hub-signature-256": signatureHeader };
+  if (forwardedFor !== undefined) headers["x-forwarded-for"] = forwardedFor;
   return {
     request: new Request(`http://sandbox.test/api/webhooks/meta/${workspaceId}`, {
       method: "POST",
       body,
-      headers: { "x-hub-signature-256": signatureHeader },
+      headers,
     }),
     context: { params: Promise.resolve({ workspaceId }) },
   };
+}
+
+function forgedEventBody(workspaceId: string, deliveryId: string): string {
+  // A distinct body per call (deliveryId varies) -- this is exactly the
+  // shape of the pre-hardening complaint: an attacker can trivially vary
+  // the body to mint a "new" forged delivery, so the proof below must show
+  // that varying the body does NOT buy the attacker a fresh row once the
+  // rate limit trips.
+  return JSON.stringify({
+    events: [
+      {
+        externalId: `route-test-post-${workspaceId}`,
+        eventType: "post.impression",
+        value: 1,
+        occurredAt: new Date().toISOString(),
+        deliveryId,
+      },
+    ],
+  });
+}
+
+async function rejectedDeliveryCount(workspaceId: string): Promise<number> {
+  const r = await adminPool.query(
+    "select count(*)::int as n from webhook_delivery where workspace_id = $1 and signature_ok = false",
+    [workspaceId],
+  );
+  return r.rows[0].n as number;
+}
+
+/**
+ * webhook_delivery.workspace_id is a real FK to `workspace` (0028), so
+ * recordRejectedDelivery's INSERT fails (silently swallowed, per its own
+ * doc) for a `newId()` that names no row at all -- exactly the ghost-
+ * workspace case elsewhere in this file, which deliberately never reaches
+ * that INSERT (it 404s on the workspace-exists check first, only for a
+ * VALID signature). The rate-limit tests below need a workspace id that IS
+ * real (so the rejected-receipt assertions are meaningful) but is used by
+ * NOTHING else in this file, so its buckets start genuinely empty and an
+ * exact "first N calls succeed, the next one is throttled" assertion is
+ * safe against cross-test interference.
+ */
+async function createBareWorkspace(): Promise<string> {
+  const id = newId();
+  await adminPool.query(`insert into workspace (id, name) values ($1, $2)`, [id, `rate-limit-test-${id}`]);
+  return id;
 }
 
 async function eventCount(workspaceId: string, publicationId: string): Promise<number> {
@@ -364,5 +412,125 @@ describe("POST /api/webhooks/meta/[workspaceId]", () => {
     const res = await POST(request, context);
     expect(res.status).toBe(404);
     expect(await res.text()).toBe("");
+  });
+
+  // --- Hardening task 1: rate limiting -----------------------------------
+  //
+  // late-findings-fix-report.md's own "Concerns" section: "an attacker who
+  // can reach the webhook with a valid-looking workspace id can add one
+  // signature_ok = false row per DISTINCT forged body. Identical replays
+  // collapse (partial unique index), distinct ones do not." Every test
+  // below uses a workspace id and/or IP dedicated to that single test (a
+  // fresh `newId()`, or the shared fixture workspaces `a`/`b` only where a
+  // fresh x-forwarded-for keeps it isolated from the invalid-path traffic
+  // the tests above already sent), so tripping a budget here can never
+  // retroactively change an assertion an earlier test in this file already
+  // made.
+  describe("rate limiting", () => {
+    it("throttles a flood of forged signatures from one source IP with 429 and a Retry-After header, and stops growing webhook_delivery once throttled", async () => {
+      const workspaceId = await createBareWorkspace();
+      const ip = `test-ip-flood-${newId()}`;
+      const limit = WEBHOOK_RATE_LIMITS.invalid_ip.limit;
+
+      const statuses: number[] = [];
+      for (let i = 0; i < limit + 5; i++) {
+        const body = forgedEventBody(workspaceId, `d-ipflood-${i}-${newId()}`);
+        const { request, context } = req(workspaceId, body, sign(body, "wrong-secret"), ip);
+        statuses.push((await POST(request, context)).status);
+      }
+
+      expect(statuses.slice(0, limit)).toEqual(Array(limit).fill(401));
+      const throttled = statuses.slice(limit);
+      expect(throttled.every((s) => s === 429)).toBe(true);
+
+      // Exactly `limit` rejected receipts -- not `limit + 5`: once throttled,
+      // the route never reaches recordRejectedDelivery at all, so distinct
+      // forged bodies past the limit buy the attacker nothing.
+      expect(await rejectedDeliveryCount(workspaceId)).toBe(limit);
+
+      // The 429 itself carries a positive, numeric retry hint -- never a
+      // silent drop.
+      const { request, context } = req(workspaceId, forgedEventBody(workspaceId, `d-ipflood-last-${newId()}`), sign("x", "y"), ip);
+      const res = await POST(request, context);
+      expect(res.status).toBe(429);
+      const retryAfter = Number(res.headers.get("Retry-After"));
+      expect(Number.isFinite(retryAfter)).toBe(true);
+      expect(retryAfter).toBeGreaterThanOrEqual(1);
+    });
+
+    it("throttles a distributed flood aimed at one target workspace even when every request comes from a different source IP", async () => {
+      const targetWorkspaceId = await createBareWorkspace();
+      const limit = WEBHOOK_RATE_LIMITS.invalid_workspace.limit;
+
+      const statuses: number[] = [];
+      for (let i = 0; i < limit + 5; i++) {
+        // A FRESH IP every single request -- the per-IP budget individually
+        // never trips, so only the per-claimed-workspace scope can be what
+        // throttles this.
+        const ip = `test-ip-distributed-${newId()}-${i}`;
+        const body = forgedEventBody(targetWorkspaceId, `d-distflood-${i}-${newId()}`);
+        const { request, context } = req(targetWorkspaceId, body, sign(body, "wrong-secret"), ip);
+        statuses.push((await POST(request, context)).status);
+      }
+
+      expect(statuses.slice(0, limit)).toEqual(Array(limit).fill(401));
+      expect(statuses.slice(limit).every((s) => s === 429)).toBe(true);
+      expect(await rejectedDeliveryCount(targetWorkspaceId)).toBe(limit);
+    });
+
+    it("a genuine, validly signed delivery to a workspace still succeeds after an attacker floods that SAME workspace with forged signatures from its own dedicated IP -- the rate limiter must never become a new way to deny a legitimate sender", async () => {
+      const ip = `test-ip-survive-${newId()}`;
+      const floodCount = WEBHOOK_RATE_LIMITS.invalid_ip.limit + WEBHOOK_RATE_LIMITS.invalid_workspace.limit + 5;
+
+      for (let i = 0; i < floodCount; i++) {
+        const body = forgedEventBody(a.workspaceId, `d-survive-flood-${i}-${newId()}`);
+        const { request, context } = req(a.workspaceId, body, sign(body, "wrong-secret"), ip);
+        await POST(request, context);
+      }
+      // Confirm the flood really did get throttled (both invalid scopes for
+      // this workspace/IP are now exhausted) before asserting the genuine
+      // delivery still gets through.
+      const confirmBody = forgedEventBody(a.workspaceId, `d-survive-confirm-${newId()}`);
+      const { request: confirmReq, context: confirmCtx } = req(a.workspaceId, confirmBody, sign(confirmBody, "wrong-secret"), ip);
+      expect((await POST(confirmReq, confirmCtx)).status).toBe(429);
+
+      const externalId = `route-test-post-${a.publicationId}`;
+      const deliveryId = `d-survive-genuine-${newId()}`;
+      const genuineBody = JSON.stringify({
+        events: [{ externalId, eventType: "post.impression", value: 999, occurredAt: new Date().toISOString(), deliveryId }],
+      });
+      const before = await eventCount(a.workspaceId, a.publicationId);
+      const { request: genuineReq, context: genuineCtx } = req(a.workspaceId, genuineBody, signFor(a.workspaceId, genuineBody));
+      const res = await POST(genuineReq, genuineCtx);
+
+      expect(res.status).toBe(200);
+      expect(await eventCount(a.workspaceId, a.publicationId)).toBe(before + 1);
+    });
+
+    it("flooding workspace A's invalid-signature budget never throttles workspace B's genuine delivery", async () => {
+      const ip = `test-ip-cross-tenant-${newId()}`;
+      const floodCount = WEBHOOK_RATE_LIMITS.invalid_ip.limit + WEBHOOK_RATE_LIMITS.invalid_workspace.limit + 5;
+
+      for (let i = 0; i < floodCount; i++) {
+        const body = forgedEventBody(a.workspaceId, `d-crosstenant-flood-${i}-${newId()}`);
+        const { request, context } = req(a.workspaceId, body, sign(body, "wrong-secret"), ip);
+        await POST(request, context);
+      }
+      const confirmBody = forgedEventBody(a.workspaceId, `d-crosstenant-confirm-${newId()}`);
+      const { request: confirmReq, context: confirmCtx } = req(a.workspaceId, confirmBody, sign(confirmBody, "wrong-secret"), ip);
+      expect((await POST(confirmReq, confirmCtx)).status).toBe(429); // A really is throttled
+
+      const externalId = `route-test-post-${b.publicationId}`;
+      const deliveryId = `d-crosstenant-genuine-b-${newId()}`;
+      const genuineBody = JSON.stringify({
+        events: [{ externalId, eventType: "post.impression", value: 123, occurredAt: new Date().toISOString(), deliveryId }],
+      });
+      const before = await eventCount(b.workspaceId, b.publicationId);
+      const { request: genuineReq, context: genuineCtx } = req(b.workspaceId, genuineBody, signFor(b.workspaceId, genuineBody));
+      const res = await POST(genuineReq, genuineCtx);
+
+      expect(res.status).toBe(200); // B is completely unaffected by A's flood
+      expect(await eventCount(b.workspaceId, b.publicationId)).toBe(before + 1);
+    });
   });
 });
