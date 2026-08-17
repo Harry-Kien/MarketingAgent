@@ -139,6 +139,27 @@ async function main() {
       `ALTER ROLE smos_vault PASSWORD ${client.escapeLiteral(smosVaultPassword)}`,
     );
     console.log("smos_vault password set from SMOS_VAULT_PASSWORD");
+
+    // Same pattern once more, for the authentication surface's own login
+    // role (0038_identity_tenancy_and_auth_role.sql): smos_auth is the only
+    // credential that may touch session/account/verification at all, and it
+    // is a member of neither smos_app nor smos_vault -- a leaked
+    // DATABASE_URL cannot mint a session, and a leaked DATABASE_AUTH_URL
+    // cannot reach this application's own data.
+    const smosAuthPassword = process.env["SMOS_AUTH_PASSWORD"];
+    if (!smosAuthPassword) {
+      console.error(
+        "SMOS_AUTH_PASSWORD is not set. Refusing to leave smos_auth without a " +
+          "password: set SMOS_AUTH_PASSWORD (see .env.example) and re-run " +
+          "npm run db:migrate.",
+      );
+      process.exitCode = 1;
+      return;
+    }
+    await client.query(
+      `ALTER ROLE smos_auth PASSWORD ${client.escapeLiteral(smosAuthPassword)}`,
+    );
+    console.log("smos_auth password set from SMOS_AUTH_PASSWORD");
   } finally {
     client.release();
     await pool.end();

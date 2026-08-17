@@ -3,7 +3,7 @@ import { betterAuth } from "better-auth";
 import { nextCookies } from "better-auth/next-js";
 import { newId, type Id } from "@smos/domain";
 import type { SessionDeps } from "./session.ts";
-import { getPool } from "./db.ts";
+import { getAuthPool, getPool } from "./db.ts";
 
 /**
  * Real authentication (better-auth 1.6.26, pinned exactly per
@@ -121,11 +121,17 @@ export function createSmosAuth(pool: pg.Pool, options: { disableSignUp: boolean 
 }
 
 /**
- * The instance the running app actually uses: the shared smos_app pool
- * (`getPool()`, DATABASE_URL) and sign-up disabled. See `createSmosAuth`'s
- * own comment for why this must never be the pool test/seed code uses.
+ * The instance the running app actually uses: the AUTH pool
+ * (`getAuthPool()`, DATABASE_AUTH_URL -- the smos_auth credential), sign-up
+ * disabled. See `createSmosAuth`'s own comment for why this must never be
+ * the pool test/seed code uses, and getAuthPool's for why it is no longer
+ * the smos_app pool either: infra/migrations/0038_identity_tenancy_and_
+ * auth_role.sql revoked every grant smos_app held on session, account and
+ * verification, because holding them made forging a session and overwriting
+ * a password hash one statement each from the role every agent runs as
+ * (final whole-branch review, IMPORTANT 4).
  */
-export const auth = createSmosAuth(getPool(), { disableSignUp: true });
+export const auth = createSmosAuth(getAuthPool(), { disableSignUp: true });
 
 /**
  * Builds the `SessionDeps` `resolveWorkspace` (apps/web/src/server/

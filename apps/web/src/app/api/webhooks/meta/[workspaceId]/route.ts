@@ -203,11 +203,21 @@ export async function POST(
   // merely LOOKS valid but names no real workspace would "fail at the FK,
   // never silently". It did fail -- as an unhandled throw carrying the raw
   // constraint name out to the caller. A well-formed id naming no workspace
-  // is a 404, decided here, explicitly. `workspace` is the tenant root: it
-  // carries no workspace_id and no RLS policy (0001_core_tenancy.sql), so
-  // this read is correct outside a tenant scope and is the only such read in
-  // this file.
-  const exists = await pool.query(`select 1 from workspace where id = $1`, [workspaceId]);
+  // is a 404, decided here, explicitly.
+  //
+  // This used to read `workspace` on the bare pool, outside any tenant
+  // scope, on the (then true) grounds that the table carried no RLS policy
+  // at all. infra/migrations/0038_identity_tenancy_and_auth_role.sql gave
+  // `workspace` the tenancy it was missing -- its own `id` IS its tenancy
+  // column, so a session now sees exactly the one workspace row it is
+  // scoped to instead of the entire customer list (final whole-branch
+  // review, IMPORTANT 5) -- and an unscoped read here would have returned
+  // zero rows for every delivery. Opening the scope for the id being
+  // claimed is not a weakening: the policy answers "does the workspace you
+  // named exist" identically and says nothing whatsoever about any other
+  // workspace, so this endpoint still cannot be used to enumerate tenants.
+  const exists = await withTenant(pool, workspaceId as Id, (tx) =>
+    tx.query(`select 1 from workspace where id = $1`, [workspaceId]));
   if (exists.rowCount === 0) {
     return new Response(null, { status: 404 });
   }
