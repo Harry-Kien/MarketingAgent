@@ -65,6 +65,12 @@ async function seedSucceededPublication(): Promise<Id> {
      values ($1, $2, $3, $4, 'meta_page')`,
     [requestId, workspaceId, campaignId, versionId],
   );
+  // The live schema enforces approval_decision_actor_is_workspace_member_
+  // fkey: the decision's actor must already be a member of this workspace.
+  await adminPool.query(
+    `insert into workspace_member (id, workspace_id, user_id, role) values ($1, $2, $3, 'owner')`,
+    [newId(), workspaceId, userId],
+  );
   await adminPool.query(
     `insert into approval_decision (id, workspace_id, approval_request_id, actor_user_id, decision, reason)
      values ($1, $2, $3, $4, 'approve', 'probe approval')`,
@@ -149,7 +155,7 @@ describe("isChannelConnected", () => {
         newId(),
         workspaceId,
       ]),
-    ).rejects.toThrow(/check|violates/i);
+    ).rejects.toThrow(/integration_sandbox_needs_evidence_check/);
     await expect(isChannelConnected(appPool, workspaceId, "meta_page")).resolves.toBe(false);
   });
 
