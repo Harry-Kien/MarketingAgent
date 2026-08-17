@@ -97,12 +97,21 @@ describe("meta adapter contract", () => {
   });
 
   it("never leaks the token in the error message", async () => {
-    const bad = adapterFor({ token: "EAAsupersecret" });
-    try {
-      await bad.publish(input("k6"));
-    } catch (e) {
-      expect((e as AdapterError).safeMessage).not.toContain("EAAsupersecret");
-    }
+    // Was vacuous: `input("k6")` targets the default "page-1" account with
+    // non-blank content and a token that is neither "expired" nor
+    // "invalid", so `publish` always resolved and the `catch` body -- the
+    // test's only assertion -- never ran. `.catch((e) => e)` (rather than
+    // try/catch) makes that failure mode structurally impossible: if
+    // `publish` resolves, `err` is a `PublishResult`, not an `AdapterError`,
+    // and `toBeInstanceOf` below fails loudly instead of silently skipping.
+    // `page-rate-limited` echoes the presented token into its error message
+    // (see fake-server.ts), so this exercises a real leak-then-redact path.
+    const secretToken = "EAAsupersecret";
+    const bad = adapterFor({ token: secretToken });
+    const err: unknown = await bad.publish(input("k6", "content", "page-rate-limited")).catch((e) => e);
+    expect(err).toBeInstanceOf(AdapterError);
+    expect((err as AdapterError).message).toContain(secretToken);
+    expect((err as AdapterError).safeMessage).not.toContain(secretToken);
   });
 
   it("health check reports true for a reachable sandbox", async () => {
