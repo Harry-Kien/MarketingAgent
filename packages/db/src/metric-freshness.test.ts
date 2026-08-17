@@ -94,7 +94,9 @@ describe("metric freshness is a fact, not a label (IMPORTANT 4)", () => {
   });
 
   it("refuses a future-dated freshness_at at INSERT", async () => {
-    await expect(insertMetric(`now() + interval '1 day'`)).rejects.toThrow(/future|violates|check/i);
+    await expect(insertMetric(`now() + interval '1 day'`)).rejects.toThrow(
+      /is in the future; a metric cannot have been measured at a time that has not happened/,
+    );
   });
 
   it("still accepts an honest observation stamped now()", async () => {
@@ -108,6 +110,8 @@ describe("metric freshness is a fact, not a label (IMPORTANT 4)", () => {
     // metric older than 24h is stale. A row that is born stale must not also
     // claim the top confidence tier -- the presentational warning and the
     // stored claim have to agree, or the badge contradicts the data.
-    await expect(insertMetric(`now() - interval '30 days'`, "high")).rejects.toThrow(/stale|confidence|violates|check/i);
+    await expect(insertMetric(`now() - interval '30 days'`, "high")).rejects.toThrow(
+      /is already stale \(over 24 hours old\) and cannot be recorded at confidence "high"/,
+    );
   });
 });
