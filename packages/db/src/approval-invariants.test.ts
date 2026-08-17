@@ -30,7 +30,15 @@ async function seedUser(label: string): Promise<string> {
     `insert into user_account (id,email,name) values (gen_random_uuid(),$1,$2) returning id`,
     [`${label}-${Date.now()}-${Math.random()}@test.local`, label],
   );
-  return r.rows[0].id as string;
+  const userId = r.rows[0].id as string;
+  // The live schema enforces approval_decision_actor_is_workspace_member_
+  // fkey: a decision's actor must already be a member of WS before any
+  // approval_decision naming them can be inserted.
+  await adminPool.query(
+    `insert into workspace_member (id, workspace_id, user_id, role) values (gen_random_uuid(), $1, $2, 'owner')`,
+    [WS, userId],
+  );
+  return userId;
 }
 
 let requestId: string;
@@ -114,7 +122,7 @@ describe("approval invariants enforced by the database (E4)", () => {
     await expect(withTenant(pool, WS, (tx) => tx.query(
       `insert into approval_decision (id,workspace_id,approval_request_id,actor_user_id,decision,reason)
        values (gen_random_uuid(),$1,$2,gen_random_uuid(),'approve','agent tried')`, [WS, requestId],
-    ))).rejects.toThrow(/foreign key|violates/i);
+    ))).rejects.toThrow(/approval_decision_actor_user_id_fkey/);
   });
 
   it("refuses actor_kind other than user (CHECK), even with a real user row", async () => {
@@ -122,7 +130,7 @@ describe("approval invariants enforced by the database (E4)", () => {
     await expect(withTenant(pool, WS, (tx) => tx.query(
       `insert into approval_decision (id,workspace_id,approval_request_id,actor_user_id,actor_kind,decision,reason)
        values (gen_random_uuid(),$1,$2,$3,'agent','approve','x')`, [WS, requestId, userId],
-    ))).rejects.toThrow(/check|violates/i);
+    ))).rejects.toThrow(/approval_decision_actor_kind_check/);
   });
 
   it("refuses actor_kind 'system' (CHECK), even with a real user row", async () => {
@@ -130,7 +138,7 @@ describe("approval invariants enforced by the database (E4)", () => {
     await expect(withTenant(pool, WS, (tx) => tx.query(
       `insert into approval_decision (id,workspace_id,approval_request_id,actor_user_id,actor_kind,decision,reason)
        values (gen_random_uuid(),$1,$2,$3,'system','approve','x')`, [WS, requestId, userId],
-    ))).rejects.toThrow(/check|violates/i);
+    ))).rejects.toThrow(/approval_decision_actor_kind_check/);
   });
 
   it("refuses a blank reason", async () => {
@@ -138,7 +146,7 @@ describe("approval invariants enforced by the database (E4)", () => {
     await expect(withTenant(pool, WS, (tx) => tx.query(
       `insert into approval_decision (id,workspace_id,approval_request_id,actor_user_id,decision,reason)
        values (gen_random_uuid(),$1,$2,$3,'approve','   ')`, [WS, requestId, userId],
-    ))).rejects.toThrow(/check|violates/i);
+    ))).rejects.toThrow(/approval_decision_reason_check/);
   });
 
   it("refuses two decisions on one request", async () => {
@@ -170,7 +178,7 @@ describe("approval invariants enforced by the database (E4)", () => {
     await expect(withTenant(pool, WS, (tx) => tx.query(
       `insert into approval_decision (id,workspace_id,approval_request_id,actor_user_id,decision,reason)
        values (gen_random_uuid(),$1,$2,$3,'approve',$4)`, [WS, reqId, userId, "\t\n"],
-    ))).rejects.toThrow(/check|violates/i);
+    ))).rejects.toThrow(/approval_decision_reason_check/);
   });
 });
 
