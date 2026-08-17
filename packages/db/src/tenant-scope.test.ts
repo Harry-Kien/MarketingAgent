@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
-import { TenantViolationError } from "@smos/domain";
+import { newId, TenantViolationError } from "@smos/domain";
 import { createDb, createDbPool } from "./client.ts";
 import { withTenant } from "./tenant-scope.ts";
 
@@ -26,7 +26,19 @@ beforeAll(async () => {
   );
 });
 
+// Every `goal` row this file's restore-variant defeat attempts try to write
+// is tagged with this run's own statement, so afterAll can remove them
+// through the migration role whether the attempt was refused (nothing to
+// clean) or wrongly committed (a row that must not be left behind for the
+// next run). `goal` is the table the reviewer's own live reproduction used,
+// and unlike audit_log it is deletable, so a FAILING test does not leave an
+// undeletable row behind.
+const GOAL_PROBE_STATEMENT = `tenant-scope restore-variant probe ${Date.now()}-${Math.random()}`;
+
 afterAll(async () => {
+  await adminPool
+    .query("delete from goal where statement = $1", [GOAL_PROBE_STATEMENT])
+    .catch(() => undefined);
   await pool.end();
   await adminPool.end();
 });
@@ -265,13 +277,18 @@ describe("withTenant", () => {
         [B, marker],
       ));
 
-    // Honest caveat (see tenant-scope.ts's header): the read below still
-    // happens, and it still sees B's row -- the boundary check runs only
-    // after the callback returns, so it cannot un-see something the
-    // callback already read inside its own body. What this DOES guarantee:
-    // the transaction the hijack ran in can never commit, and the caller
-    // gets a loud TenantViolationError instead of a silent, wrong answer
-    // that looks like a legitimate result.
+    // CORRECTED (final whole-branch review, CRITICAL 1). This comment used
+    // to read: "the read below still happens, and it still sees B's row --
+    // the boundary check runs only after the callback returns". That was
+    // true of the end-of-callback read-back it described and is now false:
+    // the guard runs after EVERY statement, so the `set_config` line below
+    // is itself refused and the count query after it never executes at all.
+    // The honest remaining caveat is narrower -- a hijacked read inside a
+    // SINGLE statement (one that re-scopes and selects in the same command)
+    // still returns its rows into the callback's own variables before the
+    // guard sees anything. What is guaranteed either way: the transaction
+    // can never commit, no statement after the hijack runs, and the caller
+    // gets a loud TenantViolationError instead of a silent, wrong answer.
     await expect(
       withTenant(pool, A, async (tx) => {
         // Still smos_app, still inside withTenant's own transaction -- but
@@ -340,6 +357,97 @@ describe("withTenant", () => {
     } finally {
       await adminPool.query("drop role tmp_boundary_check_target");
     }
+  });
+
+  // --- Final whole-branch review, CRITICAL 1 ------------------------------
+  // Every DEFEAT ATTEMPT above leaves the scope DRIFTED when the callback
+  // returns, which is the only thing a final-value read-back can see. A
+  // callback that re-scopes, writes, and then puts the original value BACK
+  // ends holding exactly what withTenant opened with, so it passed the
+  // read-back untouched and its write COMMITTED into the other workspace --
+  // proven live by the reviewer, in this exact three-statement shape:
+  //
+  //   set_config('app.workspace_id', B, true)
+  //   insert into goal (... B ...)
+  //   set_config('app.workspace_id', A, true)
+  //   return
+  //
+  // No TenantViolationError, and the row landed in workspace B.
+
+  it("DEFEAT ATTEMPT: re-scoping, WRITING, then RESTORING the original scope before returning is refused", async () => {
+    const goalId = newId();
+    await expect(
+      withTenant(pool, A, async (tx) => {
+        // The hijack: re-scope to B mid-callback...
+        await tx.query("select set_config('app.workspace_id', $1, true)", [B]);
+        // ...write a row that belongs to B...
+        await tx.query("insert into goal (id, workspace_id, statement) values ($1, $2, $3)", [
+          goalId,
+          B,
+          GOAL_PROBE_STATEMENT,
+        ]);
+        // ...then put back exactly what withTenant opened with, so any
+        // end-of-callback read-back of app.workspace_id sees "A" and is
+        // satisfied.
+        await tx.query("select set_config('app.workspace_id', $1, true)", [A]);
+      }),
+    ).rejects.toThrow(TenantViolationError);
+
+    // The transaction must never have reached COMMIT: the hijacked row is
+    // not in workspace B (checked as the migration role, which bypasses RLS,
+    // so this cannot pass merely because RLS hid the row from us).
+    const landed = await adminPool.query("select count(*)::int as n from goal where id = $1", [goalId]);
+    expect(landed.rows[0].n).toBe(0);
+  });
+
+  it("DEFEAT ATTEMPT: a callback that SWALLOWS the violation and restores the scope still cannot commit", async () => {
+    // The latch, not just the throw: catching the TenantViolationError inside
+    // the callback and returning normally must not produce a committed
+    // transaction. Otherwise the guard would be advisory -- any callback that
+    // wraps its own SQL in try/catch would defeat it.
+    const goalId = newId();
+    await expect(
+      withTenant(pool, A, async (tx) => {
+        try {
+          await tx.query("select set_config('app.workspace_id', $1, true)", [B]);
+        } catch {
+          // deliberately swallowed
+        }
+        try {
+          await tx.query("insert into goal (id, workspace_id, statement) values ($1, $2, $3)", [
+            goalId,
+            B,
+            GOAL_PROBE_STATEMENT,
+          ]);
+        } catch {
+          // deliberately swallowed
+        }
+        await tx.query("select set_config('app.workspace_id', $1, true)", [A]).catch(() => undefined);
+        return "callback finished normally";
+      }),
+    ).rejects.toThrow(TenantViolationError);
+
+    const landed = await adminPool.query("select count(*)::int as n from goal where id = $1", [goalId]);
+    expect(landed.rows[0].n).toBe(0);
+  });
+
+  it("DEFEAT ATTEMPT: a multi-statement batch cannot hide a re-scope between semicolons", async () => {
+    // A statement-boundary guard would be worthless if the whole hijack could
+    // be posted as one simple-protocol batch, which PostgreSQL executes
+    // without ever handing control back between the semicolons.
+    const goalId = newId();
+    await expect(
+      withTenant(pool, A, async (tx) => {
+        await tx.query(
+          `select set_config('app.workspace_id', '${B}', true);
+           insert into goal (id, workspace_id, statement) values ('${goalId}', '${B}', '${GOAL_PROBE_STATEMENT}');
+           select set_config('app.workspace_id', '${A}', true);`,
+        );
+      }),
+    ).rejects.toThrow();
+
+    const landed = await adminPool.query("select count(*)::int as n from goal where id = $1", [goalId]);
+    expect(landed.rows[0].n).toBe(0);
   });
 
   it("DEFEAT ATTEMPT AFTERMATH: a plain (non-LOCAL) SET ROLE would poison the pool -- withTenant itself never issues one", async () => {
