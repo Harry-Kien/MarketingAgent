@@ -267,6 +267,6 @@ describe("transactional outbox", () => {
           payload: {},
           correlationId,
         })),
-    ).rejects.toThrow(/permission denied|row-level security|violates/i);
+    ).rejects.toThrow(/new row violates row-level security policy for table "outbox"/);
   });
 });
