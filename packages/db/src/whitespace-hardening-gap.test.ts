@@ -61,7 +61,7 @@ describe("goal.statement — CHECK constraint (whitespace-only rejected)", () =>
           WS,
           WHITESPACE_ONLY,
         ])),
-    ).rejects.toThrow(/violates check constraint|check constraint/i);
+    ).rejects.toThrow(/goal_statement_check/);
   });
 
   it("accepts a real statement", async () => {
@@ -83,7 +83,7 @@ describe("source_citation.url / excerpt — CHECK constraint (whitespace-only re
            values (gen_random_uuid(), $1, $2, $3, now(), 'a real excerpt', 'VERIFIED')`,
           [WS, versionId, WHITESPACE_ONLY],
         )),
-    ).rejects.toThrow(/violates check constraint|check constraint/i);
+    ).rejects.toThrow(/source_citation_url_check/);
   });
 
   it("rejects a whitespace-only excerpt", async () => {
@@ -95,7 +95,7 @@ describe("source_citation.url / excerpt — CHECK constraint (whitespace-only re
            values (gen_random_uuid(), $1, $2, 'https://x.test', now(), $3, 'VERIFIED')`,
           [WS, versionId, WHITESPACE_ONLY],
         )),
-    ).rejects.toThrow(/violates check constraint|check constraint/i);
+    ).rejects.toThrow(/source_citation_excerpt_check/);
   });
 
   it("accepts a real url and excerpt", async () => {
@@ -117,7 +117,7 @@ describe("audit_log.event_type — CHECK constraint (whitespace-only rejected)",
           `insert into audit_log (id, workspace_id, event_type, actor_kind) values (gen_random_uuid(), $1, $2, 'system')`,
           [WS, WHITESPACE_ONLY],
         )),
-    ).rejects.toThrow(/violates check constraint|check constraint/i);
+    ).rejects.toThrow(/audit_log_event_type_check/);
   });
 
   it("accepts a real event_type", async () => {
