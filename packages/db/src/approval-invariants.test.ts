@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
+import { newId } from "@smos/domain";
 import { createDb, createDbPool } from "./client.ts";
 import { withTenant } from "./tenant-scope.ts";
 
@@ -193,5 +194,61 @@ describe("E4 lock 1's other half: smos_app cannot provision its own user_account
     // table; asserting the full set (not just the absence of INSERT) means
     // a future UPDATE/DELETE grant would also fail this test.
     expect(privileges).toEqual(["SELECT"]);
+  });
+
+  // Final whole-branch review, IMPORTANT 3. The assertion above is
+  // GRANTEE-SHAPED: it reads information_schema.role_table_grants filtered to
+  // `grantee = 'smos_app'`, so it only ever sees privileges granted to that
+  // role BY NAME. Reproduced live against this database: the reviewer's own
+  // mutation `GRANT INSERT ON user_account TO smos_app` does fail it (1 test
+  // fails, not 0 as reported) -- but the one-word variant
+  //
+  //     GRANT INSERT ON user_account TO PUBLIC;
+  //
+  // gives smos_app exactly the same INSERT privilege
+  // (has_table_privilege('smos_app','user_account','INSERT') = true, verified)
+  // while appearing nowhere under `grantee = 'smos_app'`, and the whole suite
+  // still passed 0 failures. Role membership and default privileges have the
+  // same shape of gap. So 0030's protection is pinned here by what smos_app
+  // can actually DO, not by who a catalog row says was granted what.
+  it("smos_app cannot INSERT, UPDATE or DELETE user_account by ANY grant path (privilege, not grantee)", async () => {
+    const r = await adminPool.query(
+      `select has_table_privilege('smos_app', 'user_account', 'INSERT') as ins,
+              has_table_privilege('smos_app', 'user_account', 'UPDATE') as upd,
+              has_table_privilege('smos_app', 'user_account', 'DELETE') as del,
+              has_table_privilege('smos_app', 'user_account', 'SELECT') as sel`,
+    );
+    // has_table_privilege resolves the EFFECTIVE privilege: direct grants,
+    // grants to PUBLIC, and grants inherited through role membership all
+    // read true here.
+    expect(r.rows[0].ins).toBe(false);
+    expect(r.rows[0].upd).toBe(false);
+    expect(r.rows[0].del).toBe(false);
+    // ...and SELECT is still there, so this test fails for the right reason
+    // if a future migration revokes everything rather than nothing.
+    expect(r.rows[0].sel).toBe(true);
+  });
+
+  it("smos_app is refused when it actually attempts to provision a user_account row", async () => {
+    // The behavioural half: E4's first lock is "an agent cannot manufacture
+    // the user row its approval_decision.actor_user_id would point at".
+    // Proving that by running the attempt as smos_app -- the exact role every
+    // agent rides on -- is the assertion that cannot be satisfied by a
+    // catalog view telling a comfortable story.
+    const forgedId = newId();
+    try {
+      await expect(
+        pool.query(`insert into user_account (id, email, name) values ($1, $2, $3)`, [
+          forgedId,
+          `forged-approver-${forgedId}@test.local`,
+          "forged approver",
+        ]),
+      ).rejects.toThrow(/permission denied/i);
+    } finally {
+      // Survives a failing test: if the insert ever succeeds, the row is
+      // removed through the migration role rather than left behind for the
+      // next run to trip over.
+      await adminPool.query("delete from user_account where id = $1", [forgedId]).catch(() => undefined);
+    }
   });
 });
