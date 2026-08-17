@@ -86,6 +86,16 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
     `e12-${label}-${workspaceId}@test.local`,
     label,
   ]);
+  // 0029_auth_schema.sql: binds the fixture's own user_account row to this
+  // workspace. Seeded here, before approval_decision, because the live
+  // schema now enforces approval_decision_actor_is_workspace_member_fkey --
+  // a decision's actor must already be a member of the workspace at insert
+  // time, not merely inserted into workspace_member eventually in this same
+  // function.
+  await client.query(
+    `insert into workspace_member (id, workspace_id, user_id, role) values ($1, $2, $3, 'owner')`,
+    [workspaceMemberId, workspaceId, userId],
+  );
   await client.query(`insert into goal (id, workspace_id, statement) values ($1, $2, 'e12 seed goal')`, [
     goalId,
     workspaceId,
@@ -200,13 +210,6 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
     `insert into metric (id, workspace_id, campaign_id, name, value, freshness_at, attribution_model, attribution_window, confidence)
      values (gen_random_uuid(), $1, $2, 'e12_seed_metric', 1, now(), 'last_touch', '7d', 'low')`,
     [workspaceId, campaignId],
-  );
-  // 0029_auth_schema.sql: binds the fixture's own user_account row to this
-  // workspace, the same "first membership wins" shape resolve_user_workspace
-  // expects.
-  await client.query(
-    `insert into workspace_member (id, workspace_id, user_id, role) values ($1, $2, $3, 'owner')`,
-    [workspaceMemberId, workspaceId, userId],
   );
   // Credential vault (0036_vault_secret.sql): placeholder ciphertext/wrap
   // bytes, never real crypto output -- this row exists only so
