@@ -693,11 +693,18 @@ describe("FINDING 3: unsupported CREATE TABLE shapes fail closed instead of bein
 // EXPECTED_TENANT_TABLES (packages/db/src/cross-tenant.test.ts) -- any
 // future addition or removal must be a deliberate, reviewed edit to this
 // test in the same commit, not a silent side effect.
+//
+// Hardening task 1 adds "webhook_rate_limit_bucket"
+// (0035_webhook_rate_limit.sql) -- reviewed here, in the same commit as the
+// migration that adds it, per this test's own rule: it holds no tenant
+// business data, only fixed-cardinality, hash-bucketed abuse-prevention
+// counters, three of whose four scopes are explicitly cross-tenant by
+// design (see that migration's own header).
 describe("FINDING 4: GLOBAL_TABLES is pinned to an exhaustive, committed list", () => {
   it("is exactly the committed set of global tables", () => {
     expect(GLOBAL_TABLES).toEqual([
       "workspace", "user_account", "session", "account", "verification",
-      "__drizzle_migrations", "schema_migration",
+      "__drizzle_migrations", "schema_migration", "webhook_rate_limit_bucket",
     ]);
   });
 });

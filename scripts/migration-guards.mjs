@@ -10,10 +10,17 @@
  * listed here purely so this allowlist tells the truth about what tables
  * actually exist (see packages/db/src/cross-tenant.test.ts's GLOBAL_TABLES
  * cross-check, task-12-report.md).
+ *
+ * `webhook_rate_limit_bucket` (0035_webhook_rate_limit.sql) holds no tenant
+ * business data -- only fixed-cardinality, hash-bucketed abuse-prevention
+ * counters, three of whose four scopes (IP, per-claimed-workspace-hash,
+ * global) are explicitly cross-tenant by design, decided BEFORE any
+ * workspace context is established. See that migration's own header for the
+ * full reasoning.
  */
 export const GLOBAL_TABLES = [
   "workspace", "user_account", "session", "account", "verification",
-  "__drizzle_migrations", "schema_migration",
+  "__drizzle_migrations", "schema_migration", "webhook_rate_limit_bucket",
 ];
 
 /**
