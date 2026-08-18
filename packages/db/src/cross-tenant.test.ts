@@ -176,10 +176,16 @@ const FK_PAIRS = await discoverTenantToTenantFks(TENANT_TABLES);
 // customer-advisory agent (M2C) grounds a reply in -- both workspace-owned,
 // updated here in the same commit as the migration that adds them, per this
 // list's own rule above.
+// M2B task 1 (infra/migrations/0040_conversation_domain.sql) adds
+// customer_contact, conversation and message -- the conversation domain
+// this system had no concept of before -- all three workspace-owned,
+// updated here in the same commit as the migration that adds them, per this
+// list's own rule above.
 const EXPECTED_TENANT_TABLES = [
   "agent_definition", "agent_run", "agent_version", "approval_decision", "approval_request",
-  "audit_log", "campaign", "content_item", "content_version", "credential_reference",
-  "event", "goal", "integration", "knowledge_chunk", "knowledge_document", "metric", "outbox",
+  "audit_log", "campaign", "content_item", "content_version", "conversation",
+  "credential_reference", "customer_contact", "event", "goal", "integration",
+  "knowledge_chunk", "knowledge_document", "message", "metric", "outbox",
   "publication", "run_checkpoint", "source_citation", "tool_call", "vault_secret",
   "webhook_delivery", "workspace_member",
 ].toSorted();
@@ -243,6 +249,8 @@ const EXPECTED_FK_PAIRS = [
   "campaign->goal",
   "content_item->campaign",
   "content_version->content_item",
+  // M2B task 1 (infra/migrations/0040_conversation_domain.sql):
+  "conversation->customer_contact",
   "credential_reference->integration",
   "event->publication",
   // 0033: integration.verified_publication_id -> publication, the evidence
@@ -255,6 +263,8 @@ const EXPECTED_FK_PAIRS = [
   // be attached to another workspace's document and silently inherit that
   // document's provenance tier.
   "knowledge_chunk->knowledge_document",
+  // M2B task 1 (infra/migrations/0040_conversation_domain.sql):
+  "message->conversation",
   "metric->campaign",
   "publication->approval_decision",
   "publication->campaign",
@@ -326,6 +336,14 @@ afterAll(async () => {
     // block -- nothing else references either table.
     await adminPool.query("delete from knowledge_chunk where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
     await adminPool.query("delete from knowledge_document where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
+    // M2B Task 1 (infra/migrations/0040_conversation_domain.sql): message is
+    // immutable once written from Task 2 onward, but DELETE is untouched by
+    // that trigger (it only refuses UPDATE) so this cleanup still works;
+    // child-before-parent ordering (message, then conversation, then
+    // customer_contact) since each references the one before it.
+    await adminPool.query("delete from message where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
+    await adminPool.query("delete from conversation where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
+    await adminPool.query("delete from customer_contact where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
   }
   await pool.end();
   await adminPool.end();
@@ -548,6 +566,28 @@ function buildProbeRow(table: string, ws: TenantFixture, id: string): { columns:
           { value: id }, { value: ws.workspaceId }, { value: ws.knowledgeDocumentId }, { value: 99 }, { value: "e12 probe chunk text" },
         ],
       };
+    // M2B Task 1 (infra/migrations/0040_conversation_domain.sql):
+    case "customer_contact":
+      return {
+        columns: ["id", "workspace_id", "channel", "channel_contact_id", "display_name"],
+        cells: [
+          { value: id }, { value: ws.workspaceId }, { value: "zalo" },
+          { value: `e12-probe-contact-${id}` }, { value: "E12 probe contact" },
+        ],
+      };
+    case "conversation":
+      return {
+        columns: ["id", "workspace_id", "customer_contact_id"],
+        cells: [{ value: id }, { value: ws.workspaceId }, { value: ws.customerContactId }],
+      };
+    case "message":
+      return {
+        columns: ["id", "workspace_id", "conversation_id", "direction", "channel_message_id", "body"],
+        cells: [
+          { value: id }, { value: ws.workspaceId }, { value: ws.conversationId },
+          { value: "inbound" }, { value: `e12-probe-msg-${id}` }, { value: "e12 probe message body" },
+        ],
+      };
     default:
       // Fails loudly rather than silently skipping: a table discovered from
       // the catalog with no probe-row builder here would otherwise pass this
@@ -594,6 +634,9 @@ function fixtureIdForColumn(ws: TenantFixture, column: string): string {
     // M2A task 5 (0039_knowledge_base.sql): knowledge_chunk.document_id ->
     // knowledge_document (id, workspace_id).
     document_id: "knowledgeDocumentId",
+    // M2B Task 1 (infra/migrations/0040_conversation_domain.sql):
+    customer_contact_id: "customerContactId",
+    conversation_id: "conversationId",
   };
   const key = map[column];
   if (!key) {

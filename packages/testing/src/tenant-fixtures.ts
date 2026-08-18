@@ -57,6 +57,13 @@ export interface TenantFixture {
   // find/hijack, same as every other table seeded above.
   knowledgeDocumentId: Id;
   knowledgeChunkId: Id;
+  // M2B Task 1: one customer_contact / conversation / message per fixture
+  // workspace, so cross-tenant.test.ts's exhaustive, catalog-driven suite
+  // has a real row to probe for each of the three new tables, exactly like
+  // every other table added since P4 task 3.
+  customerContactId: Id;
+  conversationId: Id;
+  messageId: Id;
 }
 
 async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixture> {
@@ -82,6 +89,9 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
   const vaultSecretId = newId();
   const knowledgeDocumentId = newId();
   const knowledgeChunkId = newId();
+  const customerContactId = newId();
+  const conversationId = newId();
+  const messageId = newId();
 
   // Seeded directly as the connecting (superuser) role, which always bypasses
   // RLS -- these rows exist to be *subjects* of the isolation proof, not to
@@ -244,6 +254,25 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
     `insert into knowledge_chunk (id, workspace_id, document_id, ordinal, text) values ($1, $2, $3, 0, 'e12 seed chunk text')`,
     [knowledgeChunkId, workspaceId, knowledgeDocumentId],
   );
+  // M2B Task 1 (infra/migrations/0040_conversation_domain.sql): a real
+  // contact/conversation/message chain per workspace. The message insert
+  // fires conversation_bump_reply_window (AFTER INSERT), which is fine --
+  // it is exercised here as a side effect, same as every other real trigger
+  // this fixture already runs through.
+  await client.query(
+    `insert into customer_contact (id, workspace_id, channel, channel_contact_id, display_name)
+     values ($1, $2, 'zalo', $3, $4)`,
+    [customerContactId, workspaceId, `e12-${label}-contact-${customerContactId}`, `E12 ${label} contact`],
+  );
+  await client.query(
+    `insert into conversation (id, workspace_id, customer_contact_id) values ($1, $2, $3)`,
+    [conversationId, workspaceId, customerContactId],
+  );
+  await client.query(
+    `insert into message (id, workspace_id, conversation_id, direction, channel_message_id, body)
+     values ($1, $2, $3, 'inbound', $4, 'e12 seed message')`,
+    [messageId, workspaceId, conversationId, `e12-${label}-msg-${messageId}`],
+  );
 
   return {
     workspaceId,
@@ -268,6 +297,9 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
     vaultSecretId,
     knowledgeDocumentId,
     knowledgeChunkId,
+    customerContactId,
+    conversationId,
+    messageId,
   };
 }
 
