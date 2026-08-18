@@ -159,5 +159,14 @@ export function createMetaAdapter(cfg: MetaAdapterConfig, fetchImpl: FetchLike =
         },
       };
     },
+
+    async sendDirectMessage(_input: { channelContactId: string; text: string; idempotencyKey: string }): Promise<{ channelMessageId: string }> {
+      // M2B widened ChannelAdapter with sendDirectMessage; Meta's Page feed
+      // channel has no direct-message send path implemented in this
+      // milestone (D1: only Zalo OA does). Refused outright rather than
+      // silently no-op'd, so a caller cannot mistake "did nothing" for
+      // "sent".
+      throw new AdapterError("permanent_rejection", "Meta channel adapter does not implement sendDirectMessage in this milestone; use publish");
+    },
   };
 }
