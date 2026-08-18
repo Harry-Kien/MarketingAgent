@@ -5,6 +5,7 @@
     { "path": "./packages/domain" },
     { "path": "./packages/policy" },
     { "path": "./packages/telemetry" },
+    { "path": "./packages/knowledge" },
     { "path": "./packages/integrations" },
     { "path": "./packages/model-gateway" },
     { "path": "./packages/agents" },
