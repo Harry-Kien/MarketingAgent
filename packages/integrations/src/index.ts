@@ -8,3 +8,12 @@ export { createMetaAdapter, type MetaAdapterConfig } from "./meta/client.ts";
 export { createZaloClient, type ZaloClientConfig, type ZaloClient, type ZaloProfile } from "./zalo/client.ts";
 export { createZaloAdapter, type ZaloAdapterConfig } from "./zalo/adapter.ts";
 export { startFakeZaloServer, type FakeZaloServer } from "./zalo/fake-server.ts";
+export {
+  assertWithinReplyWindow,
+  assertBelowComplaintThreshold,
+  DEFAULT_COMPLAINT_RATE_THRESHOLD,
+  ReplyWindowClosedError,
+  ComplaintThresholdExceededError,
+  type ReplyWindowState,
+  type ComplaintRateProvider,
+} from "./zalo/reply-window.ts";

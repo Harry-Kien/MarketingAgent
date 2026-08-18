@@ -2,8 +2,22 @@ import type { FetchLike } from "../guarded-fetch.ts";
 import { AdapterError } from "../errors.ts";
 import type { ChannelAdapter, PublishInput, PublishResult } from "../adapter.ts";
 import { createZaloClient, type ZaloClientConfig } from "./client.ts";
+import {
+  assertWithinReplyWindow,
+  assertBelowComplaintThreshold,
+  type ReplyWindowState,
+  type ComplaintRateProvider,
+} from "./reply-window.ts";
 
-export interface ZaloAdapterConfig extends ZaloClientConfig {}
+export interface ZaloAdapterConfig extends ZaloClientConfig {
+  /** Never defaulted: a caller MUST supply the real reply-window state for
+   * this contact. A silent "always open" default would defeat the whole
+   * point of the ban-avoidance gate below. */
+  getReplyWindowState(channelContactId: string): Promise<ReplyWindowState>;
+  /** Never defaulted, for the identical reason. */
+  getComplaintRate: ComplaintRateProvider;
+  complaintRateThreshold?: number;
+}
 
 /**
  * Wraps the raw Zalo OA client (Task 3) into the `ChannelAdapter` shape.
@@ -48,6 +62,14 @@ export function createZaloAdapter(cfg: ZaloAdapterConfig, fetchImpl: FetchLike =
     },
 
     async sendDirectMessage(input) {
+      // Ban avoidance (D1/4.5): both gates run, and must run, BEFORE any
+      // network call -- assertWithinReplyWindow and
+      // assertBelowComplaintThreshold both throw synchronously/before
+      // awaiting any I/O of their own besides the injected state providers.
+      const windowState = await cfg.getReplyWindowState(input.channelContactId);
+      assertWithinReplyWindow(windowState, new Date());
+      await assertBelowComplaintThreshold(cfg.getComplaintRate, cfg.complaintRateThreshold);
+
       // Known limit, stated rather than hidden: Zalo's OA send API has no
       // server-side idempotency key. `input.idempotencyKey` is accepted for
       // interface conformance; genuine duplicate-send protection must

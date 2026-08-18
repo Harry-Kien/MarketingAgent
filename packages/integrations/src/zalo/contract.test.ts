@@ -12,7 +12,16 @@ afterAll(async () => {
 });
 
 function adapterFor(fetchImpl: FetchLike = server.fetchImpl) {
-  return createZaloAdapter({ baseUrl: server.url, accessToken: "test-token", allowedHosts: ["sandbox.zalo.test"] }, fetchImpl);
+  return createZaloAdapter(
+    {
+      baseUrl: server.url,
+      accessToken: "test-token",
+      allowedHosts: ["sandbox.zalo.test"],
+      getReplyWindowState: async () => ({ lastCustomerMessageAt: new Date() }),
+      getComplaintRate: async () => 0,
+    },
+    fetchImpl,
+  );
 }
 
 describe("zalo adapter contract", () => {
@@ -41,7 +50,16 @@ describe("zalo adapter contract", () => {
       calls++;
       return server.fetchImpl(input, init);
     };
-    const adapter = createZaloAdapter({ baseUrl: server.url, accessToken: "test-token", allowedHosts: ["someone-else.test"] }, counting);
+    const adapter = createZaloAdapter(
+      {
+        baseUrl: server.url,
+        accessToken: "test-token",
+        allowedHosts: ["someone-else.test"],
+        getReplyWindowState: async () => ({ lastCustomerMessageAt: new Date() }),
+        getComplaintRate: async () => 0,
+      },
+      counting,
+    );
     await expect(
       adapter.sendDirectMessage({ channelContactId: "user-1", text: "hi", idempotencyKey: "k3" }),
     ).rejects.toThrow(/allowlist/i);
