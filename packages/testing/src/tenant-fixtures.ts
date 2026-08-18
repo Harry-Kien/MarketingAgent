@@ -50,6 +50,13 @@ export interface TenantFixture {
   // real row to probe, not to prove the crypto (that's
   // packages/vault/src/vault-store.test.ts's job).
   vaultSecretId: Id;
+  // M2A task 5 (0039_knowledge_base.sql): one knowledge_document and one
+  // knowledge_chunk per workspace so cross-tenant.test.ts's exhaustive,
+  // catalog-driven suite -- and the E14 composite-FK probe for
+  // knowledge_chunk.document_id -> knowledge_document -- have real rows to
+  // find/hijack, same as every other table seeded above.
+  knowledgeDocumentId: Id;
+  knowledgeChunkId: Id;
 }
 
 async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixture> {
@@ -73,6 +80,8 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
   const integrationId = newId();
   const workspaceMemberId = newId();
   const vaultSecretId = newId();
+  const knowledgeDocumentId = newId();
+  const knowledgeChunkId = newId();
 
   // Seeded directly as the connecting (superuser) role, which always bypasses
   // RLS -- these rows exist to be *subjects* of the isolation proof, not to
@@ -224,6 +233,17 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
      values ($1, $2, $3, '\\x00'::bytea, '\\x00'::bytea, '\\x00'::bytea, '\\x00'::bytea, '\\x00'::bytea, '\\x00'::bytea, 'e12-seed-kek')`,
     [vaultSecretId, workspaceId, `e12-${label}-vault-secret-${vaultSecretId}`],
   );
+  // M2A task 5 (0039_knowledge_base.sql): one knowledge_document and its one
+  // knowledge_chunk (ordinal 0), so cross-tenant.test.ts's exhaustive,
+  // catalog-driven suite has real rows to find for both tables.
+  await client.query(
+    `insert into knowledge_document (id, workspace_id, tier, title) values ($1, $2, 't1_authoritative', $3)`,
+    [knowledgeDocumentId, workspaceId, `e12-${label}-knowledge-doc-${knowledgeDocumentId}`],
+  );
+  await client.query(
+    `insert into knowledge_chunk (id, workspace_id, document_id, ordinal, text) values ($1, $2, $3, 0, 'e12 seed chunk text')`,
+    [knowledgeChunkId, workspaceId, knowledgeDocumentId],
+  );
 
   return {
     workspaceId,
@@ -246,6 +266,8 @@ async function seedOne(client: pg.PoolClient, label: string): Promise<TenantFixt
     integrationId,
     workspaceMemberId,
     vaultSecretId,
+    knowledgeDocumentId,
+    knowledgeChunkId,
   };
 }
 

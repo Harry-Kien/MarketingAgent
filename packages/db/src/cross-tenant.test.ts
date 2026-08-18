@@ -171,10 +171,15 @@ const FK_PAIRS = await discoverTenantToTenantFks(TENANT_TABLES);
 // -- workspace-owned (unlike user_account/session/account/verification,
 // which stay global, see that migration's own header) -- updated here in
 // the same commit per this list's own rule above.
+// M2A task 5 (infra/migrations/0039_knowledge_base.sql) adds
+// knowledge_document and knowledge_chunk -- the ingested source material the
+// customer-advisory agent (M2C) grounds a reply in -- both workspace-owned,
+// updated here in the same commit as the migration that adds them, per this
+// list's own rule above.
 const EXPECTED_TENANT_TABLES = [
   "agent_definition", "agent_run", "agent_version", "approval_decision", "approval_request",
   "audit_log", "campaign", "content_item", "content_version", "credential_reference",
-  "event", "goal", "integration", "metric", "outbox",
+  "event", "goal", "integration", "knowledge_chunk", "knowledge_document", "metric", "outbox",
   "publication", "run_checkpoint", "source_citation", "tool_call", "vault_secret",
   "webhook_delivery", "workspace_member",
 ].toSorted();
@@ -245,6 +250,11 @@ const EXPECTED_FK_PAIRS = [
   // review IMPORTANT 3). Composite, so one workspace cannot cite another's
   // successful publish as its own verification.
   "integration->publication",
+  // M2A task 5 (0039_knowledge_base.sql): knowledge_chunk.document_id ->
+  // knowledge_document, composite on (id, workspace_id) so a chunk cannot
+  // be attached to another workspace's document and silently inherit that
+  // document's provenance tier.
+  "knowledge_chunk->knowledge_document",
   "metric->campaign",
   "publication->approval_decision",
   "publication->campaign",
@@ -309,6 +319,13 @@ afterAll(async () => {
     // of the chain above and is expected to be refused; the .catch keeps it
     // best-effort exactly as before.
     await adminPool.query("delete from workspace_member where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
+    // M2A task 5 (0039_knowledge_base.sql): knowledge_chunk deleted before
+    // knowledge_document even though the FK is ON DELETE CASCADE (unlike
+    // most other pairs in this cleanup block), simply to be explicit and
+    // consistent with the child-before-parent ordering used throughout this
+    // block -- nothing else references either table.
+    await adminPool.query("delete from knowledge_chunk where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
+    await adminPool.query("delete from knowledge_document where workspace_id = $1", [ws.workspaceId]).catch(() => undefined);
   }
   await pool.end();
   await adminPool.end();
@@ -514,6 +531,23 @@ function buildProbeRow(table: string, ws: TenantFixture, id: string): { columns:
         columns: ["id", "workspace_id", "user_id", "role"],
         cells: [{ value: id }, { value: ws.workspaceId }, { value: ws.userId }, { value: "owner" }],
       };
+    // M2A task 5 (infra/migrations/0039_knowledge_base.sql):
+    case "knowledge_document":
+      return {
+        columns: ["id", "workspace_id", "tier", "title"],
+        cells: [{ value: id }, { value: ws.workspaceId }, { value: "t1_authoritative" }, { value: `e12-probe-knowledge-doc-${id}` }],
+      };
+    case "knowledge_chunk":
+      // ordinal: 99, never 0 -- the fixture's own seeded chunk already
+      // occupies ordinal 0 for ws.knowledgeDocumentId, and (document_id,
+      // ordinal) is UNIQUE, exactly like agent_version's version_number: 99
+      // above sidesteps the same kind of collision for the same reason.
+      return {
+        columns: ["id", "workspace_id", "document_id", "ordinal", "text"],
+        cells: [
+          { value: id }, { value: ws.workspaceId }, { value: ws.knowledgeDocumentId }, { value: 99 }, { value: "e12 probe chunk text" },
+        ],
+      };
     default:
       // Fails loudly rather than silently skipping: a table discovered from
       // the catalog with no probe-row builder here would otherwise pass this
@@ -557,6 +591,9 @@ function fixtureIdForColumn(ws: TenantFixture, column: string): string {
     // membership in the workspace they approved for (final whole-branch
     // review, CRITICAL 2).
     actor_user_id: "userId",
+    // M2A task 5 (0039_knowledge_base.sql): knowledge_chunk.document_id ->
+    // knowledge_document (id, workspace_id).
+    document_id: "knowledgeDocumentId",
   };
   const key = map[column];
   if (!key) {
